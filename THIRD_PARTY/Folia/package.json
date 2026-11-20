@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@chenglou/pretext": "0.0.9",
+    "esbuild": "0.25.12",
+    "framer-motion": "12.43.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "name": "notch-harbor-folia-rail",
+  "private": true
+}

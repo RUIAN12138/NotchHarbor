@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+DerivedData/
+node_modules/
+__pycache__/
+*.pyc
+xcuserdata/
+*.xcuserstate
+*.app
+*.dSYM
+*.xcarchive
+scripts/activity-notify

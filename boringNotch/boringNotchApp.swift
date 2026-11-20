@@ -1,0 +1,926 @@
+//
+//  boringNotchApp.swift
+//  boringNotchApp
+//
+//  Created by Harsh Vardhan  Goswami  on 02/08/24.
+//
+
+import AVFoundation
+import ApplicationServices
+import Combine
+import Defaults
+import KeyboardShortcuts
+import LaunchAtLogin
+import Sparkle
+import SwiftUI
+
+private enum SystemIslandAccessibility {
+    struct Snapshot: Sendable { var expanded = false; var compactWidth: CGFloat?; var reservedWidth: CGFloat? }
+    static func snapshot(on display: CGRect, notchHeight: CGFloat) -> Snapshot {
+        guard AXIsProcessTrusted(),
+              let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first else {
+            return Snapshot()
+        }
+        let app = AXUIElementCreateApplication(agent.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.08)
+        guard let windows = value(app, kAXWindowsAttribute) as? [AXUIElement] else { return Snapshot() }
+        var result = Snapshot(reservedWidth: 0)
+        var incomplete = false
+        for window in windows where value(window, kAXIdentifierAttribute) as? String == "ax-center-hud-window" {
+            guard let children = value(window, kAXChildrenAttribute) as? [AXUIElement] else {
+                incomplete = true
+                continue
+            }
+            for child in children {
+                guard let origin = value(child, kAXPositionAttribute),
+                      let size = value(child, kAXSizeAttribute),
+                      CFGetTypeID(origin) == AXValueGetTypeID(),
+                      CFGetTypeID(size) == AXValueGetTypeID() else {
+                    incomplete = true
+                    continue
+                }
+                var point = CGPoint.zero
+                var dimensions = CGSize.zero
+                if AXValueGetValue(origin as! AXValue, .cgPoint, &point),
+                   AXValueGetValue(size as! AXValue, .cgSize, &dimensions),
+                   abs(point.y - display.minY) <= notchHeight + 12,
+                   dimensions.width > 16, dimensions.width < display.width - 40, dimensions.height > 0 {
+                    let centered = abs(point.x + dimensions.width / 2 - display.midX) < 80
+                    if dimensions.height > notchHeight + 8 {
+                        if centered { result.expanded = true }
+                    } else {
+                        let reserved = 2 * max(abs(point.x - display.midX), abs(point.x + dimensions.width - display.midX))
+                        result.reservedWidth = max(result.reservedWidth ?? 0, reserved)
+                        if centered, dimensions.width > 100 { result.compactWidth = max(result.compactWidth ?? 0, dimensions.width) }
+                    }
+                }
+            }
+        }
+        if incomplete && result.reservedWidth == 0 { result.reservedWidth = nil }
+        return result
+    }
+
+    /// Public WindowServer mouse-down hit testing needs no Accessibility or capture permission.
+    /// Read only owner/geometry metadata; never synthesize an event or move the pointer.
+    @MainActor static func hitTestSnapshot(on screen: NSScreen, ownWindow: Int) -> Snapshot {
+        guard let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first else {
+            return Snapshot(reservedWidth: 0)
+        }
+        let rows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+        let hudIDs = Set(rows.compactMap { row -> Int? in
+            guard (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == agent.processIdentifier,
+                  let bounds = row[kCGWindowBounds as String] as? [String: NSNumber],
+                  (bounds["Height"]?.doubleValue ?? 0) > screen.safeAreaInsets.top + 8 else { return nil }
+            return (row[kCGWindowNumber as String] as? NSNumber)?.intValue
+        })
+        func nativeHit(_ point: NSPoint) -> Bool {
+            var hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+            if hit == ownWindow { hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: ownWindow) }
+            return hudIDs.contains(hit)
+        }
+        let height = max(24, screen.safeAreaInsets.top)
+        let physical = screen.auxiliaryTopRightArea.flatMap { right in screen.auxiliaryTopLeftArea.map { right.minX - $0.maxX } } ?? 185
+        let y = screen.frame.maxY - height / 2
+        let compact = nativeHit(NSPoint(x: screen.frame.midX - physical / 2 - 17, y: y))
+            || nativeHit(NSPoint(x: screen.frame.midX + physical / 2 + 17, y: y))
+        let expanded = nativeHit(NSPoint(x: screen.frame.midX, y: screen.frame.maxY - height - 20))
+        return Snapshot(expanded: expanded, reservedWidth: compact ? physical + 68 : 0)
+    }
+
+    private static func value(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+        var result: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &result) == .success else { return nil }
+        return result
+    }
+}
+
+@main
+struct DynamicNotchApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @Default(.menubarIcon) var showMenuBarIcon
+    @Environment(\.openWindow) var openWindow
+
+    let updaterController: SPUStandardUpdaterController?
+
+    init() {
+        if let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String, !feed.isEmpty {
+            updaterController = SPUStandardUpdaterController(
+                startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        } else {
+            updaterController = nil
+        }
+
+        // Initialize the settings window controller with the updater controller
+        SettingsWindowController.shared.setUpdaterController(updaterController)
+    }
+
+    var body: some Scene {
+        MenuBarExtra(isInserted: $showMenuBarIcon) {
+            AgentUsagePopover {
+                Button {
+                    SettingsWindowController.shared.showWindow()
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("设置")
+                .keyboardShortcut(KeyEquivalent(","), modifiers: .command)
+                Menu {
+                    if let updaterController {
+                        CheckForUpdatesView(updater: updaterController.updater)
+                        Divider()
+                    }
+                    Button("重新启动 Notch Harbor") { ApplicationRelauncher.restart() }
+                    Button("退出 Notch Harbor", role: .destructive) { NSApplication.shared.terminate(self) }
+                        .keyboardShortcut(KeyEquivalent("Q"), modifiers: .command)
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("更多操作")
+            }
+        } label: {
+            AgentUsageStatusLabel()
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    let isSystemIslandCompanion = !ProcessInfo.processInfo.arguments.contains("--standalone-notch")
+        && (ProcessInfo.processInfo.arguments.contains("--system-island-companion")
+            || Defaults[.systemIslandCompanionEnabled])
+    private var companionTrackingTimer: Timer?
+    private var companionClickMonitor: Any?
+    private var companionCheckInFlight = false
+    private var lastCompanionBackgroundCheck = Date.distantPast
+    private var lastCompanionPoint: NSPoint?
+    private var systemIslandClickUntil = Date.distantPast
+    private var nativeIslandMayReleaseAt = ProcessInfo.processInfo.systemUptime
+    private var nativeIslandVacancy = SystemIslandVacancy()
+    private weak var sampledNativeNotchWindow: NSWindow?
+    private weak var suppressedNotchWindow: NSWindow?
+    var statusItem: NSStatusItem?
+    var windows: [String: NSWindow] = [:] // UUID -> NSWindow
+    var viewModels: [String: BoringViewModel] = [:] // UUID -> BoringViewModel
+    var window: NSWindow?
+    let vm: BoringViewModel = .init()
+    @ObservedObject var coordinator = BoringViewCoordinator.shared
+    var quickShareService = QuickShareService.shared
+    var whatsNewWindow: NSWindow?
+    var timer: Timer?
+    var closeNotchTask: Task<Void, Never>?
+    private var previousScreens: [NSScreen]?
+    private var onboardingWindowController: NSWindowController?
+    private var screenLockedObserver: Any?
+    private var screenUnlockedObserver: Any?
+    private var isScreenLocked: Bool = false
+    private var windowScreenDidChangeObserver: Any?
+    private var dragDetectors: [String: DragDetector] = [:] // UUID -> DragDetector
+    private var clipboardRecordingCancellable: AnyCancellable?
+    private var appearanceCancellable: AnyCancellable?
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if coordinator.firstLaunch { showOnboardingWindow() }
+        else { SettingsWindowController.shared.showWindow() }
+        return false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        companionTrackingTimer?.invalidate()
+        if let companionClickMonitor { NSEvent.removeMonitor(companionClickMonitor) }
+        NotificationCenter.default.removeObserver(self)
+        if let observer = screenLockedObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+            screenLockedObserver = nil
+        }
+        if let observer = screenUnlockedObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+            screenUnlockedObserver = nil
+        }
+        MusicManager.shared.destroy()
+        MainActor.assumeIsolated {
+            ClipboardHistoryStore.shared.stop()
+        }
+        cleanupDragDetectors()
+        cleanupWindows()
+    }
+
+    @MainActor
+    func onScreenLocked(_ notification: Notification) {
+        isScreenLocked = true
+        ClipboardHistoryStore.shared.pauseForScreenLock()
+        if !Defaults[.showOnLockScreen] {
+            cleanupWindows()
+        } else {
+            enableSkyLightOnAllWindows()
+        }
+    }
+
+    @MainActor
+    func onScreenUnlocked(_ notification: Notification) {
+        isScreenLocked = false
+        ClipboardHistoryStore.shared.resumeFromScreenLock()
+        if !Defaults[.showOnLockScreen] {
+            adjustWindowPosition(changeAlpha: true)
+        } else {
+            disableSkyLightOnAllWindows()
+        }
+    }
+    
+    @MainActor
+    private func enableSkyLightOnAllWindows() {
+        if Defaults[.showOnAllDisplays] {
+            windows.values.forEach { window in
+                if let skyWindow = window as? BoringNotchSkyLightWindow {
+                    skyWindow.enableSkyLight()
+                }
+            }
+        } else {
+            if let skyWindow = window as? BoringNotchSkyLightWindow {
+                skyWindow.enableSkyLight()
+            }
+        }
+    }
+    
+    @MainActor
+    private func disableSkyLightOnAllWindows() {
+        // Delay disabling SkyLight to avoid flicker during unlock transition
+        Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            await MainActor.run {
+                if Defaults[.showOnAllDisplays] {
+                    self.windows.values.forEach { window in
+                        if let skyWindow = window as? BoringNotchSkyLightWindow {
+                            skyWindow.disableSkyLight()
+                        }
+                    }
+                } else {
+                    if let skyWindow = self.window as? BoringNotchSkyLightWindow {
+                        skyWindow.disableSkyLight()
+                    }
+                }
+            }
+        }
+    }
+
+    private func cleanupWindows(shouldInvert: Bool = false) {
+        let shouldCleanupMulti = shouldInvert ? !Defaults[.showOnAllDisplays] : Defaults[.showOnAllDisplays]
+        
+        if shouldCleanupMulti {
+            windows.values.forEach { window in
+                window.close()
+                NotchSpaceManager.shared.notchSpace.windows.remove(window)
+            }
+            windows.removeAll()
+            viewModels.removeAll()
+        } else if let window = window {
+            window.close()
+            NotchSpaceManager.shared.notchSpace.windows.remove(window)
+            if let obs = windowScreenDidChangeObserver {
+                NotificationCenter.default.removeObserver(obs)
+                windowScreenDidChangeObserver = nil
+            }
+            self.window = nil
+        }
+    }
+
+    private func cleanupDragDetectors() {
+        dragDetectors.values.forEach { detector in
+            detector.stopMonitoring()
+        }
+        dragDetectors.removeAll()
+    }
+
+    private func setupDragDetectors() {
+        cleanupDragDetectors()
+
+        if Defaults[.showOnAllDisplays] {
+            for screen in NSScreen.screens {
+                setupDragDetectorForScreen(screen)
+            }
+        } else {
+            let preferredScreen: NSScreen? = window?.screen
+                ?? NSScreen.screen(withUUID: coordinator.selectedScreenUUID)
+                ?? NSScreen.main
+
+            if let screen = preferredScreen {
+                setupDragDetectorForScreen(screen)
+            }
+        }
+    }
+
+    private func setupDragDetectorForScreen(_ screen: NSScreen) {
+        guard let uuid = screen.displayUUID else { return }
+        
+        let screenFrame = screen.frame
+        let notchHeight = openNotchSize.height
+        let notchWidth = (viewModels[uuid] ?? vm).requiredWindowWidth
+        
+        // Create notch region at the top-center of the screen where an open notch would occupy
+        let notchRegion = CGRect(
+            x: screenFrame.midX - notchWidth / 2,
+            y: screenFrame.maxY - notchHeight,
+            width: notchWidth,
+            height: max(0, notchHeight - (isSystemIslandCompanion && screen.safeAreaInsets.top > 0
+                ? screen.safeAreaInsets.top + SystemIslandHoverGeometry.gap : 0))
+        )
+        
+        let detector = DragDetector(notchRegion: notchRegion)
+        
+        detector.onDragMove = { [weak self] point in
+            Task { @MainActor in self?.handleDragEntersNotchRegion(onScreen: screen, at: point) }
+        }
+
+        detector.onFileDragChanged = { [weak self] dragging in
+            Task { @MainActor in
+                guard let self else { return }
+                let target = Defaults[.showOnAllDisplays] ? self.windows[uuid] : self.window
+                (target as? BoringNotchSkyLightWindow)?.setExternalFileDragActive(dragging)
+            }
+        }
+
+        dragDetectors[uuid] = detector
+        detector.startMonitoring()
+    }
+
+    @MainActor
+    private func handleDragEntersNotchRegion(onScreen screen: NSScreen, at point: NSPoint) {
+        guard Defaults[.expandedDragDetection], Defaults[.boringShelf],
+              NSEvent.pressedMouseButtons & 1 != 0,
+              !ShelfSelectionModel.shared.isDragging, let uuid = screen.displayUUID else { return }
+        let model = Defaults[.showOnAllDisplays] ? viewModels[uuid] : (window?.screen == screen ? vm : nil)
+        guard let model, !model.compactAlertPresented,
+              model.notchState == .closed || coordinator.currentView != .shelf else { return }
+        let dropFrame = model.shelfFileDropFrame(preparesExpansion: true)
+        guard dropFrame.contains(point), dropFrame.contains(NSEvent.mouseLocation) else { return }
+        coordinator.currentView = .shelf
+        if model.notchState == .closed { model.open(forShelfDrag: true) }
+    }
+
+    private func createBoringNotchWindow(for screen: NSScreen, with viewModel: BoringViewModel) -> NSWindow {
+        viewModel.usesSystemIslandTrigger = isSystemIslandCompanion && screen.safeAreaInsets.top > 0
+        let rect = NSRect(x: 0, y: 0, width: viewModel.requiredWindowWidth, height: viewModel.requiredWindowHeight)
+        let styleMask: NSWindow.StyleMask = [.borderless, .nonactivatingPanel, .utilityWindow, .hudWindow]
+        
+        let window = BoringNotchSkyLightWindow(contentRect: rect, styleMask: styleMask, backing: .buffered, defer: false)
+        if isSystemIslandCompanion && screen.safeAreaInsets.top > 0 {
+            window.keepsPhysicalNotchAnchor = true
+            window.level = .mainMenu + 1
+        }
+        
+        // Enable SkyLight only when screen is locked
+        if isScreenLocked {
+            window.enableSkyLight()
+        } else {
+            window.disableSkyLight()
+        }
+
+        let hostingView = NotchHostingView(
+            rootView: ContentView()
+                .environmentObject(viewModel)
+        )
+        hostingView.notchViewModel = viewModel
+        window.contentView = hostingView
+
+        window.enableShelfFileDrops(for: viewModel)
+        window.orderFrontRegardless()
+        NotchSpaceManager.shared.notchSpace.windows.insert(window)
+
+        // Observe when the window's screen changes so we can update drag detectors
+        windowScreenDidChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeScreenNotification,
+            object: window,
+            queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    self?.setupDragDetectors()
+                }
+        }
+        return window
+    }
+
+    @MainActor
+    private func positionWindow(_ window: NSWindow, on screen: NSScreen, changeAlpha: Bool = false) {
+        (window as? BoringNotchSkyLightWindow)?.shelfViewModel?.usesSystemIslandTrigger =
+            isSystemIslandCompanion && screen.safeAreaInsets.top > 0
+        if let model = (window as? BoringNotchSkyLightWindow)?.shelfViewModel {
+            window.setContentSize(CGSize(width: model.requiredWindowWidth, height: model.requiredWindowHeight))
+            if !model.usesSystemIslandTrigger { model.systemIslandPresentationActive = false }
+        }
+        if isSystemIslandCompanion {
+            (window as? BoringNotchSkyLightWindow)?.keepsPhysicalNotchAnchor = screen.safeAreaInsets.top > 0
+            window.level = screen.safeAreaInsets.top > 0 ? .mainMenu + 1 : .mainMenu + 3
+        }
+        if changeAlpha {
+            window.alphaValue = 0
+        }
+
+        let screenFrame = screen.frame
+        window.setFrameOrigin(
+            NSPoint(
+                x: screenFrame.origin.x + (screenFrame.width / 2) - window.frame.width / 2,
+                y: screenFrame.origin.y + screenFrame.height - window.frame.height
+            ))
+        window.alphaValue = 1
+        (window as? BoringNotchSkyLightWindow)?.refreshMouseRouting()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let managedLogin = CommandLine.arguments.contains("--background-login")
+        if managedLogin && !HarborLoginItem.managedEnabled {
+            NSApp.terminate(nil)
+            return
+        }
+        let loginLaunch = managedLogin || LaunchAtLogin.wasLaunchedAtLogin
+        appearanceCancellable = Defaults.publisher(.appAppearance)
+            .map(\.newValue)
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { mode in NSApp.appearance = mode.name.flatMap { NSAppearance(named: $0) } }
+        Task { @MainActor in _ = CalendarManager.shared }
+        let previewRain = CommandLine.arguments.contains("--preview-rain-alert")
+        if previewRain || CommandLine.arguments.contains("--preview-compact-alert") {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(5))
+                guard let self, !self.isScreenLocked, !Task.isCancelled else { return }
+                UnifiedActivities.shared.previewCompactAlert(rain: previewRain)
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenConfigurationDidChange),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name.selectedScreenChanged, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.adjustWindowPosition(changeAlpha: true)
+                self?.setupDragDetectors()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name.notchHeightChanged, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.adjustWindowPosition()
+                self?.setupDragDetectors()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name.automaticallySwitchDisplayChanged, object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self = self, let window = self.window else { return }
+            Task { @MainActor in
+                window.alphaValue = self.coordinator.selectedScreenUUID == self.coordinator.preferredScreenUUID ? 1 : 0
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name.showOnAllDisplaysChanged, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.cleanupWindows(shouldInvert: true)
+                self.adjustWindowPosition(changeAlpha: true)
+                self.setupDragDetectors()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name.expandedDragDetectionChanged, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.setupDragDetectors()
+            }
+        }
+
+        // Use closure-based observers for DistributedNotificationCenter and keep tokens for removal
+        screenLockedObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(rawValue: "com.apple.screenIsLocked"),
+            object: nil, queue: .main) { [weak self] notification in
+                Task { @MainActor in
+                    self?.onScreenLocked(notification)
+                }
+        }
+
+        screenUnlockedObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(rawValue: "com.apple.screenIsUnlocked"),
+            object: nil, queue: .main) { [weak self] notification in
+                Task { @MainActor in
+                    self?.onScreenUnlocked(notification)
+                }
+        }
+
+        ClipboardHistoryStore.shared.setRecordingEnabled(Defaults[.clipboardHistoryEnabled])
+        ClipboardHistoryStore.shared.start()
+        clipboardRecordingCancellable = Defaults.publisher(.clipboardHistoryEnabled)
+            .sink { change in
+                Task { @MainActor in
+                    ClipboardHistoryStore.shared.setRecordingEnabled(change.newValue)
+                }
+            }
+
+        KeyboardShortcuts.onKeyUp(for: .agentVoiceReply) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isScreenLocked else { return }
+                let editing = self.viewModels.values.first(where: \.isAgentReplyEditing)
+                let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
+                let underPointer = screen?.displayUUID.flatMap { self.viewModels[$0] }
+                let active = editing ?? underPointer ?? self.vm
+                self.closeNotchTask?.cancel()
+                active.agentVoiceHotkey = UUID()
+            }
+        }
+
+        KeyboardShortcuts.onKeyDown(for: .toggleNotchOpen) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                let mouseLocation = NSEvent.mouseLocation
+
+                var viewModel = self.vm
+
+                if Defaults[.showOnAllDisplays] {
+                    for screen in NSScreen.screens {
+                        if screen.frame.contains(mouseLocation) {
+                            if let uuid = screen.displayUUID, let screenViewModel = self.viewModels[uuid] {
+                                viewModel = screenViewModel
+                                break
+                            }
+                        }
+                    }
+                }
+
+                self.closeNotchTask?.cancel()
+                self.closeNotchTask = nil
+
+                switch viewModel.notchState {
+                case .closed:
+                    await MainActor.run {
+                        viewModel.open()
+                    }
+
+                    let task = Task { [weak viewModel] in
+                        do {
+                            try await Task.sleep(for: .seconds(3))
+                            await MainActor.run {
+                                guard let viewModel, !viewModel.isMouseHovering(),
+                                      !viewModel.anyDropZoneTargeting,
+                                      !ShelfSelectionModel.shared.isDragging,
+                                      !ShelfStateViewModel.shared.isLoading else { return }
+                                viewModel.close()
+                            }
+                        } catch { }
+                    }
+                    self.closeNotchTask = task
+                case .open:
+                    await MainActor.run {
+                        viewModel.close()
+                    }
+                }
+            }
+        }
+
+        if !Defaults[.showOnAllDisplays] {
+            let viewModel = self.vm
+            let window = createBoringNotchWindow(
+                for: NSScreen.main ?? NSScreen.screens.first!, with: viewModel)
+            self.window = window
+            adjustWindowPosition(changeAlpha: true)
+        } else {
+            adjustWindowPosition(changeAlpha: true)
+        }
+
+        setupDragDetectors()
+
+        if coordinator.firstLaunch {
+            DispatchQueue.main.async {
+                self.showOnboardingWindow()
+            }
+            playWelcomeSound()
+        } else if MusicManager.shared.isNowPlayingDeprecated
+            && Defaults[.mediaController] == .nowPlaying
+        {
+            DispatchQueue.main.async {
+                self.showOnboardingWindow(step: .musicPermission)
+            }
+        } else if !loginLaunch {
+            SettingsWindowController.shared.showWindow()
+        }
+        previousScreens = NSScreen.screens
+
+        if isSystemIslandCompanion {
+            startCompanionTracking()
+        }
+    }
+
+    func playWelcomeSound() {
+        NSSound(named: "Glass")?.play()
+    }
+
+    func deviceHasNotch() -> Bool {
+        if #available(macOS 12.0, *) {
+            for screen in NSScreen.screens {
+                if screen.safeAreaInsets.top > 0 {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    @objc func screenConfigurationDidChange() {
+        let currentScreens = NSScreen.screens
+
+        let screensChanged =
+            currentScreens.count != previousScreens?.count
+            || Set(currentScreens.compactMap { $0.displayUUID })
+                != Set(previousScreens?.compactMap { $0.displayUUID } ?? [])
+            || Set(currentScreens.map { $0.frame }) != Set(previousScreens?.map { $0.frame } ?? [])
+
+        previousScreens = currentScreens
+
+        if screensChanged {
+            DispatchQueue.main.async { [weak self] in
+                self?.cleanupWindows()
+                self?.adjustWindowPosition()
+                self?.setupDragDetectors()
+            }
+        }
+    }
+
+    @objc func adjustWindowPosition(changeAlpha: Bool = false) {
+        if Defaults[.showOnAllDisplays] {
+            let currentScreenUUIDs = Set(NSScreen.screens.compactMap { $0.displayUUID })
+
+            // Remove windows for screens that no longer exist
+            for uuid in windows.keys where !currentScreenUUIDs.contains(uuid) {
+                if let window = windows[uuid] {
+                    window.close()
+                    NotchSpaceManager.shared.notchSpace.windows.remove(window)
+                    windows.removeValue(forKey: uuid)
+                    viewModels.removeValue(forKey: uuid)
+                }
+            }
+
+            // Create or update windows for all screens
+            for screen in NSScreen.screens {
+                guard let uuid = screen.displayUUID else { continue }
+                
+                if windows[uuid] == nil {
+                    let viewModel = BoringViewModel(screenUUID: uuid)
+                    let window = createBoringNotchWindow(for: screen, with: viewModel)
+
+                    windows[uuid] = window
+                    viewModels[uuid] = viewModel
+                }
+
+                if let window = windows[uuid], let viewModel = viewModels[uuid] {
+                    positionWindow(window, on: screen, changeAlpha: changeAlpha)
+                    viewModel.refreshNotchSize(screenUUID: uuid)
+                }
+            }
+        } else {
+            let selectedScreen: NSScreen
+
+            if let preferredScreen = NSScreen.screen(withUUID: coordinator.preferredScreenUUID ?? "") {
+                coordinator.selectedScreenUUID = coordinator.preferredScreenUUID ?? ""
+                selectedScreen = preferredScreen
+            } else if Defaults[.automaticallySwitchDisplay], let mainScreen = NSScreen.main,
+                      let mainUUID = mainScreen.displayUUID {
+                coordinator.selectedScreenUUID = mainUUID
+                selectedScreen = mainScreen
+            } else {
+                if let window = window {
+                    window.alphaValue = 0
+                }
+                return
+            }
+
+            vm.screenUUID = selectedScreen.displayUUID
+
+            if window == nil {
+                window = createBoringNotchWindow(for: selectedScreen, with: vm)
+            }
+
+            if let window = window {
+                positionWindow(window, on: selectedScreen, changeAlpha: changeAlpha)
+                vm.refreshNotchSize(screenUUID: selectedScreen.displayUUID)
+            }
+        }
+    }
+
+    @MainActor
+    private func startCompanionTracking() {
+        let timer = Timer(timeInterval: 0.10, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.trackSystemIsland() }
+        }
+        timer.tolerance = 0.025
+        companionTrackingTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        companionClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            Task { @MainActor in self?.yieldAfterSystemIslandClick() }
+        }
+    }
+
+    @MainActor
+    private func notchOnBuiltInScreen() -> (NSScreen, NSWindow, BoringViewModel)? {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }),
+              let id = screen.displayUUID else { return nil }
+        if Defaults[.showOnAllDisplays], let window = windows[id], let model = viewModels[id] {
+            return (screen, window, model)
+        }
+        if let window, window.screen?.displayUUID == id { return (screen, window, vm) }
+        return nil
+    }
+
+    @MainActor
+    private func yieldAfterSystemIslandClick() {
+        guard !isScreenLocked, let (_, window, model) = notchOnBuiltInScreen(),
+              model.usesSystemIslandTrigger else { return }
+        let point = NSEvent.mouseLocation
+        guard model.isOverNativeIsland(point) else { return }
+        systemIslandClickUntil = Date().addingTimeInterval(0.65)
+        yieldNotchWindow(window, model: model)
+    }
+
+    @MainActor
+    private func yieldNotchWindow(_ window: NSWindow, model: BoringViewModel) {
+        model.lastConfirmedNativeVacancyAt = nil
+        model.systemIslandPresentationActive = true
+        if model.notchState == .open {
+            closeNotchTask?.cancel()
+            let animation: Animation = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                ? .easeOut(duration: 0.15)
+                : .interactiveSpring(response: 0.43, dampingFraction: 0.9, blendDuration: 0.12)
+            withAnimation(animation) { model.close() }
+        }
+        // Keep the window mounted so its closing spring can finish. The native
+        // island is already above it; only interaction and reopening are gated.
+        if suppressedNotchWindow !== window {
+            suppressedNotchWindow = window
+        }
+    }
+
+    @MainActor
+    private func trackSystemIsland() {
+        guard !isScreenLocked, !companionCheckInFlight,
+              let (screen, window, model) = notchOnBuiltInScreen() else { return }
+        let confirmWings = model.showsRunningAgent &&
+            (model.nativeWingReleaseCheckAt != nil || nativeIslandVacancy.awaitingConfirmation)
+        let interactive = isNearIsland(screen) || model.notchState == .open || suppressedNotchWindow === window || confirmWings
+        guard interactive || (model.showsRunningAgent && Date().timeIntervalSince(lastCompanionBackgroundCheck) >= 1),
+              let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return }
+        let point = NSEvent.mouseLocation
+        let stationary = lastCompanionPoint == point
+        lastCompanionPoint = point
+        if stationary && model.notchState == .open && !confirmWings && suppressedNotchWindow !== window
+            && Date().timeIntervalSince(lastCompanionBackgroundCheck) < 0.7 { return }
+        lastCompanionBackgroundCheck = Date()
+        let display = CGDisplayBounds(id.uint32Value)
+        let notchHeight = screen.safeAreaInsets.top
+        let sampledAt = ProcessInfo.processInfo.systemUptime
+        companionCheckInFlight = true
+        Task { @MainActor [weak self, weak window, weak model] in
+            var snapshot = await Task.detached(priority: .utility) {
+                SystemIslandAccessibility.snapshot(on: display, notchHeight: notchHeight)
+            }.value
+            guard let self else { return }
+            self.companionCheckInFlight = false
+            guard let window, let model, !self.isScreenLocked,
+                  self.notchOnBuiltInScreen()?.1 === window else { return }
+            if self.sampledNativeNotchWindow !== window {
+                self.nativeIslandVacancy = SystemIslandVacancy()
+                self.sampledNativeNotchWindow = window
+                model.lastConfirmedNativeVacancyAt = nil
+            }
+            // A transient empty Accessibility snapshot can leave the native island
+            // on screen. Corroborate it before releasing the Agent wings.
+            if snapshot.reservedWidth == nil || (snapshot.reservedWidth == 0 && !snapshot.expanded) {
+                let hit = SystemIslandAccessibility.hitTestSnapshot(on: screen, ownWindow: window.windowNumber)
+                snapshot.expanded = snapshot.expanded || hit.expanded
+                snapshot.reservedWidth = hit.reservedWidth
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            let compactActive = (snapshot.reservedWidth ?? 0) > 0
+            let vacant = self.nativeIslandVacancy.observe(width: snapshot.reservedWidth,
+                expanded: snapshot.expanded, at: now, since: model.nativeWingReleaseCheckAt)
+            if snapshot.expanded { self.nativeIslandMayReleaseAt = now + 0.48 }
+            let reservedWidth = compactActive ? snapshot.reservedWidth
+                : vacant ? 0 : model.systemIslandReservedWidth
+            if model.systemIslandReservedWidth != reservedWidth {
+                model.systemIslandReservedWidth = reservedWidth
+                if window.frame.width != model.requiredWindowWidth { self.positionWindow(window, on: screen) }
+            }
+            if let closeTime = model.nativeWingReleaseCheckAt,
+               vacant || (compactActive && !snapshot.expanded && now - closeTime >= 0.65) {
+                model.nativeWingReleaseCheckAt = nil
+            }
+            if let width = snapshot.compactWidth,
+               width > model.systemIslandWidth + 2 || (model.notchState == .closed && abs(width - model.systemIslandWidth) > 2) {
+                model.systemIslandWidth = width
+                if window.frame.width != model.requiredWindowWidth { self.positionWindow(window, on: screen) }
+            }
+            if snapshot.expanded || now < self.nativeIslandMayReleaseAt || Date() < self.systemIslandClickUntil {
+                self.yieldNotchWindow(window, model: model)
+            } else {
+                // A screen/lock transition may recreate the window. Always
+                // release the gate once the native presentation has ended.
+                model.lastConfirmedNativeVacancyAt = vacant ? sampledAt : nil
+                model.systemIslandPresentationActive = false
+                if self.suppressedNotchWindow === window { self.suppressedNotchWindow = nil }
+            }
+        }
+    }
+
+    @MainActor
+    private func isNearIsland(_ screen: NSScreen) -> Bool {
+        let point = NSEvent.mouseLocation
+        return screen.frame.contains(point) && abs(point.x - screen.frame.midX) <= 330
+            && point.y >= screen.frame.maxY - 72
+    }
+
+    @objc func togglePopover(_ sender: Any?) {
+        if window?.isVisible == true {
+            window?.orderOut(nil)
+        } else {
+            window?.orderFrontRegardless()
+        }
+    }
+
+    @objc func showMenu() {
+        statusItem?.menu?.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+
+    @objc func quitAction() {
+        NSApplication.shared.terminate(self)
+    }
+
+    private func showOnboardingWindow(step: OnboardingStep = .welcome) {
+        if onboardingWindowController == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 400, height: 600),
+                styleMask: [.titled, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.center()
+            window.title = "Notch Harbor"
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.contentView = NSHostingView(
+                rootView: OnboardingView(
+                    step: step,
+                    onFinish: {
+                        window.orderOut(nil)
+//                        NSApp.setActivationPolicy(.accessory)
+                        window.close()
+                        NSApp.deactivate()
+                    },
+                    onOpenSettings: {
+                        window.close()
+                        SettingsWindowController.shared.showWindow()
+                    }
+                ))
+            window.isRestorable = false
+            window.identifier = NSUserInterfaceItemIdentifier("OnboardingWindow")
+
+            onboardingWindowController = NSWindowController(window: window)
+        }
+
+//        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        onboardingWindowController?.window?.makeKeyAndOrderFront(nil)
+        onboardingWindowController?.window?.orderFrontRegardless()
+    }
+}
+
+extension Notification.Name {
+    static let selectedScreenChanged = Notification.Name("SelectedScreenChanged")
+    static let notchHeightChanged = Notification.Name("NotchHeightChanged")
+    static let showOnAllDisplaysChanged = Notification.Name("showOnAllDisplaysChanged")
+    static let automaticallySwitchDisplayChanged = Notification.Name("automaticallySwitchDisplayChanged")
+    static let expandedDragDetectionChanged = Notification.Name("expandedDragDetectionChanged")
+}
+
+extension CGRect: @retroactive Hashable {
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(origin.x)
+        hasher.combine(origin.y)
+        hasher.combine(size.width)
+        hasher.combine(size.height)
+    }
+
+    public static func == (lhs: CGRect, rhs: CGRect) -> Bool {
+        return lhs.origin == rhs.origin && lhs.size == rhs.size
+    }
+}

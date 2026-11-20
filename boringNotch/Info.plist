@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Notch Harbor</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>读取你选择的系统日历，在刘海显示今天、明天及所选日期的日程。</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>在你启用提醒事项后，显示所选列表的到期提醒。</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>检测附近 AirPods 的开盖广播，在刘海显示耳机动画和电量。</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>在音乐页展开且正在播放时读取系统音频，让底部光效跟随音乐。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>你启动 Agent 语音回复后，使用麦克风在本机转写回复草稿。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>将语音转成 Agent 回复草稿，由你确认后发送。</string>
+	<key>NSMotionUsageDescription</key>
+	<string>在你开启头动快捷回复后，读取 AirPods 的头部角度，用来选择和确认回复。</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>SUEnableDownloaderService</key>
+	<true/>
+	<key>SUEnableInstallerLauncherService</key>
+	<true/>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict/>
+	</array>
+</dict>
+</plist>

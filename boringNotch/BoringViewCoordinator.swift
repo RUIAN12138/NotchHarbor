@@ -1,0 +1,248 @@
+//
+//  BoringViewCoordinator.swift
+//  boringNotch
+//
+//  Created by Alexander on 2024-11-20.
+//
+
+import AppKit
+import Combine
+import Defaults
+import SwiftUI
+
+enum SneakContentType {
+    case brightness
+    case volume
+    case backlight
+    case music
+    case mic
+    case battery
+    case download
+}
+
+struct sneakPeek {
+    var show: Bool = false
+    var type: SneakContentType = .music
+    var value: CGFloat = 0
+    var icon: String = ""
+}
+
+struct SharedSneakPeek: Codable {
+    var show: Bool
+    var type: String
+    var value: String
+    var icon: String
+}
+
+enum BrowserType {
+    case chromium
+    case safari
+}
+
+struct ExpandedItem {
+    var show: Bool = false
+    var type: SneakContentType = .battery
+    var value: CGFloat = 0
+    var browser: BrowserType = .chromium
+}
+
+@MainActor
+class BoringViewCoordinator: ObservableObject {
+    static let shared = BoringViewCoordinator()
+
+    @Published var currentView: NotchViews = .home
+    private var sneakPeekDispatch: DispatchWorkItem?
+    private var expandingViewDispatch: DispatchWorkItem?
+
+    @AppStorage("firstLaunch") var firstLaunch: Bool = true
+    @AppStorage("showWhatsNew") var showWhatsNew: Bool = true
+    @AppStorage("musicLiveActivityEnabled") var musicLiveActivityEnabled: Bool = true
+    @AppStorage("currentMicStatus") var currentMicStatus: Bool = true
+
+    @AppStorage("openLastTabByDefault") var openLastTabByDefault: Bool = true
+    @AppStorage("lastNotchPage") var lastNotchPage: Int = NotchPage.music.rawValue
+
+    // Legacy storage for migration
+    @AppStorage("preferred_screen_name") private var legacyPreferredScreenName: String?
+    
+    // New UUID-based storage
+    @AppStorage("preferred_screen_uuid") var preferredScreenUUID: String? {
+        didSet {
+            if let uuid = preferredScreenUUID {
+                selectedScreenUUID = uuid
+            }
+            NotificationCenter.default.post(name: Notification.Name.selectedScreenChanged, object: nil)
+        }
+    }
+
+    @Published var selectedScreenUUID: String = NSScreen.main?.displayUUID ?? ""
+
+    @Published var optionKeyPressed: Bool = true
+
+    private init() {
+        // Perform migration from name-based to UUID-based storage
+        if preferredScreenUUID == nil, let legacyName = legacyPreferredScreenName {
+            // Try to find screen by name and migrate to UUID
+            if let screen = NSScreen.screens.first(where: { $0.localizedName == legacyName }),
+               let uuid = screen.displayUUID {
+                preferredScreenUUID = uuid
+                NSLog("✅ Migrated display preference from name '\(legacyName)' to UUID '\(uuid)'")
+            } else {
+                // Fallback to main screen if legacy screen not found
+                preferredScreenUUID = NSScreen.main?.displayUUID
+                NSLog("⚠️ Could not find display named '\(legacyName)', falling back to main screen")
+            }
+            // Clear legacy value after migration
+            legacyPreferredScreenName = nil
+        } else if preferredScreenUUID == nil {
+            // No legacy value, use main screen
+            preferredScreenUUID = NSScreen.main?.displayUUID
+        }
+        
+        selectedScreenUUID = preferredScreenUUID ?? NSScreen.main?.displayUUID ?? ""
+    }
+    
+    @objc func sneakPeekEvent(_ notification: Notification) {
+        let decoder = JSONDecoder()
+        if let decodedData = try? decoder.decode(
+            SharedSneakPeek.self, from: notification.userInfo?.first?.value as! Data)
+        {
+            let contentType =
+                decodedData.type == "brightness"
+                ? SneakContentType.brightness
+                : decodedData.type == "volume"
+                    ? SneakContentType.volume
+                    : decodedData.type == "backlight"
+                        ? SneakContentType.backlight
+                        : decodedData.type == "mic"
+                            ? SneakContentType.mic : SneakContentType.brightness
+
+            let formatter = NumberFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.numberStyle = .decimal
+            let value = CGFloat((formatter.number(from: decodedData.value) ?? 0.0).floatValue)
+            let icon = decodedData.icon
+
+            print("Decoded: \(decodedData), Parsed value: \(value)")
+
+            toggleSneakPeek(status: decodedData.show, type: contentType, value: value, icon: icon)
+
+        } else {
+            print("Failed to decode JSON data")
+        }
+    }
+
+    func toggleSneakPeek(
+        status: Bool, type: SneakContentType, duration: TimeInterval = 1.5, value: CGFloat = 0,
+        icon: String = ""
+    ) {
+        sneakPeekDuration = duration
+        if type != .music {
+            // close()
+            if !Defaults[.hudReplacement] && !(type == .volume && Defaults[.notchVolumeFeedback]) {
+                return
+            }
+        }
+        Task { @MainActor in
+            withAnimation(.smooth) {
+                self.sneakPeek.show = status
+                self.sneakPeek.type = type
+                self.sneakPeek.value = value
+                self.sneakPeek.icon = icon
+            }
+        }
+
+        if type == .mic {
+            currentMicStatus = value == 1
+        }
+    }
+
+    private var sneakPeekHovered = false
+    private var sneakPeekDragging = false
+    func setHUDHovered(_ value: Bool) {
+        sneakPeekHovered = value
+        updateHUDRetention()
+    }
+    func setHUDDragging(_ value: Bool) {
+        sneakPeekDragging = value
+        updateHUDRetention()
+    }
+    private func updateHUDRetention() {
+        guard sneakPeek.show else { return }
+        scheduleSneakPeekHide(after: sneakPeekDuration)
+    }
+    private var sneakPeekDuration: TimeInterval = 1.5
+    private var sneakPeekTask: Task<Void, Never>?
+    private var sneakPeekGeneration = UUID()
+
+    // Helper function to manage sneakPeek timer using Swift Concurrency
+    private func scheduleSneakPeekHide(after duration: TimeInterval) {
+        sneakPeekTask?.cancel()
+        let generation = UUID()
+        sneakPeekGeneration = generation
+        guard !sneakPeekHovered && !sneakPeekDragging else { return }
+
+        sneakPeekTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(duration))
+            guard let self = self, !Task.isCancelled else { return }
+            await MainActor.run {
+                guard self.sneakPeekGeneration == generation,
+                      !self.sneakPeekHovered, !self.sneakPeekDragging else { return }
+                withAnimation {
+                    // Mutate here, not through a second unguarded asynchronous Task.
+                    self.sneakPeek.show = false
+                    self.sneakPeekDuration = 1.5
+                }
+            }
+        }
+    }
+
+    @Published var sneakPeek: sneakPeek = .init() {
+        didSet {
+            if sneakPeek.show {
+                scheduleSneakPeekHide(after: sneakPeekDuration)
+            } else {
+                sneakPeekTask?.cancel()
+            }
+        }
+    }
+
+    func toggleExpandingView(
+        status: Bool,
+        type: SneakContentType,
+        value: CGFloat = 0,
+        browser: BrowserType = .chromium
+    ) {
+        Task { @MainActor in
+            withAnimation(.smooth) {
+                self.expandingView.show = status
+                self.expandingView.type = type
+                self.expandingView.value = value
+                self.expandingView.browser = browser
+            }
+        }
+    }
+
+    private var expandingViewTask: Task<Void, Never>?
+
+    @Published var expandingView: ExpandedItem = .init() {
+        didSet {
+            if expandingView.show {
+                expandingViewTask?.cancel()
+                let duration: TimeInterval = (expandingView.type == .download ? 2 : 3)
+                let currentType = expandingView.type
+                expandingViewTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(duration))
+                    guard let self = self, !Task.isCancelled else { return }
+                    self.toggleExpandingView(status: false, type: currentType)
+                }
+            } else {
+                expandingViewTask?.cancel()
+            }
+        }
+    }
+    
+    func showEmpty() {
+        currentView = .home
+    }
+}
