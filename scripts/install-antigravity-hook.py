@@ -14,7 +14,7 @@ GROUP = 'boringnotch-activity'
 
 def handler(event, provider='antigravity'):
     return {'type': 'command', 'command': shlex.join([sys.executable, str(SCRIPT), event, provider]),
-            'timeout': 3 if provider == 'antigravity' else 3000}
+            'timeout': 3000 if provider == 'gemini' else 3}
 
 
 def install(config, provider):
@@ -48,11 +48,16 @@ def install(config, provider):
         }
     else:
         hooks = data.setdefault('hooks', {})
-        for event in ('BeforeAgent', 'BeforeTool', 'AfterTool', 'AfterAgent', 'SessionEnd'):
+        events = ('BeforeAgent', 'BeforeTool', 'AfterTool', 'AfterAgent', 'SessionEnd', 'Notification') if provider == 'gemini' else (
+            'PermissionRequest', 'PermissionDenied', 'PostToolUse', 'PostToolUseFailure', 'Stop', 'SessionEnd')
+        for event in events:
             entries = hooks.setdefault(event, [])
-            command = handler(event, 'gemini')
+            command = handler(event, provider)
             if not any(isinstance(e, dict) and command in e.get('hooks', []) for e in entries):
-                entries.append({'matcher': '.*', 'hooks': [command]})
+                group = {'hooks': [command]}
+                if provider == 'gemini' and event != 'Notification':
+                    group['matcher'] = '.*'
+                entries.append(group)
     updated = (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
     if updated != existing:
         config.parent.mkdir(parents=True, exist_ok=True)
@@ -73,6 +78,8 @@ def ours(entry):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--provider', choices=('antigravity', 'gemini'), default='antigravity')
+    parser.add_argument('--provider', choices=('antigravity', 'gemini', 'claude'), default='antigravity')
     args = parser.parse_args()
-    install(Path.home() / '.gemini' / ('config/hooks.json' if args.provider == 'antigravity' else 'settings.json'), args.provider)
+    locations = {'antigravity': '.gemini/config/hooks.json', 'gemini': '.gemini/settings.json',
+                 'claude': '.claude/settings.json'}
+    install(Path.home() / locations[args.provider], args.provider)

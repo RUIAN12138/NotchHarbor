@@ -44,5 +44,6 @@ with tempfile.TemporaryDirectory(prefix='notch-agent-markdown-') as folder:
     main = Path(folder) / 'main.swift'
     executable = Path(folder) / 'check'
     main.write_text('import SwiftUI\n' + renderer + '\n' + checks)
-    subprocess.run(['xcrun', 'swiftc', str(main), '-o', str(executable)], check=True)
+    device_views = root / 'boringNotch/components/Notch/DeviceActivity.swift'
+    subprocess.run(['xcrun', 'swiftc', str(main), str(device_views), '-o', str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

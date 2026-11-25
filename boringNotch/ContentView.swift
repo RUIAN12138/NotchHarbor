@@ -255,6 +255,7 @@ struct ContentView: View {
     @State private var isHovering: Bool = false
     @AppStorage(MusicSpectrumSignal.enabledKey) private var musicLightEnabled = true
     @StateObject private var musicLightSignal = MusicSpectrumSignal()
+    @State private var textNeedsOutline = false
     @ObservedObject private var spotlightGuide = NotchSpotlightGuideController.shared
     @State private var attentionGlow = false
     @State private var anyDropDebounceTask: Task<Void, Never>?
@@ -321,8 +322,12 @@ struct ContentView: View {
             ? alertDetail?.id : nil
     }
 
+    private var pointerInsideCompactAlert: Bool {
+        compactCountdownID != nil && vm.acceptsWindowPointer(at: NSEvent.mouseLocation)
+    }
+
     private var pausesCompactCountdown: Bool {
-        pointerWithinHoverArea || menuIsTracking || pageInteractionActive || replyPullOffset > 0
+        pointerInsideCompactAlert || menuIsTracking || pageInteractionActive || replyPullOffset > 0
             || (completionReply != nil && replyPopupMotion.hasRecentHeadActivity)
     }
 
@@ -332,6 +337,36 @@ struct ContentView: View {
 
     private var activeTransientAgentPopupID: String? {
         activeAgentRequest?.agentAttentionKey ?? activeCompletionPopupID
+    }
+
+    private var inlinePendingApproval: IslandActivity? {
+        guard !vm.compactAlertPresented, !vm.isSpotlightGuideActive else { return nil }
+        let now = Date().timeIntervalSince1970
+        return activities.proactiveAlerts.first { $0.hasPendingAgentApproval && $0.expires > now }
+    }
+
+    private func inlineApprovalButton(_ alert: IslandActivity) -> some View {
+        Button {
+            guard let key = alert.agentAttentionKey,
+                  let request = activities.currentAgentAttention(for: key) else { return }
+            if activities.codexApproval(for: request)?.route == "desktop" {
+                AgentApplicationIcons.open(activity: request)
+                return
+            }
+            seenAgentRequests.insert(key)
+            clearInlineCompletion()
+            showCompactAlert(request)
+        } label: {
+            Label("待审批", systemImage: "hand.raised.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 10)
+                .frame(height: 24)
+                .background(.black.opacity(0.84), in: Capsule())
+                .overlay { Capsule().strokeBorder(.orange.opacity(0.30), lineWidth: 1) }
+        }
+        .buttonStyle(NotchControlStyle())
+        .accessibilityIdentifier("agent-inline-approval")
     }
 
     private var pendingAgentPopup: IslandActivity? {
@@ -573,6 +608,8 @@ struct ContentView: View {
                     }
                 }
                     .environment(\.colorScheme, vm.notchState == .open ? glassContentScheme : .dark)
+                    .environment(\.notchTextNeedsOutline, vm.notchState == .open && !reduceTransparency
+                                 && desktopRefractionEnabled && textNeedsOutline)
                     .foregroundStyle(.primary)
                     .frame(alignment: .top)
                     .padding(.horizontal, vm.notchState == .open ? expandedContentHorizontalInset : cornerRadiusInsets.closed.bottom)
@@ -586,7 +623,9 @@ struct ContentView: View {
                     .clipShape(currentNotchShape)
                     .overlay {
                         if compactCountdownID != nil, let countdown = compactAlertCountdown {
-                            CompactAlertEdgeLight(shape: currentNotchShape, countdown: countdown)
+                            CompactAlertEdgeLight(shape: currentNotchShape, countdown: countdown,
+                                                  hovered: pointerInsideCompactAlert)
+                                .transition(reduceMotion ? .identity : .opacity)
                         }
                     }
                     .background {
@@ -604,7 +643,8 @@ struct ContentView: View {
                             musicSignal: musicLightActive && musicLightSignal.audible ? musicLightSignal : nil,
                             desktopRefractionEnabled: desktopRefractionEnabled && !vm.openedForShelfDrag,
                             keepsAgentConversationContrast: isAgentConversationPage,
-                            usesDarkGlassAppearance: systemColorScheme == .dark, transparency: siriGlassTransparency
+                            usesDarkGlassAppearance: systemColorScheme == .dark, transparency: siriGlassTransparency,
+                            textContrastChanged: { textNeedsOutline = $0 }
                         )
                             .environment(\.colorScheme, glassMaterialScheme)
                             .animation(reduceMotion ? nil : animationSpring, value: closedHoverHighlight)
@@ -831,6 +871,10 @@ struct ContentView: View {
             headMotionWakingReply = false
             withAnimation(shellAnimationForClose) { vm.close() }
         }
+        .onChange(of: vm.pointerWithinHitRegion) { _, _ in
+            guard compactCountdownID != nil else { return }
+            compactAlertCountdown?.setPaused(pausesCompactCountdown, at: .now)
+        }
         .task(id: compactCountdownID) {
             guard let id = compactCountdownID else { return }
             while !Task.isCancelled, id == compactCountdownID, var countdown = compactAlertCountdown {
@@ -839,7 +883,7 @@ struct ContentView: View {
                 countdown.setPaused(paused, at: now)
                 if countdown != compactAlertCountdown { compactAlertCountdown = countdown }
                 let remaining = countdown.remaining(at: now)
-                if !paused && remaining == .zero {
+                if !paused && remaining == .zero && !pausesCompactCountdown {
                     closeTimedCompactAlert()
                     return
                 }
@@ -1084,7 +1128,7 @@ struct ContentView: View {
             if presentedAlert.kind == "clipboard-copy" {
                 HStack(spacing: 7) {
                     CompactAlertIcon(alert: presentedAlert, size: 22).id(presentedAlert.id)
-                    Text(presentedAlert.title).font(.system(size: 13, weight: .semibold))
+                    Text(presentedAlert.title).notchReadableText().font(.system(size: 13, weight: .semibold))
                 }
                 .frame(height: 38)
                 .frame(maxWidth: .infinity)
@@ -1185,7 +1229,8 @@ struct ContentView: View {
                     } else {
                         BoringHeader(
                             cameraClearanceWidth: headerClearance,
-                            headerHeight: expandedHeaderHeight
+                            headerHeight: expandedHeaderHeight,
+                            showsSpotlightTargets: guideVisible
                         )
                         .environment(\.colorScheme, glassHeaderScheme)
                         .environment(\.usesSharedGlassShell, usesSharedGlassShell)
@@ -1206,7 +1251,11 @@ struct ContentView: View {
                     }
                     .frame(width: vm.expandedPageSize.width, height: pageViewportHeight, alignment: .top)
                     .overlay(alignment: .topTrailing) {
-                        if let alert = inlineAgentCompletion {
+                        if let approval = inlinePendingApproval {
+                            inlineApprovalButton(approval)
+                                .padding(.top, 4)
+                                .padding(.trailing, 10)
+                        } else if let alert = inlineAgentCompletion {
                             inlineCompletionBanner(alert)
                                 .padding(.top, 4)
                                 .padding(.trailing, 10)
@@ -1223,12 +1272,16 @@ struct ContentView: View {
                     .environment(\.usesSharedGlassShell, usesSharedGlassShell)
                     .opacity(gestureProgress != 0 ? 1.0 - min(abs(gestureProgress) * 0.1, 0.3) : 1.0)
                 }
-                .overlay(alignment: .topLeading) {
+                .overlayPreferenceValue(NotchSpotlightNavigationAnchor.self) { anchor in
                     if guideVisible {
-                        NotchSpotlightCutoutOverlay(
-                            geometry: guideGeometry,
-                            step: spotlightGuide.currentStep
-                        )
+                        GeometryReader { layout in
+                            NotchSpotlightCutoutOverlay(
+                                geometry: guideGeometry,
+                                step: spotlightGuide.currentStep,
+                                navigationRect: anchor.map { layout[$0] }
+                            )
+                        }
+                        .allowsHitTesting(false)
                         .transition(.opacity)
                         .zIndex(10)
                     }
@@ -1517,7 +1570,8 @@ struct ContentView: View {
         if vm.notchState == .closed { return true }
         if alert.kind == "preview" { return !vm.isAgentReplyEditing }
         if alert.isCompletedAgentSession {
-            return !vm.compactAlertPresented && inlineAgentCompletion == nil && !menuIsTracking
+            return !(expandedPageRoute == .agent && vm.agentDetailExpanded)
+                && !vm.compactAlertPresented && inlineAgentCompletion == nil && !menuIsTracking
                 && !vm.anyDropZoneTargeting && !SharingStateManager.shared.preventNotchClose
         }
         return (alert.agentAttentionKey != nil
@@ -1632,7 +1686,7 @@ struct ContentView: View {
                 Image(systemName: alert.symbol)
                     .font(.system(size: 13, weight: .semibold))
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(alert.title).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                    Text(alert.title).notchReadableText().font(.system(size: 11, weight: .semibold)).lineLimit(1)
                     AgentPopupSummary(markdown: activities.agentCompletionSummary(for: alert))
                 }
                 Spacer(minLength: 0)
@@ -1646,7 +1700,10 @@ struct ContentView: View {
                     .overlay { shape.fill(.black.opacity(0.67)) }
             }
             .overlay {
-                if let inlineCountdown { CompactAlertEdgeLight(shape: shape, countdown: inlineCountdown) }
+                if let inlineCountdown {
+                    CompactAlertEdgeLight(shape: shape, countdown: inlineCountdown,
+                                          hovered: pointerOverInlineCompletion)
+                }
             }
             .environment(\.colorScheme, .dark)
             .contentShape(shape)
@@ -1725,12 +1782,13 @@ struct ContentView: View {
         completionReply = AgentInteraction.shared.completionReply(for: alert)
         compactHeadphoneSnapshot = alert.kind == "headphone-lid" ? activities.headphoneAlert : nil
         compactAlertCountdown = CompactAlertCountdown(
-            duration: compactDuration(for: alert), now: .now, paused: pausesCompactCountdown
+            duration: compactDuration(for: alert), now: .now, paused: false
         )
         selectedRouteBeforeOpening = vm.notchState == .closed
         let extraWidth: CGFloat = isTestingAgentHeadMotion ? 60 : (completionReply != nil || alert.agentAttentionKey != nil ? 32 : 0)
+        let approvalHeight: CGFloat = activities.codexApproval(for: alert)?.canReviewInNotch == true ? 170 : 100
         let height: CGFloat = alert.isCompactWeather ? 49 : isTestingAgentHeadMotion ? AgentReplyChoiceCard.practiceHeight
-            : alert.agentAttentionKey != nil ? 100 : completionReply != nil ? 108 : alert.kind == "headphone-lid" ? 133 : isShowingClipboardReceipt ? 49 : alert.isCompletedAgentSession && Defaults[.enableGestures] ? 71 : 67
+            : alert.agentAttentionKey != nil ? approvalHeight : completionReply != nil ? 108 : alert.kind == "headphone-lid" ? 133 : isShowingClipboardReceipt ? 49 : alert.isCompletedAgentSession && Defaults[.enableGestures] ? 71 : 67
         let weatherClearance = alert.isCompactWeather
             ? getPhysicalNotchSize(screenUUID: vm.screenUUID).map { $0.height + 14 } ?? 0 : 0
         withAnimation(reduceMotion ? nil : NotchPanelMotion.presentation(compact: true)) {
@@ -1738,9 +1796,11 @@ struct ContentView: View {
                                         physicalWidth: alert.isCompactWeather, minimumTopInset: weatherClearance)
             vm.open()
         }
+        compactAlertCountdown?.setPaused(pausesCompactCountdown, at: .now)
     }
 
     private func compactDuration(for alert: IslandActivity) -> Duration {
+        if alert.hasPendingAgentApproval { return .seconds(8) }
         if alert.agentAttentionKey != nil { return .seconds(5) }
         if alert.isCompletedAgentSession {
             if completionReply == nil { return AgentCompletionHoverReplay.popupDuration }
@@ -1867,7 +1927,7 @@ struct ContentView: View {
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 ActivityAvatar(activity: alert, size: 18).accessibilityHidden(true)
-                Text(source).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                Text(source).notchReadableText().font(.system(size: 12, weight: .semibold)).lineLimit(1)
                 Spacer(minLength: 2)
                 Label(approval ? "待审批" : "等待回复",
                       systemImage: approval ? "hand.raised.fill" : "bubble.left")
@@ -1877,32 +1937,41 @@ struct ContentView: View {
                     .background(accent.opacity(0.12), in: Capsule())
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(subject).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                Text(subject).notchReadableText().font(.system(size: 12, weight: .semibold)).lineLimit(1)
                 if let action = requestAction, action != subject {
-                    Text(action).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
+                    Text(action).notchReadableText().font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 27, alignment: .leading)
-            HStack(spacing: 5) {
-                Spacer(minLength: 0)
-                Button { dismissAgentPopup(alert) } label: {
-                    Text("稍后").font(.system(size: 11, weight: .medium))
-                        .padding(.horizontal, 9).frame(height: 24)
-                        .background(.primary.opacity(0.08), in: Capsule())
+            if let codexRequest, codexRequest.canReviewInNotch {
+                AgentCommandApprovalControls(item: alert, request: codexRequest, compact: true).id(codexRequest.id)
+            } else {
+                HStack(spacing: 5) {
+                    Spacer(minLength: 0)
+                    Button { dismissAgentPopup(alert) } label: {
+                        Text("稍后").notchReadableText().font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 9).frame(height: 24)
+                            .background(.primary.opacity(0.08), in: Capsule())
+                    }
+                    Button {
+                        guard let key = alert.agentAttentionKey, let current = activities.currentAgentAttention(for: key) else { return }
+                        if codexRequest?.route == "desktop" {
+                            dismissAgentPopup(current)
+                            AgentApplicationIcons.open(activity: current)
+                        } else {
+                            openAlertDestination(current)
+                        }
+                    } label: {
+                        Label(codexRequest?.route == "desktop" ? "在 Codex 审批" : approval ? "查看请求" : "查看并回复",
+                              systemImage: "arrow.up.right")
+                            .font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                            .padding(.horizontal, 9).frame(height: 24)
+                            .foregroundStyle(accent)
+                            .background(accent.opacity(0.16), in: Capsule())
+                    }
                 }
-                Button {
-                    guard let key = alert.agentAttentionKey, let current = activities.currentAgentAttention(for: key) else { return }
-                    openAlertDestination(current)
-                } label: {
-                    Label(codexRequest?.command != nil ? "查看并审批" : approval ? "查看请求" : "查看并回复",
-                          systemImage: "arrow.up.right")
-                        .font(.system(size: 11, weight: .semibold)).lineLimit(1)
-                        .padding(.horizontal, 9).frame(height: 24)
-                        .foregroundStyle(accent)
-                        .background(accent.opacity(0.16), in: Capsule())
-                }
+                .buttonStyle(NotchControlStyle())
             }
-            .buttonStyle(NotchControlStyle())
         }
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, minHeight: 85, alignment: .leading)
@@ -1913,8 +1982,8 @@ struct ContentView: View {
         HStack(spacing: 10) {
             AgentQuotaResetMark(alert: alert)
             VStack(alignment: .leading, spacing: 2) {
-                Text(alert.title).font(.system(size: 13, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8)
-                Text(alert.detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                Text(alert.title).notchReadableText().font(.system(size: 13, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                Text(alert.detail).notchReadableText().font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 0)
         }
@@ -1928,7 +1997,7 @@ struct ContentView: View {
         Button { openAlertDestination(alert) } label: {
             HStack(spacing: 6) {
                 CompactAlertIcon(alert: alert, size: 28, duration: 3.1)
-                Text(alert.title.replacingOccurrences(of: "预警信号", with: "预警"))
+                Text(alert.title.replacingOccurrences(of: "预警信号", with: "预警")).notchReadableText()
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(2)
                     .minimumScaleFactor(0.82)
@@ -1948,11 +2017,11 @@ struct ContentView: View {
                 CompactAlertIcon(alert: alert)
                     .id(alert.id)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(alert.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Text(alert.title).notchReadableText().font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     if alert.isCompletedAgentSession {
                         AgentPopupSummary(markdown: activities.agentCompletionSummary(for: alert))
                     } else {
-                        Text(alert.detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+                        Text(alert.detail).notchReadableText().font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

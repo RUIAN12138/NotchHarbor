@@ -467,6 +467,12 @@ final class AgentInteraction: ObservableObject {
                 if result.delivered == true { $0.deliveredAt = Date() }
                 if result.busy {
                     $0.unsentReply = text; $0.status = "此会话需在原应用中实时引导。未发送。"
+                } else if result.queued == true {
+                    $0.status = String(localized: "已在 Codex 原会话排队")
+                    $0.replyOptions = []; $0.context = ""
+                } else if result.steered == true {
+                    $0.status = String(localized: "已插入 Codex 当前回合")
+                    $0.replyOptions = []; $0.context = ""
                 } else {
                     let provider = source == "doubao" ? "豆包 CLI" : AgentConversationSource(rawValue: source)?.appName ?? "Agent"
                     $0.status = result.error ?? (result.delivered == true && (result.text == nil || source == "doubao")

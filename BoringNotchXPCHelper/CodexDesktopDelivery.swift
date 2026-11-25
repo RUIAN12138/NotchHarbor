@@ -21,8 +21,20 @@ final class CodexDesktopDelivery {
     private let descriptor: Int32
     private var clientID = "initializing-client"
 
-    init(home: URL) throws {
-        let path = home.appendingPathComponent(".codex/ipc/ipc.sock").path
+    static func connection(home: URL) -> CodexDesktopDelivery? {
+        let legacyName = "codex-ipc/ipc-\(getuid()).sock"
+        let candidates = [
+            home.appendingPathComponent(".codex/ipc/ipc.sock"),
+            FileManager.default.temporaryDirectory.appendingPathComponent(legacyName),
+            URL(fileURLWithPath: "/private/tmp").appendingPathComponent(legacyName)
+        ]
+        for candidate in candidates {
+            if let connection = try? CodexDesktopDelivery(path: candidate.path) { return connection }
+        }
+        return nil
+    }
+
+    private init(path: String) throws {
         let parent = (path as NSString).deletingLastPathComponent
         var socketInfo = stat()
         var parentInfo = stat()
@@ -30,7 +42,7 @@ final class CodexDesktopDelivery {
               socketInfo.st_uid == getuid(), parentInfo.st_uid == getuid(),
               socketInfo.st_mode & S_IFMT == S_IFSOCK,
               parentInfo.st_mode & S_IFMT == S_IFDIR,
-              socketInfo.st_mode & 0o077 == 0, parentInfo.st_mode & 0o077 == 0 else {
+              socketInfo.st_mode & 0o077 == 0, parentInfo.st_mode & 0o022 == 0 else {
             throw DeliveryError.unavailable
         }
         var address = sockaddr_un()
@@ -94,7 +106,8 @@ final class CodexDesktopDelivery {
             ["no-client-found", "disabled", "no-handler-for-request"].contains(reason) { return nil }
     }
 
-    func send(_ text: String, threadID: String, owner: String, preferSteer: Bool) throws {
+    /// Returns true when the owner accepted input into its active turn.
+    func send(_ text: String, threadID: String, owner: String) throws -> Bool {
         let messageID = UUID().uuidString.lowercased()
         let items: [[String: Any]] = [["type": "text", "text": text, "text_elements": []]]
         let restored: [String: Any] = [
@@ -105,19 +118,16 @@ final class CodexDesktopDelivery {
             ],
             "responsesapiClientMetadata": ["source": "codex", "client_type": "boringnotch"]
         ]
-        if preferSteer {
-            do {
-                let reply = try request("thread-follower-steer-turn", version: 1, params: [
-                    "conversationId": threadID, "clientUserMessageId": messageID, "input": items,
-                    "restoreMessage": restored, "additionalContext": [String: Any]()
-                ], target: owner, seconds: 12)
-                guard let result = Self.receipt(reply),
-                      let id = result["turnId"] as? String, !id.isEmpty else { throw DeliveryError.interrupted }
-                return
-            } catch DeliveryError.rejected(let reason) where Self.inactiveTurn(reason) {
-                // Explicit refusal proves the message did not enter this turn.
-                // A disconnection, timeout or other reply never triggers a resend.
-            }
+        do {
+            let reply = try request("thread-follower-steer-turn", version: 1, params: [
+                "conversationId": threadID, "clientUserMessageId": messageID, "input": items,
+                "attachments": [], "restoreMessage": restored, "additionalContext": [String: Any]()
+            ], target: owner, seconds: 12)
+            guard let result = Self.receipt(reply),
+                  let id = result["turnId"] as? String, !id.isEmpty else { throw DeliveryError.interrupted }
+            return true
+        } catch DeliveryError.rejected(let reason) where Self.inactiveTurn(reason) {
+            // An explicit no-active-turn response is the only safe reason to start one.
         }
         let reply = try request("thread-follower-start-turn", version: 2, params: [
             "conversationId": threadID, "turnStart": [
@@ -129,6 +139,7 @@ final class CodexDesktopDelivery {
               let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String, !id.isEmpty else {
             throw DeliveryError.interrupted
         }
+        return false
     }
 
     static func receipt(_ reply: [String: Any]) -> [String: Any]? {
@@ -139,6 +150,7 @@ final class CodexDesktopDelivery {
     private static func inactiveTurn(_ reason: String) -> Bool {
         let text = reason.lowercased()
         return text.contains("no active turn to steer")
+            || text.contains("cannot steer conversation because it has no active turn")
             || (text.contains("cannot steer conversation") && text.contains("active turn already ended"))
             || (text.contains("turn") && text.hasSuffix("is not active"))
     }

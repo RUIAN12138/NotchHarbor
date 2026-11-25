@@ -77,6 +77,22 @@ final class XPCHelperClient {
         }) ?? Data()
     }
 
+    @MainActor
+    func pendingCodexApprovals() async -> Data {
+        (try? await ensureRemoteService().withContinuation { service, continuation in
+            service.pendingCodexApprovals { continuation.resume(returning: $0) }
+        }) ?? Data()
+    }
+
+    @MainActor
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool {
+        (try? await ensureRemoteService().withContinuation { service, continuation in
+            service.submitCodexApproval(id.uuidString, sessionID: sessionID.uuidString, choice: choice) {
+                continuation.resume(returning: $0)
+            }
+        }) ?? false
+    }
+
     // MARK: - Accessibility
     
     nonisolated func requestAccessibilityAuthorization() {

@@ -16,6 +16,30 @@ class BoringNotchXPCHelper: NSObject, BoringNotchXPCHelperProtocol {
         AgentMessagingService.shared.perform(request, reply: reply)
     }
     
+    @objc func pendingCodexApprovals(with reply: @escaping (Data) -> Void) {
+        let folder = CodexApprovalPacket.directory
+        let pending = CodexApprovalPacket.pending(in: folder)
+        for request in pending { request.acknowledge(in: folder) }
+        let desktop = CodexDesktopApprovals.shared.pending(home: FileManager.default.homeDirectoryForCurrentUser)
+        reply((try? JSONEncoder().encode(pending + CodexServerApprovals.shared.pending() + desktop)) ?? Data())
+    }
+
+    @objc func submitCodexApproval(_ requestID: String, sessionID: String, choice: String,
+                                   with reply: @escaping (Bool) -> Void) {
+        let folder = CodexApprovalPacket.directory
+        guard let id = UUID(uuidString: requestID), let session = UUID(uuidString: sessionID),
+              let decision = CodexApprovalPacket.Choice(rawValue: choice) else { reply(false); return }
+        if CodexServerApprovals.shared.choose(decision, id: id, sessionID: session) { reply(true); return }
+        guard let request = CodexApprovalPacket.pending(in: folder).first(where: { $0.id == id && $0.sessionID == session })
+        else { reply(false); return }
+        do {
+            try request.submit(decision, in: folder)
+            reply(true)
+        } catch {
+            reply(false)
+        }
+    }
+
     @objc func appMemoryRanking(with reply: @escaping (Data) -> Void) {
         DispatchQueue.global(qos: .utility).async {
             struct Usage: Encodable {

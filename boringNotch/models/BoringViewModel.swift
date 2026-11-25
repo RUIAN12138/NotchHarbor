@@ -293,7 +293,7 @@ class BoringViewModel: NSObject, ObservableObject {
     var expandedNotchSize: CGSize {
         let baseHeight: CGFloat = compactAlertPresented
             ? compactAlertTopInset + compactAlertContentHeight
-            : (agentDetailExpanded ? 252 : Self.regularPanelHeight + agentListExtraHeight)
+            : (agentDetailExpanded ? 346 : Self.regularPanelHeight + agentListExtraHeight)
         return CGSize(width: expandedPanelWidth, height: baseHeight + spotlightGuideExtraHeight)
     }
 

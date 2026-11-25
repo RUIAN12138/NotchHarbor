@@ -26,3 +26,24 @@ Agent 列表保留进行中与待处理会话，每个来源另显示最多两�
 运行 `python3 scripts/install-codex-approval-hook.py` 注册独立的 `PermissionRequest` 钩子，然后在 Codex 的钩子审查界面信任 **Notch Harbor 审批**。CLI 可从 `/hooks` 进入审查。已有钩子保留。钩子的 JSON 字段和批复格式来自 [Codex Hooks 文档](https://learn.chatgpt.com/docs/hooks#permissionrequest)。
 
 潮屿先显示提醒，并在 Agent 页的对应会话保留待审批标记。点「查看并审批」可核对普通命令及其工作目录，再选择「仅允许这次」或「拒绝」。网络授权、需要选择权限范围的请求和其他无法完整呈现的审批可以交回 Codex。未处理的请求约 55 秒后回到 Codex 的默认流程。潮屿未确认收到请求时，钩子最多等 3 秒。潮屿不会修改 Codex 的审批策略或钩子信任设置。
+
+潮屿通过 Codex App Server 接续闲置的 CLI 会话时，沿用 Codex 的审批设置。App Server 为这个回合发出的普通命令审批会直接出现在灵动岛。确认和拒绝只适用于该请求，90 秒无操作即取消。涉及额外权限范围或网络授权时，潮屿会让当前批复失败，需回到 Codex 重新发起操作。协议参考 [Codex Island 的 App Server 请求解析](https://github.com/Jarcis-cy/codex-island-app/blob/main/apps/macos/CodexIsland/Services/Remote/RemoteAppServerServerRequestParser.swift) 和 [Codex App Server 审批文档](https://learn.chatgpt.com/docs/app-server#approvals)。
+
+### 桌面版与其他 Agent
+
+- **Codex 桌面版**从当前运行实例的本地审批通知日志读取待办和批复结束事件，只使用时间、会话 ID、请求 ID 和事件类型。弹窗和 Agent 页可打开对应的原会话，在 Codex 选择授权范围；终端 Hook 的直接批复入口仍可使用。
+- **Claude Code**运行 `python3 scripts/install-antigravity-hook.py --provider claude` 安装被动观察钩子。收到 `PermissionRequest` 时通知，权限被拒绝、工具结束或会话结束时清除。原有审批工具继续处理批复。
+- **Gemini CLI**运行 `python3 scripts/install-antigravity-hook.py --provider gemini` 接入 `Notification / ToolPermission`，在工具或会话结束时清除。批复在原终端完成。
+- **Antigravity、豆包 CLI 及其他接入方**可用现有 MCP 状态工具显式上报审批和清除。未发现可复用的 Antigravity 或豆包原会话审批通知接口时，普通工具启动不会被当作待审批。
+
+### 在灵动岛内批复命令
+
+收到可完整显示的 Bash 审批时，弹窗和 Agent 详情会显示原命令、工作目录，以及「仅允许这次」「拒绝」「交回原会话」。两个界面共用请求编号，重复点击不会重复提交。桌面原生权限请求仍可直接跳到对应的 Codex 会话处理。
+
+Claude Code 的被动审批提醒可以继续使用。若希望由潮屿直接处理 Claude Code 的 Bash 审批，可执行 `python3 scripts/install-codex-approval-hook.py --provider claude`，再从新会话开始测试。同一代理请只使用一个等待用户批复的钩子。安装器只追加潮屿的钩子，先备份现有配置。
+
+Codex Bash 钩子会先检查原会话当前回合的 `approvals_reviewer`，只有明确交给用户的审批才交给潮屿。自动审核和无法确认审批人的请求继续由 Codex 处理。参考 [Agent HUD 的审批判定](https://github.com/jazzenchen/agent-hud-open/blob/main/docs/hud.md)。[codex-web 的桌面回传](https://github.com/i-am-BT/codex-web/blob/main/desktop-ipc-client.mjs)需可用的 Desktop IPC；本机桌面版的连接不可用，潮屿不从日志回写授权。
+
+### Codex 桌面回复
+
+潮屿优先在原桌面会话的实时连接上请求插入当前回合。只有原会话明确回复当前没有运行中的回合，才开启新回合。连接不可用时，调用 Codex 桌面版自带的 `codex queue`，让 CLI 查找共享 App Server，并核对队列回执里的原会话 UUID。消息入队后显示「已在 Codex 原会话排队」，由原桌面会话接收。当前回合正在运行时，通常要等回合结束。没有明确回执时保留原文，不自动重发。参考 [Codex CLI 队列](https://github.com/openai/codex/blob/main/codex-rs/tui/src/session_queue_commands.rs) 与 [AgentBridge 的回执校验](https://github.com/firejune/AgentBridge/blob/main/skill/agent-bridge/scripts/codex_queue.py)。

@@ -11,7 +11,7 @@ folia_deps="$build_dir/folia"
 
 mkdir -p "$folia_deps" "$package_cache_dir"
 cp "$folia_source/package.json" "$folia_source/package-lock.json" "$folia_deps/"
-npm ci --prefix "$folia_deps" --prefer-offline --no-audit --no-fund
+(cd "$folia_deps" && npm ci --prefer-offline --no-audit --no-fund)
 
 skip_updates_flag=()
 if [[ -f "$package_dir/checkouts/swift-syntax/Package.swift" && -f "$package_dir/checkouts/Sparkle/Package.swift" ]]; then

@@ -548,7 +548,7 @@ struct ClipboardHistoryView: View {
     private func preview(for entry: ClipboardHistoryEntry) -> some View {
         switch entry.kind {
         case .text:
-            Text(entry.previewText)
+            Text(entry.previewText).notchReadableText()
                 .font(.system(size: 11, weight: .regular, design: .rounded))
                 .foregroundStyle(.primary.opacity(0.9))
                 .lineLimit(2)
@@ -578,7 +578,7 @@ struct ClipboardHistoryView: View {
                     .font(.system(size: 15, weight: .light))
                     .foregroundStyle(.secondary)
                 ForEach(Array(names.prefix(1).enumerated()), id: \.offset) { _, name in
-                    Text(name)
+                    Text(name).notchReadableText()
                         .font(.system(size: 11, weight: .medium, design: .rounded))
                         .lineLimit(1)
                         .truncationMode(.middle)

@@ -13,6 +13,7 @@ struct NotchDesktopRefraction: NSViewRepresentable {
     var shape: NotchShape
     var intensity: Double
     var previewCaptureSize: CGSize? = nil
+    var textContrastChanged: ((Bool) -> Void)? = nil
 
     func makeNSView(context: Context) -> RefractionHost {
         let host = RefractionHost()
@@ -22,6 +23,7 @@ struct NotchDesktopRefraction: NSViewRepresentable {
 
     func updateNSView(_ host: RefractionHost, context: Context) {
         let level = Float(intensity.isFinite ? min(1, max(0, intensity)) : 1)
+        host.textContrastChanged = textContrastChanged
         host.previewCaptureSize = previewCaptureSize
         guard host.shape.animatableData != shape.animatableData || host.intensity != level else { return }
         host.shape = shape
@@ -39,6 +41,7 @@ struct NotchDesktopRefraction: NSViewRepresentable {
 private struct RefractionFrame: @unchecked Sendable {
     let backing: CVMetalTexture
     let texture: MTLTexture
+    let pixels: CVPixelBuffer
 }
 
 private final class RefractionStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate {
@@ -68,7 +71,7 @@ private final class RefractionStreamOutput: NSObject, SCStreamOutput, SCStreamDe
         )
         guard result == kCVReturnSuccess, let backing,
               let texture = CVMetalTextureGetTexture(backing) else { return }
-        onFrame(stream, RefractionFrame(backing: backing, texture: texture))
+        onFrame(stream, RefractionFrame(backing: backing, texture: texture, pixels: buffer))
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -141,6 +144,9 @@ final class RefractionHost: NSView {
     private var drawScheduled = false
     private var inFlight = false
     private var dirty = false
+    var textContrastChanged: ((Bool) -> Void)?
+    private var brightBackdrop = false
+    private var contrastSampleAfter = ContinuousClock.Instant.now
     private var screenLocked = false
     private var displayAsleep = false
 
@@ -234,6 +240,11 @@ final class RefractionHost: NSView {
         dirty = false
         captureRect = nil
         surface.layer?.opacity = 0
+        if brightBackdrop {
+            brightBackdrop = false
+            let notify = textContrastChanged
+            DispatchQueue.main.async { notify?(false) }
+        }
         if let stream { stream.stopCapture { _ in } }
         stream = nil
         output = nil
@@ -332,11 +343,60 @@ final class RefractionHost: NSView {
         }
     }
 
+    private func sampleTextContrast(frame: RefractionFrame, local: CGRect, capture: CGRect) {
+        let now = ContinuousClock.now
+        guard textContrastChanged != nil, now >= contrastSampleAfter, local.height >= 64 else { return }
+        contrastSampleAfter = now + .milliseconds(500)
+        // Match the visible panel, rather than the full transparent window or the capture margin.
+        let area = CGRect(x: (local.minX - capture.minX) / capture.width,
+                          y: (local.minY - capture.minY) / capture.height,
+                          width: local.width / capture.width, height: local.height / capture.height)
+        let pixels = frame.pixels
+        let token = generation
+        sampleQueue.async { [weak self] in
+            guard let coverage = Self.brightCoverage(pixels, area: area) else { return }
+            DispatchQueue.main.async {
+                guard let self, self.generation == token else { return }
+                let bright = coverage >= (self.brightBackdrop ? 0.20 : 0.34)
+                guard bright != self.brightBackdrop else { return }
+                self.brightBackdrop = bright
+                self.textContrastChanged?(bright)
+            }
+        }
+    }
+
+    private nonisolated static func brightCoverage(_ pixels: CVPixelBuffer, area: CGRect) -> Double? {
+        guard CVPixelBufferGetPixelFormatType(pixels) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferLockBaseAddress(pixels, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixels) else { return nil }
+        let width = CVPixelBufferGetWidth(pixels)
+        let height = CVPixelBufferGetHeight(pixels)
+        let stride = CVPixelBufferGetBytesPerRow(pixels)
+        var samples = 0
+        var bright = 0
+        for row in 0..<5 {
+            let y = area.minY + area.height * (0.24 + Double(row) * 0.15)
+            for column in 0..<7 {
+                let x = area.minX + area.width * (0.13 + Double(column) * 0.122)
+                guard (0..<1).contains(x), (0..<1).contains(y) else { continue }
+                let offset = Int(y * Double(height)) * stride + Int(x * Double(width)) * 4
+                let blue = Double(base.load(fromByteOffset: offset, as: UInt8.self))
+                let green = Double(base.load(fromByteOffset: offset + 1, as: UInt8.self))
+                let red = Double(base.load(fromByteOffset: offset + 2, as: UInt8.self))
+                if red * 0.2126 + green * 0.7152 + blue * 0.0722 >= 187 { bright += 1 }
+                samples += 1
+            }
+        }
+        return samples > 0 ? Double(bright) / Double(samples) : nil
+    }
+
     private func drawFrame() {
         guard dirty, !inFlight, let captureRect, let frame = latestFrame, let location, let window,
               let queue, let pipeline, bounds.width > 0, bounds.height > 0 else { return }
         let windowRect = convert(bounds, to: nil)
         let local = Self.rectForCapture(windowRect, window: window, windowRect: location.windowRect)
+        sampleTextContrast(frame: frame, local: local, capture: captureRect)
         // The desktop input uses a point-sized drawable. Updating it on
         // the deferred draw path avoids changing the layer during layout.
         if surface.drawableSize != bounds.size { surface.drawableSize = bounds.size }

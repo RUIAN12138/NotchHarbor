@@ -150,6 +150,7 @@ struct NotchGlassBackground: View, Animatable {
     var usesDarkGlassAppearance: Bool
     var transparency: Double
     var previewCaptureSize: CGSize?
+    var textContrastChanged: ((Bool) -> Void)?
     private var agentConversationContrast: CGFloat
 
     /// Driven by `isExpanded`, but interpolated between states instead of
@@ -174,7 +175,8 @@ struct NotchGlassBackground: View, Animatable {
         keepsAgentConversationContrast: Bool = false,
         usesDarkGlassAppearance: Bool = false,
         transparency: Double = 0.5,
-        previewCaptureSize: CGSize? = nil
+        previewCaptureSize: CGSize? = nil,
+        textContrastChanged: ((Bool) -> Void)? = nil
     ) {
         self.shape = shape
         self.isExpanded = isExpanded
@@ -194,6 +196,7 @@ struct NotchGlassBackground: View, Animatable {
         self.usesDarkGlassAppearance = usesDarkGlassAppearance
         self.transparency = transparency
         self.previewCaptureSize = previewCaptureSize
+        self.textContrastChanged = textContrastChanged
         self.reveal = isExpanded ? 1 : 0
     }
 
@@ -243,7 +246,8 @@ struct NotchGlassBackground: View, Animatable {
             baseSurface
 
             if opticalSurfaceActive && desktopRefractionEnabled && clampedReveal > 0.08 {
-                NotchDesktopRefraction(shape: shape, intensity: effectiveLightIntensity, previewCaptureSize: previewCaptureSize)
+                NotchDesktopRefraction(shape: shape, intensity: effectiveLightIntensity,
+                                           previewCaptureSize: previewCaptureSize, textContrastChanged: textContrastChanged)
                     .opacity(Double(notchPhase(clampedReveal, from: 0.08, to: 0.70)))
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
@@ -540,15 +544,15 @@ private struct NotchGlassBacking: View {
             let lower = graphite + (.init(0.13, 0.15, 0.18) - graphite) * emphasis
             let graphiteColor = Color(red: graphite.x, green: graphite.y, blue: graphite.z)
             let lowerGlass = Color(red: lower.x, green: lower.y, blue: lower.z)
-            let bodyOpacity = darkAppearance ? 0.81 + 0.13 * emphasis : 0.98
+            let bodyOpacity = darkAppearance ? 0.81 + 0.10 * emphasis : 0.98
             let controlOpacity = darkAppearance ? 0.84 + 0.09 * emphasis : 0.96
             let lipOpacity = darkAppearance ? 0.34 : 0.40
-            let lowerOpacity = bodyOpacity + ((darkAppearance ? 0.48 : 0.52) - bodyOpacity) * emphasis
+            let lowerOpacity = bodyOpacity + ((darkAppearance ? 0.72 : 0.76) - bodyOpacity) * emphasis
 
             LinearGradient(stops: [
                 .init(color: .black, location: 0),
                 .init(color: graphiteColor.opacity(ink(bodyOpacity)), location: 0.29),
-                .init(color: graphiteColor.opacity(ink(bodyOpacity - 0.12 * emphasis)), location: 0.58),
+                .init(color: graphiteColor.opacity(ink(bodyOpacity - 0.045 * emphasis)), location: 0.58),
                 .init(color: lowerGlass.opacity(ink(lowerOpacity)), location: 0.91),
                 .init(color: graphiteColor.opacity(ink(controlOpacity - 0.32 * emphasis)), location: 0.966),
                 .init(color: graphiteColor.opacity(ink(lipOpacity)), location: 1),
@@ -567,28 +571,52 @@ private struct NotchGlassBacking: View {
     }
 }
 
-/// The compact popup's remaining time, drawn on the same path as its glass.
+/// Countdown and hover illumination share the popup's existing glass outline.
 struct CompactAlertEdgeLight: View {
     let shape: NotchShape
     let countdown: CompactAlertCountdown
+    let hovered: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: reduceMotion ? 0.25 : 1.0 / 24, paused: countdown.isPaused)) { _ in
-            let remaining = countdown.fractionRemaining(at: .now)
-            Canvas { context, size in
-                guard remaining > 0, size.width > 6, size.height > 6 else { return }
-                let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2)
-                let band = shape.path(in: bounds).trimmedPath(from: 0, to: remaining)
-                context.stroke(band, with: .color(.white.opacity(0.13)),
-                               style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
-                context.stroke(band, with: .linearGradient(
-                    Gradient(colors: [.white.opacity(0.46), .white.opacity(0.9)]),
-                    startPoint: CGPoint(x: bounds.midX, y: bounds.minY),
-                    endPoint: CGPoint(x: bounds.midX, y: bounds.maxY)
-                ), style: StrokeStyle(lineWidth: 1.4, lineCap: .round, lineJoin: .round))
+        ZStack {
+            TimelineView(.animation(minimumInterval: reduceMotion ? 0.25 : 1.0 / 24,
+                                    paused: countdown.isPaused || hovered)) { _ in
+                let now = ContinuousClock.now
+                let remaining = countdown.fractionRemaining(at: now)
+                let fade = min(1, countdown.remaining(at: now) / .milliseconds(220))
+                Canvas { context, size in
+                    guard remaining > 0, size.width > 6, size.height > 6 else { return }
+                    let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2)
+                    let band = shape.path(in: bounds).trimmedPath(from: 0, to: remaining)
+                    var context = context
+                    context.opacity = fade
+                    context.stroke(band, with: .color(.white.opacity(0.13)),
+                                   style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                    context.stroke(band, with: .linearGradient(
+                        Gradient(colors: [.white.opacity(0.46), .white.opacity(0.9)]),
+                        startPoint: CGPoint(x: bounds.midX, y: bounds.minY),
+                        endPoint: CGPoint(x: bounds.midX, y: bounds.maxY)
+                    ), style: StrokeStyle(lineWidth: 1.4, lineCap: .round, lineJoin: .round))
+                }
             }
+            .opacity(hovered ? 0 : 1)
+
+            Canvas { context, size in
+                guard size.width > 6, size.height > 6 else { return }
+                let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2)
+                let rim = shape.path(in: bounds)
+                context.drawLayer { bloom in
+                    bloom.addFilter(.blur(radius: 3))
+                    bloom.stroke(rim, with: .color(.white.opacity(0.24)),
+                                 style: StrokeStyle(lineWidth: 4, lineJoin: .round))
+                }
+                context.stroke(rim, with: .color(.white.opacity(0.33)),
+                               style: StrokeStyle(lineWidth: 0.9, lineJoin: .round))
+            }
+            .opacity(hovered ? 1 : 0)
         }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: hovered)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }

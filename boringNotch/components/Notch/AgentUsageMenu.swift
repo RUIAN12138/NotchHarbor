@@ -231,7 +231,6 @@ struct AgentUsagePopover: View {
     private var apiEnabled: Bool { quickReplySource == .api }
     @State private var page: Page = .overview
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var visible = false
     @State private var measured = false
     @State private var sample: MenuPowerSample?
 
@@ -315,7 +314,7 @@ struct AgentUsagePopover: View {
                 sourceTabs
                 quotaDetail
             case .power:
-                MenuPowerFlowDetail(sample: sample, measured: measured, animates: visible && !reduceMotion)
+                MenuPowerFlowDetail(sample: sample, measured: measured, animates: !reduceMotion)
                 MenuMemoryTrend(readApps: readMemoryApps)
             }
         }
@@ -323,13 +322,8 @@ struct AgentUsagePopover: View {
         .frame(width: 276)
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityIdentifier("agent-usage-details")
-        .background(MenuPowerWindowVisibility { shown in
-            visible = shown
-            if !shown { page = .overview }
-        })
-        .task(id: visible) {
-            guard visible else { return }
-            let telemetry = MenuPowerTelemetry()
+        .task {
+            let telemetry = MenuPowerTelemetry.shared
             while !Task.isCancelled {
                 let reading = await telemetry.read()
                 guard !Task.isCancelled else { return }
@@ -650,49 +644,6 @@ private struct MenuPowerSection: View {
     }
 }
 
-private struct MenuPowerWindowVisibility: NSViewRepresentable {
-    var changed: (Bool) -> Void
-
-    func makeNSView(context: Context) -> VisibilityView {
-        let view = VisibilityView()
-        view.changed = changed
-        return view
-    }
-
-    func updateNSView(_ view: VisibilityView, context: Context) {
-        view.changed = changed
-    }
-
-    final class VisibilityView: NSView {
-        var changed: ((Bool) -> Void)?
-        private var wasVisible = false
-
-        override func viewWillMove(toWindow newWindow: NSWindow?) {
-            NotificationCenter.default.removeObserver(self)
-            super.viewWillMove(toWindow: newWindow)
-        }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if let window {
-                NotificationCenter.default.addObserver(self, selector: #selector(refresh),
-                    name: NSWindow.didChangeOcclusionStateNotification, object: window)
-            }
-            refresh()
-        }
-
-        @objc private func refresh() {
-            let visible = window?.occlusionState.contains(.visible) == true
-            guard visible != wasVisible else { return }
-            wasVisible = visible
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.wasVisible == visible else { return }
-                self.changed?(visible)
-            }
-        }
-    }
-}
-
 @MainActor
 final class MenuMemoryMonitor: ObservableObject {
     static let shared = MenuMemoryMonitor()
@@ -704,14 +655,14 @@ final class MenuMemoryMonitor: ObservableObject {
     private init() {
         sampler = Task { [weak self] in
             while !Task.isCancelled {
+                let sample = await MenuMemoryTelemetry.shared.read()
+                guard !Task.isCancelled, let self else { return }
                 let now = Date()
-                guard let self else { return }
                 var history = self.points.filter { now.timeIntervalSince($0.date) <= Self.history }
-                if let sample = MenuMemorySnapshot.read() {
-                    history.append(sample)
-                }
+                if let sample { history.append(sample) }
                 self.points = history
-                try? await Task.sleep(for: .seconds(2))
+                do { try await Task.sleep(for: .seconds(1)) }
+                catch { break }
             }
         }
     }

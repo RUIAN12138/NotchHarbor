@@ -190,7 +190,7 @@ struct CalendarView: View {
         VStack(spacing: 2) {
             HStack(alignment: .center, spacing: 7) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(selectedDate.formatted(.dateTime.month(.abbreviated)))
+                    Text(selectedDate.formatted(.dateTime.month(.abbreviated))).notchReadableText()
                         .font(.subheadline)
                         .fontWeight(.semibold)
                         .foregroundColor(.primary)
@@ -447,10 +447,10 @@ struct EventListView: View {
             if compact {
                 HStack(spacing: 4) {
                     Circle().fill(Color(event.calendar.color)).frame(width: 4, height: 4)
-                    Text(event.title).font(.caption).lineLimit(1)
+                    Text(event.title).notchReadableText().font(.caption).lineLimit(1)
                     Spacer(minLength: 3)
                     if event.isAllDay { Text("全天").font(.caption2) }
-                    else { Text(event.start, style: .time).font(.caption2) }
+                    else { Text(event.start, style: .time).notchReadableText().font(.caption2) }
                 }
                 .frame(minHeight: 19)
                 .contentShape(Rectangle())
@@ -491,7 +491,7 @@ struct EventListView: View {
                     )
                     .opacity(1.0)  // Ensure the toggle is always fully opaque
                     HStack {
-                        Text(event.title)
+                        Text(event.title).notchReadableText()
                             .font(.callout)
                             .foregroundColor(.primary)
                             .lineLimit(showFullEventTitles ? nil : 1)
@@ -504,7 +504,7 @@ struct EventListView: View {
                                     .foregroundColor(.primary)
                                     .lineLimit(1)
                             } else {
-                                Text(event.start, style: .time)
+                                Text(event.start, style: .time).notchReadableText()
                                     .foregroundColor(.primary)
                                     .font(.caption)
                             }
@@ -528,7 +528,7 @@ struct EventListView: View {
                         .cornerRadius(1.5)
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(event.title)
+                        Text(event.title).notchReadableText()
                             .font(.callout)
                             .fontWeight(.medium)
                             .foregroundColor(.primary)
@@ -550,7 +550,7 @@ struct EventListView: View {
                                 .foregroundColor(.primary)
                                 .lineLimit(1)
                         } else {
-                            Text(event.start, style: .time)
+                            Text(event.start, style: .time).notchReadableText()
                                 .foregroundColor(.primary)
                             Text(event.end, style: .time)
                                 .foregroundColor(Color.secondary)

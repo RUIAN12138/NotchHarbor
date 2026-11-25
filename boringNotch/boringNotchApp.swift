@@ -256,6 +256,7 @@ private final class HarborStatusPopover: NSObject, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         presentationID = nil
         pendingSize = nil
+        popover.contentViewController = nil
         if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
         if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
         localClickMonitor = nil

@@ -110,6 +110,34 @@ with tempfile.TemporaryDirectory() as directory:
     assert not b.collect(path, 1010)
 print('PASS: Gemini CLI maps thinking, tool execution, completion and session end without prompt data')
 
+with tempfile.TemporaryDirectory() as directory:
+    path = Path(directory)
+    payload = dict(session_id=valid_id, cwd='/tmp/sample', message='PRIVATE')
+    assert not hook.record(dict(payload, notification_type='warning'), 'Notification', path, 1000, 'gemini')
+    assert not b.collect(path, 1001)
+    notice = dict(payload, notification_type='ToolPermission',
+                  details={'toolName':'run_shell_command', 'callId':'gemini-test', 'command':'PRIVATE'})
+    assert hook.record(notice, 'Notification', path, 1001, 'gemini')
+    gemini = b.collect(path, 1002)[0]
+    assert gemini['progress']['phase'] == 'waiting_for_approval'
+    assert gemini['progress']['lastTool'] == 'run_shell_command'
+    assert hook.record(notice, 'Notification', path, 1003, 'gemini')
+    assert b.collect(path, 1004)[0]['progress']['requestID'] == gemini['progress']['requestID']
+    assert hook.record(dict(payload, tool_use_id='claude-test', tool_name='Bash', tool_input={'command':'PRIVATE'}),
+                       'PermissionRequest', path, 1004, 'claude')
+    reports = b.collect(path, 1005)
+    assert {item['source'] for item in reports} == {'gemini', 'claude'}
+    assert {item['progress']['phase'] for item in reports} == {'waiting_for_approval'}
+    assert 'PRIVATE' not in ''.join(item.read_text() for item in path.glob('*.json'))
+    hook.record(payload, 'PermissionDenied', path, 1005, 'claude')
+    hook.record(payload, 'AfterTool', path, 1005, 'gemini')
+    assert {item['progress']['phase'] for item in b.collect(path, 1006)} == {'processing'}
+    hook.record(payload, 'SessionEnd', path, 1006, 'gemini')
+    hook.record(payload, 'SessionEnd', path, 1006, 'claude')
+    assert not b.collect(path, 1007)
+print('PASS: Gemini and Claude approvals, stable request IDs, sanitized notices, and resolution')
+
+
 from datetime import datetime, timezone
 from uuid import uuid4
 with tempfile.TemporaryDirectory() as directory:

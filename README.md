@@ -6,11 +6,13 @@
 
 <p align="center">
   <strong>把每一次切窗，留在屏幕顶端。</strong><br />
-  面向 macOS 14+ 的原生光学刘海工作台 —— 融合 30pt Metal 水滴折射壳体、媒体与 Folia 逐词歌词、跨窗文件架与隔空投送、滚轮局部划选剪贴板、多路 CLI Agent 同屏监管与菜单栏 65W 功率丝带。
+  面向 macOS 14+ 的原生光学刘海工作台 —— 融合 30pt Metal 水滴折射壳体、媒体与 Folia 逐词歌词、跨窗文件架与隔空投送、滚轮局部划选剪贴板、多路 CLI Agent 同屏监管与菜单栏实时功率监控。
 </p>
 
 <p align="center">
-  <img src="docs/media/demo-preview.gif" alt="Notch Harbor 动态演示" width="760" />
+  <a href="https://github.com/RUIAN12138/NotchHarbor/releases/latest">下载 Notch Harbor</a>
+  ·
+  <a href="https://github.com/RUIAN12138/NotchHarbor/releases/download/v2.7.4/notch-harbor-film-16x9.mp4">观看 16:9 宣传片</a>
 </p>
 
 ---

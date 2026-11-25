@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route live Codex PermissionRequest events to Notch Harbor."""
+"""Route live command approvals to Notch Harbor."""
 import json
 import os
 from pathlib import Path
@@ -13,6 +13,48 @@ import uuid
 
 LIFETIME = 55
 NOTIFIER = Path(__file__).with_name("activity-notify")
+
+
+def codex_is_asking_user(event, codex_home):
+    """Match this session's latest recorded turn, not global config defaults."""
+    try:
+        turn_id = uuid.UUID(event["turn_id"])
+        session_id = uuid.UUID(event["session_id"])
+        path = Path(event["transcript_path"])
+        sessions = (codex_home / "sessions").resolve()
+        if (not path.is_absolute() or not path.resolve().is_relative_to(sessions)
+                or not path.name.endswith(str(session_id) + ".jsonl")):
+            return False
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return False
+            meta = json.loads(stream.readline(128 * 1024))
+            if meta.get("type") != "session_meta" or uuid.UUID(meta["payload"]["id"]) != session_id:
+                return False
+            first = stream.tell()
+            tail = max(first, info.st_size - 2 * 1024 * 1024)
+            stream.seek(tail)
+            if tail > first:
+                stream.readline(2 * 1024 * 1024)
+            raw = stream.read(2 * 1024 * 1024)
+            for line in reversed(raw.splitlines()):
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(record, dict) or record.get("type") != "turn_context":
+                    continue
+                payload = record.get("payload", {})
+                return (uuid.UUID(payload["turn_id"]) == turn_id
+                        and payload.get("approvals_reviewer") == "user"
+                        and payload.get("approval_policy") not in (None, "never"))
+    except (OSError, KeyError, AttributeError, TypeError, ValueError):
+        pass
+    return False
+
+
 def notify():
     try:
         subprocess.run([str(NOTIFIER), "--codex-approval"], input=b"", timeout=1,
@@ -21,7 +63,9 @@ def notify():
         pass
 
 
-def make_request(event, now, pid):
+def make_request(event, now, pid, provider="codex"):
+    if provider not in ("codex", "claude"):
+        return None
     if not isinstance(event, dict) or event.get("hook_event_name") != "PermissionRequest":
         return None
     tool_input = event.get("tool_input")
@@ -36,13 +80,18 @@ def make_request(event, now, pid):
     # A complete plain shell command can be reviewed here. Requests for a
     # particular network host, permission set, or another tool stay in Codex.
     allowed_keys = {"command", "description", "justification", "cwd", "workdir"}
+    if provider == "claude":
+        allowed_keys |= {"timeout", "run_in_background"}
     can_decide = (tool == "Bash" and set(tool_input) <= allowed_keys
                   and isinstance(reason, str) and not reason.lstrip().lower().startswith("network-access ")
                   and isinstance(command, str) and 0 < len(command) <= 2000
                   and not any(unicodedata.category(c) in ("Cc", "Cf") and c not in "\t\n" for c in command)
                   and isinstance(cwd, str) and cwd.startswith("/") and len(cwd) <= 512
                   and not any(unicodedata.category(c) in ("Cc", "Cf") for c in cwd))
-    return dict(id=str(uuid.uuid4()), sessionID=session_id, tool=tool,
+    if provider == "claude" and not can_decide:
+        # The existing passive hook continues to surface the request.
+        return None
+    return dict(id=str(uuid.uuid4()), sessionID=session_id, tool=tool, provider=provider,
                 cwd=cwd[:512] if isinstance(cwd, str) else "",
                 reason=reason[:240] if isinstance(reason, str) else "",
                 command=command if can_decide else None, createdAt=now,
@@ -114,8 +163,16 @@ def hook_output(choice):
 def main():
     try:
         parent = os.getppid()
-        request = make_request(json.loads(sys.stdin.buffer.read(256 * 1024)), time.time(), os.getpid())
+        provider = sys.argv[1] if len(sys.argv) == 2 else "codex"
+        event = json.loads(sys.stdin.buffer.read(256 * 1024))
+        request = make_request(event, time.time(), os.getpid(), provider)
         if request is None:
+            return
+        if provider == "codex":
+            codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+            if not codex_is_asking_user(event, codex_home):
+                return
+        elif os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
             return
         root = private_folder(Path.home() / ".multiagent-notch" / "notch-harbor-approvals")
         choice = wait_for_choice(request, root, notify, parent)

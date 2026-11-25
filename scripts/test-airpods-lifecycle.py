@@ -6,6 +6,12 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 model = (root / 'boringNotch/components/Notch/UnifiedActivities.swift').read_text().split('private enum AgentActivityFilter:')[0]
 test = r'''
+@MainActor final class XPCHelperClient {
+    static let shared = XPCHelperClient()
+    func pendingCodexApprovals() async -> Data { Data() }
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool { false }
+}
+
 @main struct Check {
  @MainActor static func main() async {
   let hub = UnifiedActivities(observeSystem: false)

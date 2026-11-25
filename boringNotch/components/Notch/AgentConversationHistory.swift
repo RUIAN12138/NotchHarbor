@@ -60,7 +60,7 @@ enum AgentConversationHistory {
     enum AccessError: Error, Equatable { case noAccess, noSession }
 
     static func read(
-        bookmark: Data?, source: AgentConversationSource, id: UUID, before: UInt64?, knownFile: URL?
+        bookmark: Data?, source: AgentConversationSource, id: UUID, before: UInt64?, knownFile: URL?, limit: Int = 6
     ) throws -> (file: URL, page: AgentConversationPage) {
         let root: URL
         if let bookmark {
@@ -78,7 +78,7 @@ enum AgentConversationHistory {
             matches(candidate, within: resolved, source: source, id: id) ? candidate : nil
         }
         guard let file = try verifiedHint ?? find(in: resolved, source: source, id: id) else { throw AccessError.noSession }
-        return (file, try page(file: file, source: source, before: before))
+        return (file, try page(file: file, source: source, before: before, limit: limit))
     }
 
     static func find(in root: URL, source: AgentConversationSource, id: UUID) throws -> URL? {
@@ -157,7 +157,7 @@ enum AgentConversationHistory {
 
     /// Gemini CLI uses append-only records in newer versions and whole-history
     /// checkpoints in older ones. Only user/model message text is displayed.
-    private static func geminiPage(file: URL, before: UInt64?) throws -> AgentConversationPage {
+    private static func geminiPage(file: URL, before: UInt64?, limit: Int) throws -> AgentConversationPage {
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
         let end = try handle.seekToEnd()
@@ -220,7 +220,7 @@ enum AgentConversationHistory {
             guard UInt64(index) < (before ?? .max) else { return nil }
             return geminiMessage(row, offset: UInt64(index))
         }
-        let page = Array(visible.suffix(6))
+        let page = Array(visible.suffix(limit))
         return AgentConversationPage(messages: page, before: visible.count > page.count ? page.first?.id : nil)
     }
 
@@ -243,8 +243,8 @@ enum AgentConversationHistory {
         return AgentConversationMessage(id: offset, role: type == "user" ? "user" : "assistant", text: body)
     }
 
-    static func page(file: URL, source: AgentConversationSource, before: UInt64?) throws -> AgentConversationPage {
-        if source == .gemini { return try geminiPage(file: file, before: before) }
+    static func page(file: URL, source: AgentConversationSource, before: UInt64?, limit: Int = 6) throws -> AgentConversationPage {
+        if source == .gemini { return try geminiPage(file: file, before: before, limit: limit) }
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
         let end = try handle.seekToEnd()
@@ -268,9 +268,9 @@ enum AgentConversationHistory {
             let previous = first < bytes.count ? start + UInt64(first) : start
             records.insert(contentsOf: chunk, at: 0)
             upper = previous
-            if records.count >= 6 { break }
+            if records.count >= limit { break }
         }
-        let displayed = Array(records.suffix(6))
+        let displayed = Array(records.suffix(limit))
         let cursor = records.count > displayed.count ? displayed[0].id : upper
         return AgentConversationPage(messages: displayed, before: cursor > 0 ? cursor : nil)
     }

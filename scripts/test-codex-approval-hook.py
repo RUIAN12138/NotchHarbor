@@ -26,12 +26,43 @@ for extra in (dict(description="network-access https://example.com:443"),
     assert hook.make_request(unsupported, 1, os.getpid())["command"] is None
 
 with tempfile.TemporaryDirectory() as directory:
+    codex_home = Path(directory)
+    sessions = codex_home / "sessions"
+    sessions.mkdir()
+    live_turn = str(uuid.uuid4())
+    later_turn = str(uuid.uuid4())
+    transcript = sessions / ("rollout-" + event["session_id"] + ".jsonl")
+    review_event = dict(event, transcript_path=str(transcript), turn_id=live_turn)
+    metadata = {"type": "session_meta", "payload": {"id": event["session_id"]}}
+
+    def transcript_with(*reviewers):
+        rows = [metadata]
+        for index, reviewer in enumerate(reviewers):
+            rows.append({"type": "turn_context", "payload": {
+                "turn_id": live_turn if index == 0 else later_turn,
+                "approvals_reviewer": reviewer,
+                "approval_policy": "on-request",
+            }})
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    transcript_with("user")
+    assert hook.codex_is_asking_user(review_event, codex_home)
+    assert not hook.codex_is_asking_user(dict(review_event, session_id=str(uuid.uuid4())), codex_home)
+    transcript_with("auto_review")
+    assert not hook.codex_is_asking_user(review_event, codex_home)
+    transcript_with("user", "user")
+    assert not hook.codex_is_asking_user(review_event, codex_home)
+    assert hook.codex_is_asking_user(dict(review_event, turn_id=later_turn), codex_home)
+    transcript_with(None)
+    assert not hook.codex_is_asking_user(review_event, codex_home)
+
+with tempfile.TemporaryDirectory() as directory:
     root = hook.private_folder(Path(directory) / "private" / "approvals")
 
-    def run(payload, input_choice, ready=True):
+    def run(payload, input_choice, ready=True, provider="codex"):
         now = [0.0]
         observed = []
-        request = hook.make_request(payload, now[0], os.getpid())
+        request = hook.make_request(payload, now[0], os.getpid(), provider)
         request_file = root / (request["id"] + ".json")
 
         def notify():
@@ -53,6 +84,11 @@ with tempfile.TemporaryDirectory() as directory:
     for choice in ("allow", "deny"):
         assert run(event, choice)["hookSpecificOutput"]["decision"]["behavior"] == choice
     assert run(event, "native") is None
+    for choice in ("allow", "deny"):
+        assert run(event, choice, provider="claude")["hookSpecificOutput"]["decision"]["behavior"] == choice
+    assert hook.make_request(dict(event, tool_name="Write"), 1, os.getpid(), "claude") is None
+    assert hook.make_request(event, 1, os.getpid(), "gemini") is None
+    assert hook.make_request(event, 1, os.getpid(), "claude")["provider"] == "claude"
     assert run(event, None) is None
     assert run(event, "allow", ready=False) is None
     assert run(dict(event, tool_name="request_permissions"), "allow") is None
@@ -66,5 +102,13 @@ with tempfile.TemporaryDirectory() as directory:
     assert json.loads(config.read_text())["hooks"]["PermissionRequest"][0] == mock_agent_hud
     assert len(json.loads(config.read_text())["hooks"]["PermissionRequest"]) == 2
     assert json.loads(next(config.parent.glob("hooks-before-notch-harbor-*.json")).read_text()) == original
+
+    claude = Path(directory) / "claude-settings.json"
+    claude.write_text(json.dumps(original))
+    for _ in range(2):
+        installer.install(claude, root / "notch-hook.py", "claude")
+    entries = json.loads(claude.read_text())["hooks"]["PermissionRequest"]
+    assert entries[0] == mock_agent_hud and len(entries) == 2
+    assert entries[-1]["matcher"] == "Bash" and entries[-1]["hooks"][0]["command"].endswith(" claude")
 
 print("PASS: user decisions, timeout, no app, unsupported permissions fallback, and preserving pre-existing hooks")

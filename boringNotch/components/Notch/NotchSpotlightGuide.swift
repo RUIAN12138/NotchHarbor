@@ -50,49 +50,38 @@ enum SpotlightGuideStepKind: Int, CaseIterable, Sendable {
 
     func title(english: Bool) -> String {
         switch self {
-        case .navHubs:
-            return english ? "5-in-1 Top Hub Rail" : "五合一顶栏中枢"
-        case .musicFolia:
-            return english ? "Word-Synced Lyrics & Spectrum" : "Folia 逐词歌词与液态光谱"
-        case .shelfAirDrop:
-            return english ? "Drop Shelf & Quick AirDrop" : "跨窗文件暂存与一键投送"
-        case .clipboardAutoCopy:
-            return english ? "Wheel History & Substring Auto-Copy" : "滚轮横滑与划选自动复制"
-        case .agentSessions:
-            return english ? "Multi-Agent Hub & Menu Power Flow" : "多路 CLI Agent 监管与功耗监控"
-        case .calendarWeather:
-            return english ? "Weather Alerts & 7-Day Wheel" : "气象预警与七日滚轮日程"
+        case .navHubs: return english ? "Switch pages" : "切换页面"
+        case .musicFolia: return english ? "Follow the lyrics" : "跟唱与快进"
+        case .shelfAirDrop: return english ? "Drop a file" : "暂存与投送"
+        case .clipboardAutoCopy: return english ? "Reuse your clipboard" : "查看剪贴板"
+        case .agentSessions: return english ? "Open an Agent session" : "查看 Agent 会话"
+        case .calendarWeather: return english ? "Check today’s plans" : "查看天气和日程"
         }
     }
 
     func detail(english: Bool) -> String {
         switch self {
         case .navHubs:
-            return english
-                ? "Hover the left-wing icons for Dock magnification, or swipe horizontally with two fingers to switch hubs."
-                : "掠过左翼图标触发邻近放大，点击或双指横滑即可在五大高频工作台间秒切。"
+            return english ? "Click a highlighted icon or swipe sideways inside the island."
+                : "点高亮图标切页，也可以在灵动岛内双指横滑。"
         case .musicFolia:
-            return english
-                ? "Follow live Folia word-by-word lyrics and the 16-band SiriGlass waterline without leaving your active app."
-                : "实时同步逐词扫光歌词与底部 16 频段折射光波，支持直接拖拽进度条与调节音量。"
+            return english ? "Play a song to see synced lyrics. Click the progress bar to seek."
+                : "播放歌曲后可看同步歌词，点击进度条可跳到指定位置。"
         case .shelfAirDrop:
-            return english
-                ? "Drag any file toward the closed notch to wake the glass orb, stash items, or drop left for instant AirDrop."
-                : "抓起桌面或访达文件移向刘海即可唤醒光球暂存，拖入左侧绿色区域即可隔空投送。"
+            return english ? "Drop files into the shelf, or onto the AirDrop icon to share."
+                : "拖文件到暂存区保存，拖到隔空投送图标可分享。"
         case .clipboardAutoCopy:
-            return english
-                ? "Scroll horizontally through text, images, and files; hover to expand, select a substring, and leave to auto-copy."
-                : "滚轮翻阅文字图片与多文件记录；悬停展开长文本并划选局部，鼠标移出刘海即自动复制。"
+            return english ? "Hover over a card to preview it. Click to copy it."
+                : "悬停卡片查看完整内容，点击即可复制。"
         case .agentSessions:
-            return english
-                ? "Track Codex, Claude Code, Antigravity, and Doubao inline, send quick replies, and inspect 65W power flow in the menu bar."
-                : "同屏掌握多路 AI 会话审批并岛内发令；点击右上角菜单栏图标还可查看配额与功率丝带。"
+            return english ? "Open a conversation and press Tab in an empty field to send the suggestion."
+                : "点开会话，在空输入框按 Tab 可发送建议回复。"
         case .calendarWeather:
-            return english
-                ? "Check live weather alerts on the left and spin the 7-day wheel picker to preview upcoming events and reminders."
-                : "左侧实时展示气温与降水预警，右侧拨动七日滚轮即可速览会议日程与待办提醒。"
+            return english ? "Check weather on the left, then choose a date to see its events."
+                : "左边看天气，右边选日期查看日程。"
         }
     }
+
 }
 
 struct SpotlightGuideGeometry: Equatable, Sendable {
@@ -295,6 +284,14 @@ final class NotchSpotlightGuideController: ObservableObject {
     }
 }
 
+struct NotchSpotlightNavigationAnchor: PreferenceKey {
+    static let defaultValue: Anchor<CGRect>? = nil
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        if let next = nextValue() { value = next }
+    }
+}
+
 private struct AnimatableSpotlightData: VectorArithmetic {
     var x: Double
     var y: Double
@@ -403,12 +400,19 @@ private struct SpotlightHaloRimView: View, Animatable {
 struct NotchSpotlightCutoutOverlay: View {
     let geometry: SpotlightGuideGeometry
     let step: SpotlightGuideStepKind
+    var navigationRect: CGRect? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pulse = false
 
     private var holeData: AnimatableSpotlightData {
-        let rect = geometry.spotlightRect(for: step)
-        let r = geometry.cornerRadius(for: step)
+        let rect: CGRect
+        if step == .navHubs, let navigationRect, !navigationRect.isEmpty {
+            rect = SpotlightGuideGeometry.clamp(navigationRect.insetBy(dx: -4, dy: -1),
+                                               inside: geometry.upperBounds)
+        } else {
+            rect = geometry.spotlightRect(for: step)
+        }
+        let r = min(geometry.cornerRadius(for: step), min(rect.width, rect.height) / 2)
         return AnimatableSpotlightData(
             x: rect.origin.x,
             y: rect.origin.y,
@@ -422,18 +426,20 @@ struct NotchSpotlightCutoutOverlay: View {
         let bounds = geometry.upperBounds
         ZStack(alignment: .topLeading) {
             SpotlightReverseCutoutShape(hole: holeData)
-                .fill(Color.black.opacity(0.54), style: FillStyle(eoFill: true))
+                .fill(Color.black.opacity(0.43), style: FillStyle(eoFill: true))
 
             SpotlightHaloRimView(hole: holeData, pulse: pulse)
         }
         .frame(width: bounds.width, height: bounds.height)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-        .onAppear {
+        .task(id: step) {
+            pulse = false
             guard !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 1.25).repeatForever(autoreverses: true)) {
-                pulse = true
-            }
+            withAnimation(.easeOut(duration: 0.19)) { pulse = true }
+            try? await Task.sleep(for: .milliseconds(225))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.38)) { pulse = false }
         }
     }
 }
@@ -511,9 +517,12 @@ struct NotchSpotlightCoachBar: View {
                                 .fill(idx == safeIdx
                                       ? Color(red: 0.62, green: 0.84, blue: 1.0)
                                       : Color.white.opacity(0.24))
-                                .frame(width: idx == safeIdx ? 14 : 5, height: 5)
+                                .frame(width: idx == safeIdx ? 14 : 5, height: 4)
+                                .frame(width: 15, height: 13)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityAddTraits(idx == safeIdx ? .isSelected : [])
                         .accessibilityLabel(isEnglish ? "Step \(idx + 1)" : "第 \(idx + 1) 步")
                     }
                 }

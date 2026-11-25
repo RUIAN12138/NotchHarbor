@@ -7,9 +7,29 @@ root = Path(__file__).resolve().parents[1]
 model = (root / 'boringNotch/components/Notch/UnifiedActivities.swift').read_text().split('private enum AgentActivityFilter:')[0]
 checks = r'''
 extension UnifiedActivities {
-    @MainActor func refreshTestCodexApprovals() { refreshCodexApprovals() }
+    @MainActor func refreshTestCodexApprovals() async { await refreshCodexApprovals() }
     func receiveTestAgents(_ items: [IslandActivity]) throws {
         receiveAgents(try JSONEncoder().encode(items))
+    }
+}
+
+@MainActor final class XPCHelperClient {
+    static let shared = XPCHelperClient()
+    var testApprovals: URL?
+    var desktopApprovals: [CodexApprovalPacket] = []
+    func pendingCodexApprovals() async -> Data {
+        guard let testApprovals else { return Data() }
+        let pending = CodexApprovalPacket.pending(in: testApprovals)
+        for request in pending { request.acknowledge(in: testApprovals) }
+        return (try? JSONEncoder().encode(pending + desktopApprovals)) ?? Data()
+    }
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool {
+        guard let testApprovals, let choice = CodexApprovalPacket.Choice(rawValue: choice),
+              let request = CodexApprovalPacket.pending(in: testApprovals).first(where: {
+                  $0.id == id && $0.sessionID == sessionID
+              })
+        else { return false }
+        return (try? request.submit(choice, in: testApprovals)) != nil
     }
 }
 
@@ -41,7 +61,8 @@ extension UnifiedActivities {
         try FileManager.default.createDirectory(at: approvalFolder, withIntermediateDirectories: false,
                                                 attributes: [.posixPermissions: 0o700])
         let approvalHub = UnifiedActivities(observeSystem: false,
-            storageURL: folder.appendingPathComponent("approval-history"), approvalDirectory: approvalFolder)
+            storageURL: folder.appendingPathComponent("approval-history"))
+        XPCHelperClient.shared.testApprovals = approvalFolder
         let request = CodexApprovalRequest(id: UUID(), sessionID: UUID(), tool: "Bash", cwd: "/tmp/example",
             reason: "test approval", command: "/usr/bin/true", createdAt: now, expires: now + 55, pid: getpid())
         let requestURL = approvalFolder.appendingPathComponent(request.id.uuidString.lowercased() + ".json")
@@ -51,24 +72,55 @@ extension UnifiedActivities {
         underlying.sessionID = request.sessionID.uuidString
         underlying.expires = now + 50
         try approvalHub.receiveTestAgents([underlying])
-        approvalHub.refreshTestCodexApprovals()
+        await approvalHub.refreshTestCodexApprovals()
         let popup = approvalHub.proactiveAlerts.first!
         precondition(approvalHub.hasPendingAgentApprovals && popup.hasPendingAgentApproval)
         precondition(approvalHub.agentSessions.count == 1 && approvalHub.agentSessions.first?.id == popup.id)
         precondition(approvalHub.agentSession(for: popup.id) == popup && approvalHub.codexApproval(for: popup) == request)
         precondition(FileManager.default.fileExists(atPath: requestURL.deletingPathExtension().appendingPathExtension("ready").path))
-        try approvalHub.submitCodexApproval(.deny, request: request)
+        let sent = await approvalHub.submitCodexApproval(.deny, request: request)
+        precondition(sent)
         let result = try String(contentsOf: requestURL.deletingPathExtension().appendingPathExtension("decision"), encoding: .utf8)
         precondition(result == "deny")
-        do {
-            try approvalHub.submitCodexApproval(.allow, request: request)
-            preconditionFailure("A second decision must not overwrite the first")
-        } catch {}
+        let duplicate = await approvalHub.submitCodexApproval(.allow, request: request)
+        precondition(!duplicate, "A second decision must not overwrite the first")
         try FileManager.default.removeItem(at: requestURL)
-        approvalHub.refreshTestCodexApprovals()
+        await approvalHub.refreshTestCodexApprovals()
         precondition(approvalHub.currentAgentAttention(for: popup.agentAttentionKey!) == nil)
         precondition(approvalHub.agentSessions == [underlying])
         print("PASS: live Codex request reaches both popup and session detail, single choice, fallback to working")
+        XPCHelperClient.shared.desktopApprovals = [CodexApprovalPacket(id: UUID(), sessionID: request.sessionID,
+            tool: "permissionRequest", cwd: "", reason: "", command: nil, createdAt: now + 1,
+            expires: now + 100, pid: 0, route: "desktop")]
+        await approvalHub.refreshTestCodexApprovals()
+        let desktop = approvalHub.proactiveAlerts.first!
+        precondition(desktop.destinationAgentID(in: approvalHub.agentSessions) == underlying.id)
+        precondition(approvalHub.codexApproval(for: desktop)?.canReviewInNotch == false)
+        let nativeRow = approvalHub.codexApproval(for: desktop)!
+        let grant = await approvalHub.submitCodexApproval(.allow, request: nativeRow)
+        precondition(!grant, "Desktop notices must never authorize permissions from a log")
+        XPCHelperClient.shared.desktopApprovals = []
+        await approvalHub.refreshTestCodexApprovals()
+        precondition(approvalHub.currentAgentAttention(for: desktop.agentAttentionKey!) == nil)
+        print("PASS: desktop notices route to the exact original session and clear without a grant")
+        let claude = CodexApprovalPacket(id: UUID(), sessionID: request.sessionID, tool: "Bash",
+            cwd: "/tmp/claude", reason: "static test", command: "/usr/bin/true", createdAt: now,
+            expires: now + 55, pid: getpid(), provider: "claude")
+        let claudeURL = approvalFolder.appendingPathComponent(claude.id.uuidString.lowercased() + ".json")
+        try JSONEncoder().encode(claude).write(to: claudeURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: claudeURL.path)
+        await approvalHub.refreshTestCodexApprovals()
+        let claudePopup = approvalHub.proactiveAlerts.first!
+        precondition(claudePopup.source == "claude" && claudePopup.id != underlying.id)
+        precondition(approvalHub.codexApproval(for: claudePopup)?.canReviewInNotch == true)
+        var mismatchedProvider = claudePopup
+        mismatchedProvider.source = "codex"
+        precondition(approvalHub.codexApproval(for: mismatchedProvider) == nil)
+        try FileManager.default.removeItem(at: claudeURL)
+        await approvalHub.refreshTestCodexApprovals()
+        print("PASS: Claude and Codex approvals stay separate for the same session UUID")
+
+
         let running = session("one", phase: "processing", stamp: now + 1)
         try hub.receiveTestAgents([running])
         precondition(hub.agentSessions.count == 1 && hub.agentSessions[0].progress?.phase == "processing")
@@ -230,5 +282,6 @@ with tempfile.TemporaryDirectory(prefix='boring-agent-retention-') as folder:
     subprocess.run(['xcrun', 'swiftc', '-parse-as-library', str(work / 'Check.swift'),
                     str(root / 'boringNotch/components/Notch/DeviceActivity.swift'),
                     str(root / 'boringNotch/components/Notch/AgentConversationHistory.swift'),
+                    str(root / 'BoringNotchXPCHelper/CodexApprovalStore.swift'),
                     '-o', str(work / 'check')], check=True)
     subprocess.run([str(work / 'check')], check=True)

@@ -267,7 +267,7 @@ struct AgentPopupSummary: View {
     let markdown: String
 
     var body: some View {
-        Text(AgentMarkdownFormatting.inline(markdown))
+        Text(AgentMarkdownFormatting.inline(markdown)).notchReadableText()
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -306,7 +306,7 @@ struct AgentReplyChoiceCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text(rejected ? "会话已更新" : title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                Text(rejected ? "会话已更新" : title).notchReadableText().font(.system(size: 12, weight: .semibold)).lineLimit(1)
                 Spacer()
                 if isPractice {
                     Button(action: dismiss) {
@@ -430,7 +430,7 @@ struct AgentReplyChoiceCard: View {
         Button {
             select(index)
         } label: {
-            Text(AgentMarkdownFormatting.inline(options[index].title))
+            Text(AgentMarkdownFormatting.inline(options[index].title)).notchReadableText()
                 .font(.system(size: 11, weight: .medium))
                 .multilineTextAlignment(.center)
                 .lineLimit(2)

@@ -10,6 +10,8 @@ import Foundation
 /// The protocol that this service will vend as its API. This protocol will also need to be visible to the process hosting the service.
 @objc protocol BoringNotchXPCHelperProtocol {
     func agentInteraction(_ request: Data, with reply: @escaping (Data) -> Void)
+    func pendingCodexApprovals(with reply: @escaping (Data) -> Void)
+    func submitCodexApproval(_ requestID: String, sessionID: String, choice: String, with reply: @escaping (Bool) -> Void)
     func appMemoryRanking(with reply: @escaping (Data) -> Void)
     func isAccessibilityAuthorized(with reply: @escaping (Bool) -> Void)
     func requestAccessibilityAuthorization()
@@ -69,6 +71,8 @@ struct AgentInteractionResult: Codable {
     var error: String? = nil
     var busy: Bool = false
     var delivered: Bool? = nil
+    var queued: Bool?
+    var steered: Bool? = nil
 }
 
 /*

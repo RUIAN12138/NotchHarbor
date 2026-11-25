@@ -272,12 +272,12 @@ struct MusicControlsView: View {
                 Text(musicManager.isPlaying ? "正在播放" : "已暂停")
                     .font(.system(size: 13, weight: .semibold))
             } else {
-                Text(trimmedTitle)
+                Text(trimmedTitle).notchReadableText()
                     .font(.system(size: 14, weight: .semibold))
                     .layoutPriority(1)
             }
             if !sourceSubtitle.isEmpty {
-                Text(sourceSubtitle)
+                Text(sourceSubtitle).notchReadableText()
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
             }
@@ -761,9 +761,9 @@ struct NotchHomeView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Image(systemName: weather.symbol).font(.system(size: 18, weight: .medium))
                             .foregroundStyle(Color.accentColor)
-                        Text(weather.detail).font(.caption.weight(.semibold))
+                        Text(weather.detail).notchReadableText().font(.caption.weight(.semibold))
                             .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                        Text(weather.title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(weather.title).notchReadableText().font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         if warnings.isEmpty, let updated = activities.weatherUpdatedAt {
                             Text("更新于 \(updated.formatted(date: .omitted, time: .shortened))")
                                 .font(.caption2).foregroundStyle(.secondary)
@@ -950,12 +950,12 @@ private struct MusicLyricsFocusView: View {
     @ViewBuilder
     private func lyricText(_ label: String, active: Bool, progress: Double) -> some View {
         if #available(macOS 15.0, *), active, !reduceMotion {
-            Text(label).foregroundStyle(Color(nsColor: albumLyricInk(music.avgColor)))
+            Text(label).notchReadableText().foregroundStyle(Color(nsColor: albumLyricInk(music.avgColor)))
                 .textRenderer(MonetLineSweep(progress: progress))
         } else if active {
-            Text(label).foregroundStyle(Color(nsColor: albumLyricInk(music.avgColor)))
+            Text(label).notchReadableText().foregroundStyle(Color(nsColor: albumLyricInk(music.avgColor)))
         } else {
-            Text(label).foregroundStyle(.white)
+            Text(label).notchReadableText().foregroundStyle(.white)
         }
     }
 }
@@ -1196,7 +1196,7 @@ struct MusicSliderView: View {
     }
 
     private func timeLabel(_ seconds: Double) -> some View {
-        Text(timeString(from: seconds))
+        Text(timeString(from: seconds)).notchReadableText()
             .foregroundStyle(.white)
             .font(.system(size: 10, weight: .semibold).monospacedDigit())
             .lineLimit(1)

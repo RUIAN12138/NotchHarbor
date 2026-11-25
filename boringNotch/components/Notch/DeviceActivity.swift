@@ -435,7 +435,7 @@ struct HeadphoneBatteryRing: View {
                 }
             }.padding(stroke / 2).frame(width: size, height: size)
             if showsValue {
-                Text(value).font(.system(size: size * 0.43, weight: .regular))
+                Text(value).notchReadableText().font(.system(size: size * 0.43, weight: .regular))
                     .monospacedDigit().foregroundStyle(.primary)
             }
         }
@@ -452,7 +452,7 @@ struct HeadphoneConnectionCard: View {
     private var hasCase: Bool { ["airpods", "airpodspro"].contains(alert.symbol) }
     var body: some View {
         VStack(spacing: 4) {
-            Text(alert.name).font(.headline).lineLimit(1).frame(maxWidth: .infinity)
+            Text(alert.name).notchReadableText().font(.headline).lineLimit(1).frame(maxWidth: .infinity)
             HStack(alignment: .top, spacing: 0) {
                 VStack(spacing: 4) {
                     DeviceArt(alert: alert, size: artSize)
@@ -469,7 +469,7 @@ struct HeadphoneConnectionCard: View {
                 }
             }
             if alert.isPreview {
-                Text("模拟预览").font(.system(size: 9)).foregroundStyle(.secondary)
+                Text("模拟预览").notchReadableText().font(.system(size: 9)).foregroundStyle(.secondary)
             }
         }
         .multilineTextAlignment(.center)
@@ -622,4 +622,34 @@ final class AirPodsLidMonitor: NSObject, @preconcurrency CBCentralManagerDelegat
             onUpdate?(packet, identity)
         }
     }
+}
+
+private struct NotchTextContrastKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var notchTextNeedsOutline: Bool {
+        get { self[NotchTextContrastKey.self] }
+        set { self[NotchTextContrastKey.self] = newValue }
+    }
+}
+
+private struct NotchReadableText: ViewModifier {
+    @Environment(\.notchTextNeedsOutline) private var needsOutline
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if needsOutline {
+            content
+                .shadow(color: .black.opacity(0.92), radius: 0.65)
+                .shadow(color: .black.opacity(0.78), radius: 0.4, y: 0.35)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func notchReadableText() -> some View { modifier(NotchReadableText()) }
 }

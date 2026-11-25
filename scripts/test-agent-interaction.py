@@ -7,6 +7,12 @@ activity_source = (root / 'boringNotch/components/Notch/UnifiedActivities.swift'
 model = activity_source.split('private enum AgentActivityFilter:')[0]
 metrics = activity_source[activity_source.index('enum AgentSessionListMetrics {'):activity_source.index('private struct AgentSessionsPage:')]
 checks = r'''
+@MainActor final class XPCHelperClient {
+    static let shared = XPCHelperClient()
+    func pendingCodexApprovals() async -> Data { Data() }
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool { false }
+}
+
 extension UnifiedActivities {
     func receiveFixture(_ items: [IslandActivity]) throws { receiveAgents(try JSONEncoder().encode(items)) }
 }
@@ -335,6 +341,14 @@ extension UnifiedActivities {
     finish?(.init(delivered: true))
     precondition(client.draft(for: id).isEmpty && client.draft(for: second) == "另一个会话的草稿")
     precondition(client.state(id).status == "已发送至 Codex")
+    client.setDraft("这是排队回复", for: second)
+    client.sendDraft(source: "codex", id: second)
+    precondition(sent.last?.sessionID == second && sent.last?.text == "这是排队回复")
+    finish?(.init(queued: true))
+    precondition(client.draft(for: second).isEmpty)
+    precondition(client.state(second).status == "已在 Codex 原会话排队")
+    precondition(client.state(second).deliveredAt == nil)
+
     let interrupted = session("finished")
     try hub.receiveFixture([interrupted])
     var interruptedNotice = false

@@ -118,54 +118,20 @@ struct CodexApprovalRequest: Codable, Equatable {
     let createdAt: TimeInterval
     let expires: TimeInterval
     let pid: Int32
+    var route: String? = nil
+    var provider: String? = nil
+
+    var source: String { provider ?? "codex" }
+    var sourceName: String { source == "claude" ? "Claude" : "Codex" }
+    var canReviewInNotch: Bool { command != nil && (route == nil || route == "app-server") }
+
 
     var sessionActivityID: String {
-        SHA256.hash(data: Data(("codex|" + sessionID.uuidString.lowercased()).utf8))
+        SHA256.hash(data: Data((source + "|" + sessionID.uuidString.lowercased()).utf8))
             .map { String(format: "%02x", $0) }.joined()
     }
 
-    static let directory = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".multiagent-notch/notch-harbor-approvals", isDirectory: true)
 
-    static func pending(in directory: URL, now: TimeInterval = Date().timeIntervalSince1970) -> [Self] {
-        guard privatePath(directory.deletingLastPathComponent(), type: .typeDirectory),
-              privatePath(directory, type: .typeDirectory),
-              let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        else { return [] }
-        return files.filter { $0.pathExtension == "json" }.prefix(128).compactMap { file in
-            guard let id = UUID(uuidString: file.deletingPathExtension().lastPathComponent),
-                  privatePath(file, type: .typeRegular, maxBytes: 32768),
-                  let data = try? Data(contentsOf: file),
-                  let request = try? JSONDecoder().decode(Self.self, from: data),
-                  request.id == id, request.createdAt <= now + 5, request.expires > now,
-                  (0...60).contains(request.expires - request.createdAt),
-                  request.pid > 1, kill(request.pid, 0) == 0
-            else { return nil }
-            return request
-        }.sorted { ($0.createdAt, $0.id.uuidString) < ($1.createdAt, $1.id.uuidString) }
-    }
-
-    func acknowledge(in directory: URL) {
-        let ready = directory.appendingPathComponent(id.uuidString.lowercased() + ".ready")
-        try? Data().write(to: ready, options: .withoutOverwriting)
-    }
-
-    func submit(_ choice: Choice, in directory: URL) throws {
-        guard Self.pending(in: directory).contains(self), choice != .allow || command != nil else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        let decision = directory.appendingPathComponent(id.uuidString.lowercased() + ".decision")
-        try Data(choice.rawValue.utf8).write(to: decision, options: .withoutOverwriting)
-    }
-
-    private static func privatePath(_ url: URL, type: FileAttributeType, maxBytes: Int? = nil) -> Bool {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attributes[.type] as? FileAttributeType == type,
-              (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
-              let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue,
-              permissions & 0o077 == 0 else { return false }
-        return maxBytes.map { (attributes[.size] as? NSNumber)?.intValue ?? Int.max <= $0 } ?? true
-    }
 }
 
 struct AgentUsageWindow: Codable, Equatable {
@@ -594,67 +560,94 @@ final class UnifiedActivities: ObservableObject {
     }
 
     @Published private var codexApprovals: [CodexApprovalRequest] = []
-    private let codexApprovalDirectory: URL
     private var codexApprovalObserver: NSObjectProtocol?
     private var codexApprovalPoll: Task<Void, Never>?
 
-    private func refreshCodexApprovals() {
-        let pending = CodexApprovalRequest.pending(in: codexApprovalDirectory)
-        if pending != codexApprovals {
-            let known = Set(codexApprovals.map(\.id))
-            for request in pending where !known.contains(request.id) {
-                request.acknowledge(in: codexApprovalDirectory)
-            }
-            codexApprovals = pending
+    private var refreshingCodexApprovals = false
+    private var needsCodexApprovalRefresh = false
+
+    private func refreshCodexApprovals() async {
+        if refreshingCodexApprovals {
+            needsCodexApprovalRefresh = true
+            return
         }
-        if pending.isEmpty {
-            codexApprovalPoll?.cancel()
-            codexApprovalPoll = nil
-        } else if codexApprovalPoll == nil {
-            codexApprovalPoll = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .milliseconds(500))
-                    guard !Task.isCancelled, let self else { return }
-                    self.refreshCodexApprovals()
+        refreshingCodexApprovals = true
+        defer { refreshingCodexApprovals = false }
+        repeat {
+            needsCodexApprovalRefresh = false
+            let data = await XPCHelperClient.shared.pendingCodexApprovals()
+            guard !Task.isCancelled else { return }
+            if let pending = try? JSONDecoder().decode([CodexApprovalRequest].self, from: data),
+               pending != codexApprovals {
+                codexApprovals = pending
+            }
+        } while needsCodexApprovalRefresh && !Task.isCancelled
+    }
+
+    private func monitorDesktopApprovals() {
+        let hookFolder = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".multiagent-notch/notch-harbor-approvals", isDirectory: true)
+        codexApprovalPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let desktopRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex").isEmpty
+                let hookWaiting = !desktopRunning && ((try? FileManager.default.contentsOfDirectory(atPath: hookFolder.path))?
+                    .contains { $0.hasSuffix(".json") } == true)
+                if desktopRunning || hookWaiting || !self.codexApprovals.isEmpty {
+                    await self.refreshCodexApprovals()
                 }
+                try? await Task.sleep(for: .milliseconds(self.codexApprovals.isEmpty ? 750 : 420))
             }
         }
     }
 
-    private var liveCodexApprovalActivities: [IslandActivity] {
-        var sessions = Set<UUID>()
+    private var liveCommandApprovalActivities: [IslandActivity] {
+        var sessions = Set<String>()
         let now = Date().timeIntervalSince1970
-        return codexApprovals.filter { $0.expires > now && sessions.insert($0.sessionID).inserted }
-            .map { request in
-                let id = request.sessionID.uuidString.lowercased()
-                let existing = (activities + agentHistory).first {
-                    $0.source == "codex" && ($0.conversationID ?? $0.sessionID)?.lowercased() == id
-                }
-                return IslandActivity(id: existing?.id ?? request.sessionActivityID, kind: "agent",
-                    title: "Codex · 已请求审批", detail: URL(fileURLWithPath: request.cwd).lastPathComponent,
-                    symbol: "hand.raised.fill", priority: 95, expires: request.expires, source: "codex",
-                    sessionID: id, progress: AgentProgress(phase: "waiting_for_approval",
-                        observedAt: request.createdAt, children: [], lastTool: request.tool,
-                        requestID: request.id.uuidString.lowercased()),
-                    sessionTitle: existing?.sessionTitle, conversationID: id)
+        let ordered = codexApprovals.sorted { left, right in
+            if left.canReviewInNotch != right.canReviewInNotch { return left.canReviewInNotch }
+            return (left.createdAt, left.id.uuidString) < (right.createdAt, right.id.uuidString)
+        }
+        return ordered.filter { request in
+            let session = request.sessionID.uuidString.lowercased()
+            let alreadyFinished = request.route == "desktop" && completedAgentSessions.contains {
+                $0.source == request.source
+                    && ($0.conversationID ?? $0.sessionID)?.lowercased() == session
+                    && ($0.progress?.observedAt ?? 0) >= request.createdAt
             }
+            return request.expires > now && !alreadyFinished && sessions.insert(request.sessionActivityID).inserted
+        }.map { request in
+            let id = request.sessionID.uuidString.lowercased()
+            let existing = (activities + agentHistory).first {
+                $0.source == request.source && ($0.conversationID ?? $0.sessionID)?.lowercased() == id
+            }
+            return IslandActivity(id: existing?.id ?? request.sessionActivityID, kind: "agent",
+                title: request.sourceName + " · 已请求审批",
+                detail: request.cwd.isEmpty ? (existing?.detail ?? "Codex 桌面会话") : URL(fileURLWithPath: request.cwd).lastPathComponent,
+                symbol: "hand.raised.fill", priority: 95, expires: request.expires, source: request.source,
+                sessionID: request.source == "codex" ? id : nil,
+                progress: AgentProgress(phase: "waiting_for_approval", observedAt: request.createdAt, children: [],
+                    lastTool: request.route == "desktop" ? "Codex 桌面审批" : request.tool,
+                    requestID: request.id.uuidString.lowercased()),
+                sessionTitle: existing?.sessionTitle, conversationID: id)
+        }
     }
 
     func codexApproval(for item: IslandActivity) -> CodexApprovalRequest? {
-        guard item.hasPendingAgentApproval, item.source == "codex",
+        guard item.hasPendingAgentApproval,
               let id = item.progress?.requestID.flatMap(UUID.init(uuidString:)),
               let session = (item.conversationID ?? item.sessionID).flatMap(UUID.init(uuidString:))
         else { return nil }
-        return codexApprovals.first { $0.id == id && $0.sessionID == session &&
-            $0.expires > Date().timeIntervalSince1970 }
+        return codexApprovals.first { $0.id == id && $0.sessionID == session && $0.source == item.source
+            && $0.expires > Date().timeIntervalSince1970 }
     }
 
-    func submitCodexApproval(_ choice: CodexApprovalRequest.Choice, request: CodexApprovalRequest) throws {
-        try request.submit(choice, in: codexApprovalDirectory)
+    func submitCodexApproval(_ choice: CodexApprovalRequest.Choice, request: CodexApprovalRequest) async -> Bool {
+        await XPCHelperClient.shared.submitCodexApproval(id: request.id, sessionID: request.sessionID, choice: choice.rawValue)
     }
 
     var proactiveAlerts: [IslandActivity] {
-        let approvals = liveCodexApprovalActivities
+        let approvals = liveCommandApprovalActivities
         let liveIDs = Set(approvals.map(\.id))
         return approvals + activities.filter { !liveIDs.contains($0.id) && (
             $0.kind == "preview" || $0.kind == "calendar" || $0.kind == "agent-quota-reset" || $0.kind == "weather-warning" || $0.agentAttentionKey != nil)
@@ -857,7 +850,7 @@ final class UnifiedActivities: ObservableObject {
 
     var agentSessions: [IslandActivity] {
         let now = Date().timeIntervalSince1970
-        let approvals = liveCodexApprovalActivities
+        let approvals = liveCommandApprovalActivities
         let approvalIDs = Set(approvals.map(\.id))
         let current = approvals + activities.filter {
             $0.kind == "agent" && !$0.isCompletedAgentSession && $0.expires > now && !approvalIDs.contains($0.id)
@@ -876,13 +869,12 @@ final class UnifiedActivities: ObservableObject {
 
     func agentSession(for id: String) -> IslandActivity? {
         let now = Date().timeIntervalSince1970
-        return liveCodexApprovalActivities.first { $0.id == id }
+        return liveCommandApprovalActivities.first { $0.id == id }
             ?? activities.first { $0.id == id && $0.kind == "agent" && $0.expires > now }
             ?? Self.recentAgentHistory(agentHistory.filter { $0.id == id }, now: now).first
     }
 
-    init(observeSystem: Bool = true, storageURL: URL? = nil, approvalDirectory: URL? = nil) {
-        codexApprovalDirectory = approvalDirectory ?? CodexApprovalRequest.directory
+    init(observeSystem: Bool = true, storageURL: URL? = nil) {
         observeDevices = observeSystem
         directory = storageURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("UnifiedActivities", isDirectory: true)
@@ -913,9 +905,9 @@ final class UnifiedActivities: ObservableObject {
         codexApprovalObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("local.boringnotch.codex-approval"), object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.refreshCodexApprovals() }
+            Task { @MainActor in await self?.refreshCodexApprovals() }
         }
-        refreshCodexApprovals()
+        monitorDesktopApprovals()
         if let data = try? Data(contentsOf: directory.appendingPathComponent("agent-usage.json")) { receiveUsage(data) }
         usageObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("local.boringnotch.agent-usage"), object: nil, queue: .main
@@ -1067,7 +1059,7 @@ final class UnifiedActivities: ObservableObject {
               let incoming = try? JSONDecoder().decode([IslandActivity].self, from: data) else { return }
         bridgeAvailable = true
         // The launch agent's regular heartbeat also recovers a missed change notification.
-        if observeDevices { refreshCodexApprovals() }
+        if observeDevices { Task { [weak self] in await self?.refreshCodexApprovals() } }
         // Only normalized agent metadata is accepted from the read-only helper.
         let valid = incoming.prefix(16).filter {
             $0.kind == "agent" && $0.title.count <= 80 && $0.detail.count <= 160 &&
@@ -1648,7 +1640,7 @@ private struct AgentSessionsPage: View {
             if let source = item.source.flatMap(AgentConversationSource.init(rawValue:)),
                let id = (item.conversationID ?? item.sessionID).flatMap(UUID.init(uuidString:)) {
                 AgentConversationSection(source: source, sessionID: id, updatedAt: item.progress?.observedAt,
-                                         viewportHeight: viewportHeight, allowsReply: !item.hasPendingAgentApproval) {
+                                         viewportHeight: viewportHeight, waitingForApproval: item.hasPendingAgentApproval) {
                     detailHeader(item)
                 }
                 .id(item.id)
@@ -1671,7 +1663,7 @@ private struct AgentSessionsPage: View {
                     Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.secondary).frame(width: 20, height: 20)
                     AgentNotchBadge(activity: item, name: agentName(item))
-                    Text(sessionName(item)).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Text(sessionName(item)).notchReadableText().font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     Spacer(minLength: 4)
                 }
                 .contentShape(Rectangle())
@@ -1688,14 +1680,67 @@ private struct AgentSessionsPage: View {
 
 }
 
+struct AgentCommandApprovalControls: View {
+    let item: IslandActivity
+    let request: CodexApprovalRequest
+    let compact: Bool
+    @ObservedObject private var activities = UnifiedActivities.shared
+    @State private var sending = false
+    @State private var submission: Bool?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(verbatim: request.cwd).notchReadableText()
+                .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.middle).help(request.cwd)
+            ScrollView {
+                Text(verbatim: request.command ?? "").notchReadableText()
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .scrollIndicators(.hidden)
+            .frame(height: compact ? 47 : 52)
+            HStack(spacing: 6) {
+                if let submission {
+                    Text(submission ? "决定已提交" : "请求已失效").notchReadableText()
+                        .font(.caption2).foregroundStyle(submission ? Color.secondary : .orange)
+                }
+                Spacer(minLength: 2)
+                if request.route == nil {
+                    Button("交回原会话") { send(.native) }
+                        .accessibilityIdentifier("agent-approval-native")
+                }
+                Button("拒绝") { send(.deny) }
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("agent-codex-deny")
+                Button("仅允许这次") { send(.allow) }
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("agent-codex-allow-once")
+            }
+            .buttonStyle(AgentNotchTaskButtonStyle())
+            .disabled(sending || submission == true)
+        }
+        .accessibilityIdentifier("agent-approval-controls")
+    }
+
+    private func send(_ choice: CodexApprovalRequest.Choice) {
+        guard !sending, submission != true, request.canReviewInNotch,
+              activities.codexApproval(for: item)?.id == request.id else { return }
+        sending = true
+        Task { @MainActor in
+            submission = await activities.submitCodexApproval(choice, request: request)
+            sending = false
+        }
+    }
+}
+
 private struct AgentSessionAttention: View {
     let item: IslandActivity
     var openDetails: (() -> Void)? = nil
     @ObservedObject private var activities = UnifiedActivities.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var showCommand = true
-    @State private var submitted = false
-    @State private var submitFailed = false
+    @State private var showCommand = false
 
     private var needsApproval: Bool { item.progress?.islandPhase == .waitingForApproval }
 
@@ -1711,76 +1756,47 @@ private struct AgentSessionAttention: View {
                     Text(tool).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 4)
-                if let request, request.command != nil {
+                if let request, request.canReviewInNotch {
                     Button(openDetails == nil && showCommand ? "收起命令" : "查看并审批") {
                         if let openDetails { openDetails() }
                         else { withAnimation(reduceMotion ? nil : .smooth(duration: 0.22)) { showCommand.toggle() } }
                     }
                     .buttonStyle(AgentNotchTaskButtonStyle())
                     .accessibilityIdentifier("agent-codex-review")
-                } else if item.needsDoubaoApproval {
-                    Text("请在豆包原终端确认")
+                } else if item.needsDoubaoApproval || (needsApproval && item.source == "gemini") {
+                    Text(item.needsDoubaoApproval ? "请在豆包原终端确认" : "请在 Gemini 原终端确认")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if needsApproval && item.source?.hasPrefix("mcp-") == true {
+                    Text("请在原会话审批")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
                     Button {
-                        if let request { submit(.native, request: request) }
-                        AgentApplicationIcons.open(activity: item)
+                        if let request, request.route != "desktop" {
+                            Task { @MainActor in
+                                _ = await activities.submitCodexApproval(.native, request: request)
+                                AgentApplicationIcons.open(activity: item)
+                            }
+                        } else {
+                            AgentApplicationIcons.open(activity: item)
+                        }
                     } label: {
-                        Label(needsApproval ? "前往审批" : "打开原会话", systemImage: "arrow.up.right")
+                        Label(request?.route == "desktop" ? "在 Codex 审批" : needsApproval ? "前往审批" : "打开原会话", systemImage: "arrow.up.right")
                             .font(.system(size: 11, weight: .semibold))
                     }
                     .buttonStyle(AgentNotchTaskButtonStyle())
                 }
             }
             .frame(height: 24)
-            if openDetails == nil, showCommand, let request, let command = request.command {
+            if openDetails == nil, showCommand, let request, request.canReviewInNotch {
                 if !request.reason.isEmpty {
                     Text(request.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
-                Text(request.cwd).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(request.cwd)
-                ScrollView {
-                    Text(verbatim: command).font(.system(size: 11, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .scrollIndicators(.hidden)
-                .frame(maxHeight: 52)
-                HStack {
-                    if submitFailed { Text("请求已失效，请在 Codex 查看").font(.caption).foregroundStyle(.orange) }
-                    Spacer()
-                    Button("回 Codex") {
-                        submit(.native, request: request)
-                        AgentApplicationIcons.open(activity: item)
-                    }
-                    Button("拒绝") { submit(.deny, request: request) }
-                        .foregroundStyle(.red)
-                        .accessibilityIdentifier("agent-codex-deny")
-                    Button("仅允许这次") { submit(.allow, request: request) }
-                        .foregroundStyle(.orange)
-                        .accessibilityIdentifier("agent-codex-allow-once")
-                }
-                .buttonStyle(AgentNotchTaskButtonStyle())
-                .disabled(submitted)
+                AgentCommandApprovalControls(item: item, request: request, compact: false).id(request.id)
             }
         }
-        .onChange(of: request?.id) {
-            showCommand = true
-            submitted = false
-            submitFailed = false
-        }
-    }
-
-    private func submit(_ choice: CodexApprovalRequest.Choice, request: CodexApprovalRequest) {
-        do {
-            try activities.submitCodexApproval(choice, request: request)
-            submitted = true
-            submitFailed = false
-        } catch {
-            submitFailed = true
-        }
+        .onChange(of: request?.id) { showCommand = false }
     }
 }
 
@@ -1899,11 +1915,11 @@ private struct AgentNotchTaskRow: View {
                 ActivityAvatar(activity: item, size: 18).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                        Text(title).notchReadableText().font(.system(size: 13, weight: .semibold)).lineLimit(1)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         statusLabel.fixedSize()
                     }
-                    Text(activity).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
+                    Text(activity).notchReadableText().font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold))
@@ -2103,6 +2119,8 @@ private struct AgentReplyField: NSViewRepresentable {
     var canSubmit: Bool
     var placeholder = "回复当前会话…"
     var submit: () -> Void
+    var submitSuggestion: (() -> Void)?
+    var compositionChanged: (Bool) -> Void
     var voiceFocus: UUID?
     var voiceReady: () -> Void
 
@@ -2151,13 +2169,16 @@ private struct AgentReplyField: NSViewRepresentable {
         init(_ field: AgentReplyField) { self.field = field }
 
         func controlTextDidChange(_ notification: Notification) {
-            guard let input = notification.object as? NSTextField,
-                  (input.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
-            field.text = (input.currentEditor() as? NSTextView)?.string ?? input.stringValue
+            guard let input = notification.object as? NSTextField else { return }
+            let editor = input.currentEditor() as? NSTextView
+            let marked = editor?.hasMarkedText() == true
+            field.compositionChanged(marked)
+            if !marked { field.text = editor?.string ?? input.stringValue }
         }
 
         func controlTextDidEndEditing(_ notification: Notification) {
             guard let input = notification.object as? Input else { return }
+            field.compositionChanged(false)
             let panel = input.window as? BoringNotchSkyLightWindow
             Task { @MainActor [weak input, weak panel] in
                 if let input, input.currentEditor() == nil { panel?.endAgentReplyEditing(input) }
@@ -2166,11 +2187,15 @@ private struct AgentReplyField: NSViewRepresentable {
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
             guard let input = control as? Input, !textView.hasMarkedText() else { return false }
+            if command == #selector(NSResponder.insertTab(_:)), textView.string.isEmpty,
+               field.canSubmit, let submitSuggestion = field.submitSuggestion {
+                if NSApp.currentEvent?.isARepeat != true { submitSuggestion() }
+                return true
+            }
             if command == #selector(NSResponder.insertNewline(_:)) {
                 if field.canSubmit {
                     field.text = textView.string
                     field.submit()
-                    (input.window as? BoringNotchSkyLightWindow)?.endAgentReplyEditing(input)
                 }
                 return true
             }
@@ -2188,7 +2213,8 @@ private struct AgentReplyField: NSViewRepresentable {
         let input = Input()
         input.delegate = context.coordinator
         input.appearance = NSAppearance(named: .darkAqua)
-        input.font = .systemFont(ofSize: 12)
+        input.font = .systemFont(ofSize: 11)
+        input.setAccessibilityLabel("回复当前会话")
         input.isBordered = false
         input.isBezeled = false
         input.focusRingType = .none
@@ -2202,6 +2228,7 @@ private struct AgentReplyField: NSViewRepresentable {
 
     func updateNSView(_ input: Input, context: Context) {
         context.coordinator.field = self
+        input.placeholderString = placeholder
         input.pendingVoiceFocus = voiceFocus
         input.voiceReady = voiceReady
         input.scheduleVoiceFocus()
@@ -2229,8 +2256,6 @@ private struct AgentConversationSection<Header: View>: View {
     let sessionID: UUID
     let updatedAt: Double?
     @ObservedObject private var interaction = AgentInteraction.shared
-    @AppStorage(AgentQuickReplySource.preferenceKey) private var quickReplySource = AgentQuickReplySource.current
-    @AppStorage(AgentQuickReplySource.customRepliesKey) private var customReplyData = Data()
     @AppStorage("agentConversationRoot.codex") private var codexRoot: Data?
     @AppStorage("agentConversationRoot.gemini") private var geminiRoot: Data?
     @AppStorage("agentConversationRoot.antigravity") private var antigravityRoot: Data?
@@ -2242,13 +2267,8 @@ private struct AgentConversationSection<Header: View>: View {
     @State private var message: String?
     @State private var fileHint: URL?
     @State private var activeRequest = UUID()
-    @EnvironmentObject private var vm: BoringViewModel
-    @StateObject private var voice = AgentVoiceReply()
-    @AppStorage(AgentVoiceEngine.preferenceKey) private var voiceEngine = AgentVoiceEngine.onDevice
-    @State private var draft = ""
-
-    private var showsComposer: Bool { allowsReply }
-
+    @State private var hasMoreBelow = false
+    @State private var lastLoadedDelivery: Date?
 
     private var bookmark: Data? {
         switch source {
@@ -2262,12 +2282,12 @@ private struct AgentConversationSection<Header: View>: View {
     private struct Refresh: Equatable {
         var bookmark: Data?
         var updatedAt: Double?
+        var deliveredAt: Date?
     }
 
     var viewportHeight: CGFloat
-    var allowsReply = true
+    var waitingForApproval = false
     @ViewBuilder var header: () -> Header
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2277,194 +2297,43 @@ private struct AgentConversationSection<Header: View>: View {
                 ScrollView(.vertical) {
                     conversationContent
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, 16)
-                    Color.clear.frame(height: 16).id("agent-conversation-end")
+                        .padding(.top, 4)
+                    Color.clear.frame(height: 4).id("agent-conversation-end")
                 }
                 .scrollIndicators(.never)
                 .scrollBounceBehavior(.basedOnSize)
-                .modifier(AgentTranscriptEdgeFade(length: 16))
-                .onChange(of: messages.last?.id) { _, _ in
-                    guard !showingOlder, !vm.isAgentReplyEditing else { return }
+                .frame(maxHeight: .infinity)
+                .modifier(AgentTranscriptEdgeFade(length: 6, onBottomEdgeChange: { hasMoreBelow = $0 }))
+                .onChange(of: messages.last?.id) { previous, next in
+                    guard next != nil, !showingOlder, previous == nil || !hasMoreBelow else { return }
                     proxy.scrollTo("agent-conversation-end", anchor: .bottom)
                 }
+                .onChange(of: messages.first?.id) { previous, _ in
+                    if showingOlder, let previous { proxy.scrollTo(previous, anchor: .top) }
+                }
             }
-            if showsComposer {
-                quickReplies
-                    .padding(.horizontal, 6)
-                    .padding(.top, 6)
-                    .padding(.bottom, 6)
-                    .background { conversationControlGlass }
-            }
+            AgentConversationComposer(source: source, sessionID: sessionID,
+                                      messages: messages, waitingForApproval: waitingForApproval)
+                .padding(.horizontal, 3)
+                .padding(.vertical, 3)
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
         }
         .frame(height: viewportHeight)
-        .onAppear { draft = interaction.draft(for: sessionID) }
-        .onChange(of: voice.isActive) { _, active in vm.isAgentVoiceReplyActive = active }
-        .onChange(of: vm.isAgentReplyEditing) { _, editing in
-            if !editing, voice.hasStartedRecording || voiceEngine == .doubao { voice.cancel() }
-        }
-        .onDisappear {
-            voice.cancel()
-            vm.isAgentVoiceReplyActive = false
-            if vm.agentVoiceFocus?.sessionID == sessionID { vm.agentVoiceFocus = nil }
-        }
-        .onChange(of: interaction.state(sessionID).sending) { _, sending in
-            if !sending {
-                draft = interaction.draft(for: sessionID)
-                if !showingOlder { Task { await load(before: nil) } }
-            }
-        }
-        .onChange(of: interaction.state(sessionID).deliveredAt) { _, date in
-            if source == .doubao, date != nil { Task { await load(before: nil, refresh: true) } }
-        }
-        .task(id: Refresh(bookmark: bookmark, updatedAt: updatedAt)) {
+        .task(id: Refresh(bookmark: bookmark, updatedAt: updatedAt,
+                          deliveredAt: interaction.state(sessionID).deliveredAt)) {
             guard !showingOlder else { return }
-            // Coalesce the burst of session updates for successive tool calls.
             if !messages.isEmpty { try? await Task.sleep(for: .milliseconds(200)) }
             guard !Task.isCancelled else { return }
-            await load(before: nil)
+            let delivered = interaction.state(sessionID).deliveredAt
+            let refresh = source == .doubao && delivered != lastLoadedDelivery
+            await load(before: nil, refresh: refresh)
+            if !Task.isCancelled { lastLoadedDelivery = delivered }
         }
-    }
-
-    private var conversationControlGlass: some View {
-        LinearGradient(
-            stops: [
-                .init(color: .clear, location: 0),
-                .init(color: .black.opacity(reduceTransparency ? 0.96 : 0.58), location: 0.30),
-                .init(color: .black.opacity(reduceTransparency ? 0.96 : 0.73), location: 1)
-            ], startPoint: .top, endPoint: .bottom
-        )
-        .padding(.top, -6)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-
-    private var quickReplies: some View {
-        let state = interaction.state(sessionID)
-        let replyOptions: [AgentReplyOption] = switch quickReplySource {
-        case .standard: AgentInteraction.immediateReplies(messages: messages, title: "")
-        case .api: interaction.apiReplies(id: sessionID, messages: messages)
-        case .custom: AgentQuickReplySource.customReplies(from: customReplyData)
-        }
-        return VStack(alignment: .leading, spacing: 5) {
-            if !replyOptions.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 6) {
-                        ForEach(replyOptions, id: \.body) { reply in
-                            Button {
-                                interaction.send(reply.body, source: source.rawValue, id: sessionID)
-                            } label: {
-                                Text(AgentMarkdownFormatting.inline(reply.title))
-                                    .lineLimit(1)
-                                    .frame(maxWidth: 240, alignment: .leading)
-                            }
-                            .buttonStyle(AgentNotchTaskButtonStyle())
-                            .disabled(state.sending)
-                            .help(reply.body)
-                        }
-                    }
-                }
-                .frame(height: 28)
-                .scrollIndicators(.never)
-                .reservesHorizontalNotchScrolling()
-            } else if quickReplySource == .api {
-                Button {
-                    Task { await interaction.generateAPIReplies(id: sessionID, messages: messages) }
-                } label: {
-                    HStack(spacing: 5) {
-                        if state.generating { ProgressView().controlSize(.mini) }
-                        else { Image(systemName: "sparkles") }
-                        Text(state.generating ? "正在生成回复…" : "生成 API 建议")
-                    }
-                }
-                .buttonStyle(AgentNotchTaskButtonStyle())
-                .disabled(messages.isEmpty || state.generating || state.sending)
-                .help("使用设置中选定的 API，根据最近对话生成建议")
-                .accessibilityIdentifier("agent-generate-replies")
-            }
-            HStack(spacing: 5) {
-                AgentReplyField(
-                    text: Binding(get: { draft }, set: { value in
-                        draft = String(value.prefix(8000))
-                        interaction.setDraft(draft, for: sessionID)
-                    }),
-                    canSubmit: !state.sending && !voice.isActive,
-                    submit: sendDraft,
-                    voiceFocus: vm.agentVoiceFocus?.sessionID == sessionID ? vm.agentVoiceFocus?.id : nil,
-                    voiceReady: startVoiceReply
-                )
-                .frame(maxWidth: .infinity, minHeight: 28)
-                Button {
-                    vm.agentVoiceFocus = AgentVoiceFocus(sessionID: sessionID)
-                } label: {
-                    Image(systemName: voice.isActive ? "stop.fill" : "mic")
-                        .font(.system(size: 11, weight: .medium))
-                        .frame(width: 24, height: 23)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(NotchControlStyle())
-                .disabled(state.sending)
-                .help(voice.isActive ? "结束听写" : "语音回复")
-                .accessibilityLabel(voice.isActive ? "结束听写" : "语音回复")
-                Button(action: sendDraft) {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 25, height: 23)
-                        .background(.white.opacity(0.12), in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .disabled(state.sending || voice.isActive || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .accessibilityLabel("发送到\(source.appName)")
-            }
-            .padding(.leading, 8).padding(.trailing, 3)
-            .frame(height: 28)
-            .background(.white.opacity(0.075), in: Capsule())
-            .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
-            if let status = voice.status {
-                Text(status).font(.system(size: 10)).foregroundStyle(.secondary)
-                    .lineLimit(1).help(status)
-            }
-            if let status = state.status {
-                HStack(spacing: 8) {
-                    Text(status).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).help(status)
-                    if let text = state.unsentReply {
-                        let label: LocalizedStringKey = source == .antigravity ? "复制并打开 Antigravity"
-                            : source == .codex ? "复制并打开会话" : "复制引导语"
-                        Button(label) {
-                            guard AgentInteraction.copyReply(text) else { return }
-                            interaction.dismissUnsent(sessionID)
-                            if source == .codex, let url = URL(string: "codex://threads/\(sessionID.uuidString.lowercased())") {
-                                NSWorkspace.shared.open(url)
-                            } else if source == .antigravity {
-                                AgentApplicationIcons.open(source: source.rawValue)
-                            }
-                        }.buttonStyle(.plain).font(.caption)
-                    }
-                }
-            }
-        }
-        .accessibilityIdentifier("agent-quick-replies")
-    }
-
-    private func startVoiceReply() {
-        guard !interaction.state(sessionID).sending else { return }
-        let base = draft
-        var last = base
-        voice.toggle(engine: voiceEngine) { sample in
-            guard draft == last else { return false }
-            let separator = base.isEmpty || base.last?.isWhitespace == true ? "" : " "
-            last = String((base + separator + sample).prefix(8000))
-            draft = last
-            interaction.setDraft(last, for: sessionID)
-            return true
-        }
-    }
-
-    private func sendDraft() {
-        interaction.sendDraft(source: source.rawValue, id: sessionID)
     }
 
     private var conversationContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        LazyVStack(alignment: .leading, spacing: 8) {
             if cursor != nil {
                 Button("加载更早的消息") {
                     guard let cursor else { return }
@@ -2503,7 +2372,6 @@ private struct AgentConversationSection<Header: View>: View {
             }
         }
         .padding(.vertical, 4)
-        .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder
@@ -2574,8 +2442,9 @@ private struct AgentConversationSection<Header: View>: View {
                 let page = try await interaction.doubaoHistory(id, before: before, refresh: refresh)
                 guard activeRequest == request, !Task.isCancelled else { return }
                 cursor = page.before
-                if before == nil { messages = page.messages }
-                else { messages.insert(contentsOf: page.messages, at: 0) }
+                if before == nil {
+                    if messages != page.messages { messages = page.messages }
+                } else { messages.insert(contentsOf: page.messages, at: 0) }
                 interaction.updateContext(id: sessionID, messages: messages)
                 message = nil
             } catch {
@@ -2586,7 +2455,7 @@ private struct AgentConversationSection<Header: View>: View {
         let knownFile = fileHint
         let worker = Task.detached(priority: .utility) {
             try AgentConversationHistory.read(bookmark: bookmark, source: source, id: id,
-                                              before: before, knownFile: knownFile)
+                                              before: before, knownFile: knownFile, limit: 10)
         }
         do {
             let result = try await withTaskCancellationHandler(operation: { try await worker.value },
@@ -2595,9 +2464,8 @@ private struct AgentConversationSection<Header: View>: View {
             fileHint = result.file
             cursor = result.page.before
             if before == nil {
-                if !result.page.messages.isEmpty || messages.isEmpty { messages = result.page.messages }
-            }
-            else { messages.insert(contentsOf: result.page.messages, at: 0) }
+                if !result.page.messages.isEmpty, messages != result.page.messages { messages = result.page.messages }
+            } else { messages.insert(contentsOf: result.page.messages, at: 0) }
             if before == nil { interaction.updateContext(id: sessionID, messages: messages) }
             message = nil
         } catch is CancellationError {
@@ -2616,6 +2484,192 @@ private struct AgentConversationSection<Header: View>: View {
     }
 }
 
+@MainActor
+private struct AgentConversationComposer: View {
+    let source: AgentConversationSource
+    let sessionID: UUID
+    let messages: [AgentConversationMessage]
+    let waitingForApproval: Bool
+
+    @EnvironmentObject private var vm: BoringViewModel
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @ObservedObject private var interaction = AgentInteraction.shared
+    @AppStorage(AgentQuickReplySource.preferenceKey) private var quickReplySource = AgentQuickReplySource.current
+    @AppStorage(AgentQuickReplySource.customRepliesKey) private var customReplyData = Data()
+    @AppStorage(AgentVoiceEngine.preferenceKey) private var voiceEngine = AgentVoiceEngine.onDevice
+    @StateObject private var voice = AgentVoiceReply()
+    @State private var draft = ""
+    @State private var isComposing = false
+    @State private var selectedSuggestion: String?
+
+    var body: some View {
+        let state = interaction.state(sessionID)
+        let replyOptions: [AgentReplyOption] = switch quickReplySource {
+        case .standard: AgentInteraction.immediateReplies(messages: messages, title: "")
+        case .api: interaction.apiReplies(id: sessionID, messages: messages)
+        case .custom: AgentQuickReplySource.customReplies(from: customReplyData)
+        }
+        let canSubmit = !waitingForApproval && !state.sending && !voice.isActive
+        let suggestion = replyOptions.first { $0.body == selectedSuggestion } ?? replyOptions.first
+        let inline = canSubmit && draft.isEmpty && !isComposing ? suggestion : nil
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                if !waitingForApproval, !replyOptions.isEmpty || quickReplySource == .api {
+                    Menu {
+                        ForEach(replyOptions, id: \.body) { reply in
+                            Button {
+                                selectedSuggestion = reply.body
+                            } label: {
+                                Text(AgentMarkdownFormatting.inline(reply.title))
+                            }
+                        }
+                        if replyOptions.isEmpty {
+                            Button(state.generating ? "正在生成回复…" : "生成 API 建议") {
+                                Task { await interaction.generateAPIReplies(id: sessionID, messages: messages) }
+                            }
+                            .disabled(messages.isEmpty || state.generating)
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .medium))
+                            .frame(width: 14, height: 19)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .disabled(state.sending)
+                    .help("快捷回复")
+                    .accessibilityLabel("快捷回复")
+                }
+                AgentReplyField(
+                    text: Binding(get: { draft }, set: { value in
+                        draft = String(value.prefix(8000))
+                        interaction.setDraft(draft, for: sessionID)
+                    }),
+                    canSubmit: canSubmit,
+                    placeholder: inline != nil ? "" : waitingForApproval ? "审批后发送，草稿会保留…" : "回复当前会话…",
+                    submit: sendDraft,
+                    submitSuggestion: inline.map { reply in { sendSuggestion(reply) } },
+                    compositionChanged: { isComposing = $0 },
+                    voiceFocus: vm.agentVoiceFocus?.sessionID == sessionID ? vm.agentVoiceFocus?.id : nil,
+                    voiceReady: startVoiceReply
+                )
+                .frame(maxWidth: .infinity, minHeight: 22)
+                .overlay(alignment: .leading) {
+                    if let inline {
+                        Text(AgentMarkdownFormatting.inline(inline.title))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .help(inline.map { "按 Tab 发送：\($0.body)" } ?? "回复当前会话")
+                if inline != nil {
+                    Text("Tab")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4).padding(.vertical, 2)
+                        .background(.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 4))
+                        .accessibilityLabel("按 Tab 发送建议回复")
+                }
+                Button {
+                    vm.agentVoiceFocus = AgentVoiceFocus(sessionID: sessionID)
+                } label: {
+                    Image(systemName: voice.isActive ? "stop.fill" : "mic")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: 20, height: 19)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(NotchControlStyle())
+                .disabled(state.sending)
+                .help(voice.isActive ? "结束听写" : "语音回复")
+                .accessibilityLabel(voice.isActive ? "结束听写" : "语音回复")
+                Button {
+                    if let inline { sendSuggestion(inline) }
+                    else { sendDraft() }
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 20, height: 19)
+                        .background(.white.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSubmit || (inline == nil && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                .accessibilityLabel(inline == nil ? "发送到\(source.appName)" : "发送建议回复")
+            }
+            .padding(.leading, 8).padding(.trailing, 3)
+            .frame(height: 24)
+            .background {
+                Capsule().fill(.black.opacity(reduceTransparency ? 0.90 : 0.33))
+                Capsule().fill(.white.opacity(0.085))
+            }
+            .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
+            if let status = voice.status {
+                Text(status).font(.system(size: 10)).foregroundStyle(.secondary)
+                    .lineLimit(1).help(status)
+            } else if let status = state.status {
+                HStack(spacing: 8) {
+                    Text(status).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).help(status)
+                    if let text = state.unsentReply {
+                        let label: LocalizedStringKey = source == .antigravity ? "复制并打开 Antigravity"
+                            : source == .codex ? "复制并打开会话" : "复制引导语"
+                        Button(label) {
+                            guard AgentInteraction.copyReply(text) else { return }
+                            interaction.dismissUnsent(sessionID)
+                            if source == .codex, let url = URL(string: "codex://threads/\(sessionID.uuidString.lowercased())") {
+                                NSWorkspace.shared.open(url)
+                            } else if source == .antigravity {
+                                AgentApplicationIcons.open(source: source.rawValue)
+                            }
+                        }.buttonStyle(.plain).font(.caption)
+                    }
+                }
+            }
+        }
+        .accessibilityIdentifier("agent-quick-replies")
+        .onAppear { draft = interaction.draft(for: sessionID) }
+        .onChange(of: voice.isActive) { _, active in vm.isAgentVoiceReplyActive = active }
+        .onChange(of: vm.isAgentReplyEditing) { _, editing in
+            if !editing, voice.hasStartedRecording || voiceEngine == .doubao { voice.cancel() }
+        }
+        .onChange(of: state.sending) { _, sending in
+            if !sending { draft = interaction.draft(for: sessionID) }
+        }
+        .onDisappear {
+            voice.cancel()
+            vm.isAgentVoiceReplyActive = false
+            if vm.agentVoiceFocus?.sessionID == sessionID { vm.agentVoiceFocus = nil }
+        }
+    }
+
+    private func sendSuggestion(_ reply: AgentReplyOption) {
+        guard draft.isEmpty, !isComposing, !waitingForApproval, !voice.isActive else { return }
+        interaction.send(reply.body, source: source.rawValue, id: sessionID)
+    }
+
+    private func startVoiceReply() {
+        guard !interaction.state(sessionID).sending else { return }
+        let base = draft
+        var last = base
+        voice.toggle(engine: voiceEngine) { sample in
+            guard draft == last else { return false }
+            let separator = base.isEmpty || base.last?.isWhitespace == true ? "" : " "
+            last = String((base + separator + sample).prefix(8000))
+            draft = last
+            interaction.setDraft(last, for: sessionID)
+            return true
+        }
+    }
+
+    private func sendDraft() {
+        guard !waitingForApproval, !voice.isActive else { return }
+        interaction.sendDraft(source: source.rawValue, id: sessionID)
+    }
+
+}
+
 // === AGENT_TRANSCRIPT_EDGES_BEGIN ===
 private struct AgentTranscriptEdges: Equatable {
     var top: Bool
@@ -2631,6 +2685,7 @@ private struct AgentTranscriptEdges: Equatable {
 
 private struct AgentTranscriptEdgeFade: ViewModifier {
     let length: CGFloat
+    var onBottomEdgeChange: ((Bool) -> Void)? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var edges = AgentTranscriptEdges(top: false, bottom: false)
 
@@ -2642,7 +2697,8 @@ private struct AgentTranscriptEdgeFade: ViewModifier {
                     AgentTranscriptEdges.visible(offset: geometry.contentOffset.y,
                         contentHeight: geometry.contentSize.height, viewportHeight: geometry.containerSize.height,
                         topInset: geometry.contentInsets.top, bottomInset: geometry.contentInsets.bottom)
-                } action: { _, next in
+                } action: { previous, next in
+                    if previous.bottom != next.bottom { onBottomEdgeChange?(next.bottom) }
                     withAnimation(reduceMotion ? nil : .easeOut(duration: 0.13)) { edges = next }
                 }
                 .mask { gradient(for: edges) }
@@ -2675,7 +2731,7 @@ private struct AgentConversationMessageText: View {
     var body: some View {
         Group {
             if entry.role == "user" {
-                Text(verbatim: entry.text)
+                Text(verbatim: entry.text).notchReadableText()
                     .font(.system(size: 13))
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
@@ -2718,7 +2774,7 @@ private struct AgentMarkdownReply: View, Equatable {
                                 .font(.system(size: 12, weight: .medium).monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
-                        Text(block.text)
+                        Text(block.text).notchReadableText()
                             .font(block.font)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .fixedSize(horizontal: false, vertical: true)

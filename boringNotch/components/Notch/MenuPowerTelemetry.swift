@@ -209,6 +209,7 @@ struct MenuPowerSample: Equatable, Sendable {
 }
 
 actor MenuPowerTelemetry {
+    static let shared = MenuPowerTelemetry()
     private let smc = MenuSMCReader()
 
     func read() -> MenuPowerSample? {
@@ -238,15 +239,29 @@ actor MenuPowerTelemetry {
             let value = Double(raw.int64Value) / 1_000
             return (-300...300).contains(value) ? value : nil
         }
+        func batteryWatts() -> Double? {
+            guard let current = (property("InstantAmperage") as? NSNumber)?.int64Value,
+                  (-30_000...30_000).contains(current),
+                  let voltage = (property("Voltage") as? NSNumber)?.int64Value,
+                  (5_000...25_000).contains(voltage) else { return nil }
+            return Double(current) * Double(voltage) / 1_000_000
+        }
+        let instantBattery = batteryWatts()
+        let battery = instantBattery ?? watts("BatteryPower")
         let adapter = pluggedIn ? watts("SystemPowerIn").flatMap { $0 >= 0 ? $0 : nil } : 0
-        let system = watts("SystemLoad").flatMap { $0 >= 0 ? $0 : nil }
-        return MenuPowerSample(adapter: adapter, battery: watts("BatteryPower"), system: system,
-                               pluggedIn: pluggedIn, isLive: false)
+        let estimatedLoad = battery.flatMap { battery in
+            adapter.map { $0 - battery }.flatMap { $0 >= -0.5 ? max(0, $0) : nil }
+        }
+        let reportedLoad = watts("SystemLoad").flatMap { $0 >= 0 ? $0 : nil }
+        // On battery, the instantaneous pack draw is fresher than the system's cached load.
+        let system = pluggedIn ? reportedLoad ?? estimatedLoad : estimatedLoad ?? reportedLoad
+        return MenuPowerSample(adapter: adapter, battery: battery, system: system,
+                               pluggedIn: pluggedIn, isLive: !pluggedIn && instantBattery != nil)
     }
 }
 
-struct MenuMemorySnapshot: Identifiable {
-    enum Pressure: Int32 {
+struct MenuMemorySnapshot: Identifiable, Sendable {
+    enum Pressure: Int32, Sendable {
         case normal = 1, warning = 2, critical = 4, unknown = 0
 
         var label: String {
@@ -289,5 +304,14 @@ struct MenuMemorySnapshot: Identifiable {
         let pressureStatus = sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &size, nil, 0)
         return Self(date: Date(), used: used, total: total,
                     pressure: pressureStatus == 0 ? Pressure(rawValue: pressure) ?? .unknown : .unknown)
+    }
+}
+
+
+actor MenuMemoryTelemetry {
+    static let shared = MenuMemoryTelemetry()
+
+    func read() -> MenuMemorySnapshot? {
+        MenuMemorySnapshot.read()
     }
 }
