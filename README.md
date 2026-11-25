@@ -11,9 +11,11 @@
 
 <p align="center">
   <a href="https://github.com/RUIAN12138/NotchHarbor/releases/latest">下载 Notch Harbor</a>
-  ·
-  <a href="https://github.com/RUIAN12138/NotchHarbor/releases/download/v2.7.4/notch-harbor-film-16x9.mp4">观看 16:9 宣传片</a>
 </p>
+
+## 宣传片
+
+https://github.com/user-attachments/assets/b5057165-52ab-4add-b2e7-3ffe893f935d
 
 ---
 
