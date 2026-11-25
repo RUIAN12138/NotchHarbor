@@ -230,7 +230,11 @@ half4 notchOpticalSurfaceImpl(
     float4 radii,
     float4 params,
     float4 tint,
-    float4 music,
+    float4 bassBands,
+    float4 lowMidBands,
+    float4 highMidBands,
+    float4 trebleBands,
+    float density,
     bool edgeOnly
 ) {
     (void)color;
@@ -271,7 +275,7 @@ half4 notchOpticalSurfaceImpl(
     // share the same decay, without a threshold introducing a second band.
     float remaining = 1.0 - bodyT;
     float tau = 5.7 * pow(remaining, 2.63) + 0.30 * remaining * remaining;
-    float bodyAbsorb = 1.0 - exp(-tau);
+    float bodyAbsorb = 1.0 - exp(-tau * clamp(sanitize(density, 1.0), 0.35, 1.65));
     float headerAbsorb = 1.0 - smoothstep(header, header + 24.0, p.y);
     float absorb = 1.0 - (1.0 - headerAbsorb) * (1.0 - bodyAbsorb);
 
@@ -383,35 +387,31 @@ half4 notchOpticalSurfaceImpl(
     float yDepth = p.y - lineY;
     float bandGate = smoothstep(0.0, 8.0, yDepth);
     float fromBottom = size.y - p.y;
-    if (music.w > 0.5 && intensity > 0.001 && fromBottom < 37.0 && p.y > header + 4.0) {
-        float3 bands = saturate(music.xyz);
+    float4 bandPeaks = max(max(bassBands, lowMidBands), max(highMidBands, trebleBands));
+    float peak = max(max(bandPeaks.x, bandPeaks.y), max(bandPeaks.z, bandPeaks.w));
+    float musicPresence = smoothstep(0.02, 0.19, peak);
+    if (musicPresence > 0.0 && intensity > 0.001 && fromBottom < 33.0 && p.y > header + 4.0) {
         float x = (p.x - size.x * 0.5) / max(size.x * 0.5, 1.0);
+        // Sixteen local spectrum values raise the soft upper edge of one lit area.
+        float4x4 spectrum(bassBands, lowMidBands, highMidBands, trebleBands);
+        float bandPosition = saturate((x + 0.72) / 1.44) * 15.0;
+        uint left = min(uint(bandPosition), 14u);
+        uint right = left + 1u;
+        uint before = left > 0u ? left - 1u : 0u;
+        uint after = min(right + 1u, 15u);
+        float a = spectrum[left / 4u][left % 4u];
+        float b = spectrum[right / 4u][right % 4u];
+        float lower = 0.80 * a + 0.10 * (spectrum[before / 4u][before % 4u] + b);
+        float upper = 0.80 * b + 0.10 * (a + spectrum[after / 4u][after % 4u]);
+        float level = saturate(mix(lower, upper, smoothstep(0.0, 1.0, bandPosition - float(left))));
 
-        // The bass plume climbs, while the midrange sends two softer pools
-        // out along the lower glass. Treble brightens their feathered edges.
-        float bassHeight = 5.7 + 25.0 * bands.x;
-        float bassDepth = (fromBottom - bassHeight) / (3.8 + 2.4 * bands.x);
-        float bassSpread = 0.22 + 0.24 * bands.x;
-        float bassX = (x + 0.045 * bands.y * bassDepth) / bassSpread;
-        float bass = exp(-(bassX * bassX + bassDepth * bassDepth));
-        float bassHalo = exp(-(bassX * bassX * 0.52 + bassDepth * bassDepth * 0.34));
-
-        float sideCentre = 0.24 + 0.30 * bands.y;
-        float sideHeight = 5.0 + 12.0 * bands.y + 3.0 * bands.x;
-        float sideDepth = (fromBottom - sideHeight + 2.1 * x) / (4.4 + 2.0 * bands.z);
-        float sideX = (abs(x + 0.038 * bands.x) - sideCentre) / (0.16 + 0.085 * bands.y);
-        float sides = exp(-(sideX * sideX + sideDepth * sideDepth));
-        float sideHalo = exp(-(sideX * sideX * 0.56 + sideDepth * sideDepth * 0.48));
-
-        float boundary = (1.0 - smoothstep(30.0, 37.0, fromBottom))
-                       * smoothstep(header + 4.0, header + 15.0, p.y)
-                       * smoothstep(1.3, 4.5, edge.distance)
-                       * (1.0 - smoothstep(0.69, 0.91, abs(x)));
-        float bassGain = smoothstep(0.025, 0.56, bands.x);
-        float sideGain = smoothstep(0.03, 0.68, max(bands.y, 0.58 * bands.z));
-        float centreLight = bassGain * (0.28 * bass + 0.13 * bassHalo);
-        float sideLight = sideGain * ((0.17 + 0.07 * bands.z) * sides + 0.09 * sideHalo);
-        fieldAlpha = min(0.45, (centreLight + sideLight) * intensity * boundary);
+        float thickness = 18.0 + 10.0 * level;
+        float body = 1.0 - smoothstep(3.0 + 3.0 * level, thickness, fromBottom);
+        float reflection = exp(-pow((fromBottom - (7.0 + 4.0 * level)) / 8.5, 2.0));
+        float boundary = smoothstep(header + 4.0, header + 15.0, p.y)
+                       * smoothstep(1.0, 5.0, edge.distance)
+                       * (1.0 - smoothstep(0.65, 0.95, abs(x)));
+        fieldAlpha = ((0.13 + 0.13 * level) * body + 0.09 * reflection) * musicPresence * intensity * boundary;
     }
     if (bandGate > 0.001 && intensity > 0.001) {
         float phaseTime = time * 0.74 + 0.20;
@@ -459,7 +459,7 @@ half4 notchOpticalSurfaceImpl(
         float gate = intensity * bandGate * fieldLevel * env * inward * ends;
         float spectralCore = lobePeak * (0.33 + 0.42 * local);
         float haloLight = halo * (0.06 + 0.13 * local);
-        float ambientWeight = music.w > 0.5 ? 0.36 : 1.0;
+        float ambientWeight = 1.0 - 0.67 * musicPresence;
         float ambient = (spectralCore * 1.04 + haloLight) * gate * ambientWeight;
         fieldAlpha = min(0.45, fieldAlpha + ambient * (1.0 - fieldAlpha));
 
@@ -540,13 +540,15 @@ half4 notchOpticalSurfaceImpl(
 
 // Shared implementation keeps the original desktop-optical entry unchanged.
 [[ stitchable ]] half4 notchOpticalSurface(float2 position, half4 color, float4 rect,
-                                         float4 radii, float4 params, float4 tint, float4 music) {
-    return notchOpticalSurfaceImpl(position, color, rect, radii, params, tint, music, false);
+                                         float4 radii, float4 params, float4 tint,
+                                         float4 bassBands, float4 lowMidBands, float4 highMidBands, float4 trebleBands, float density) {
+    return notchOpticalSurfaceImpl(position, color, rect, radii, params, tint, bassBands, lowMidBands, highMidBands, trebleBands, density, false);
 }
 
 [[ stitchable ]] half4 notchEdgeOptics(float2 position, half4 color, float4 rect,
-                                     float4 radii, float4 params, float4 tint, float4 music) {
-    return notchOpticalSurfaceImpl(position, color, rect, radii, params, tint, music, true);
+                                     float4 radii, float4 params, float4 tint,
+                                         float4 bassBands, float4 lowMidBands, float4 highMidBands, float4 trebleBands, float density) {
+    return notchOpticalSurfaceImpl(position, color, rect, radii, params, tint, bassBands, lowMidBands, highMidBands, trebleBands, density, true);
 }
 
 // Samples the moving display texture using the lab's convex Snell profile.

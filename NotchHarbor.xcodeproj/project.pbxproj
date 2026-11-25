@@ -17,6 +17,8 @@
 		CD0044444444444444444401 /* NotchOpticalSurface.metal in Sources */ = {isa = PBXBuildFile; fileRef = CD0044444444444444444402; };
 		CD0022222222222222222201 /* DeviceActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD0022222222222222222202; };
 		CD12A1100000000000000011 /* AgentUsageMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD12A1100000000000000012; };
+		CD12A1100000000000000013 /* MenuPowerTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD12A1100000000000000014; };
+		CD12A1100000000000000015 /* MenuPowerFlowDetail.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD12A1100000000000000016; };
 		CD0011111111111111111101 /* UnifiedActivities.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD0011111111111111111102; };
 		DEC017111111111111111101 /* AgentConversationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEC017111111111111111102; };
 		CD0077777777777777777701 /* ClipboardHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD0077777777777777777702 /* ClipboardHistoryStore.swift */; };
@@ -111,6 +113,7 @@
 		14D570C02C5EA5870011E668 /* AnimatedFace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14D570BF2C5EA5870011E668 /* AnimatedFace.swift */; };
 		14D570C22C5EAFBF0011E668 /* EmptyState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14D570C12C5EAFBF0011E668 /* EmptyState.swift */; };
 		14D570C62C5F38210011E668 /* BoringHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14D570C52C5F38210011E668 /* BoringHeader.swift */; };
+		DEC020222222222222222102 /* NotchSpotlightGuide.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEC020222222222222222101 /* NotchSpotlightGuide.swift */; };
 		14D570C92C5F38890011E668 /* BoringViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14D570C82C5F38890011E668 /* BoringViewModel.swift */; };
 		14D570CB2C5F4B2C0011E668 /* BatteryStatusViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14D570CA2C5F4B2C0011E668 /* BatteryStatusViewModel.swift */; };
 		14D570CD2C5F4BB70011E668 /* BoringBattery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14D570CC2C5F4BB70011E668 /* BoringBattery.swift */; };
@@ -201,6 +204,8 @@
 		CD0044444444444444444402 /* NotchOpticalSurface.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = NotchOpticalSurface.metal; sourceTree = "<group>"; };
 		CD0022222222222222222202 /* DeviceActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceActivity.swift; sourceTree = "<group>"; };
 		CD12A1100000000000000012 /* AgentUsageMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentUsageMenu.swift; sourceTree = "<group>"; };
+		CD12A1100000000000000014 /* MenuPowerTelemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuPowerTelemetry.swift; sourceTree = "<group>"; };
+		CD12A1100000000000000016 /* MenuPowerFlowDetail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuPowerFlowDetail.swift; sourceTree = "<group>"; };
 		CD0011111111111111111102 /* UnifiedActivities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedActivities.swift; sourceTree = "<group>"; };
 		DEC017111111111111111102 /* AgentConversationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConversationHistory.swift; sourceTree = "<group>"; };
 		1100290B2E847E2800035A57 /* NSItemProvider+LoadHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSItemProvider+LoadHelpers.swift"; sourceTree = "<group>"; };
@@ -291,6 +296,7 @@
 		14D570BF2C5EA5870011E668 /* AnimatedFace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimatedFace.swift; sourceTree = "<group>"; };
 		14D570C12C5EAFBF0011E668 /* EmptyState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmptyState.swift; sourceTree = "<group>"; };
 		14D570C52C5F38210011E668 /* BoringHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoringHeader.swift; sourceTree = "<group>"; };
+		DEC020222222222222222101 /* NotchSpotlightGuide.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotchSpotlightGuide.swift; sourceTree = "<group>"; };
 		14D570C82C5F38890011E668 /* BoringViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoringViewModel.swift; sourceTree = "<group>"; };
 		14D570CA2C5F4B2C0011E668 /* BatteryStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatteryStatusViewModel.swift; sourceTree = "<group>"; };
 		14D570CC2C5F4BB70011E668 /* BoringBattery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoringBattery.swift; sourceTree = "<group>"; };
@@ -741,6 +747,8 @@
 				CD0033333333333333333314 /* NotchCaptureGeometry.swift */,
 				CD0044444444444444444402 /* NotchOpticalSurface.metal */,
 				CD12A1100000000000000012 /* AgentUsageMenu.swift */,
+				CD12A1100000000000000014 /* MenuPowerTelemetry.swift */,
+				CD12A1100000000000000016 /* MenuPowerFlowDetail.swift */,
 				CD0011111111111111111102 /* UnifiedActivities.swift */,
 				DEC017111111111111111102 /* AgentConversationHistory.swift */,
 				DEC017222222222222222112 /* AgentReplyMotion.swift */,
@@ -749,6 +757,7 @@
 				CD0022222222222222222202 /* DeviceActivity.swift */,
 				9AB0C6BB2C73C9CB00F7CD30 /* NotchHomeView.swift */,
 				14D570C52C5F38210011E668 /* BoringHeader.swift */,
+				DEC020222222222222222101 /* NotchSpotlightGuide.swift */,
 			);
 			path = Notch;
 			sourceTree = "<group>";
@@ -991,6 +1000,8 @@
 				CD0033333333333333333313 /* NotchCaptureGeometry.swift in Sources */,
 				CD0044444444444444444401 /* NotchOpticalSurface.metal in Sources */,
 				CD12A1100000000000000011 /* AgentUsageMenu.swift in Sources */,
+				CD12A1100000000000000013 /* MenuPowerTelemetry.swift in Sources */,
+				CD12A1100000000000000015 /* MenuPowerFlowDetail.swift in Sources */,
 				CD0011111111111111111101 /* UnifiedActivities.swift in Sources */,
 				DEC017111111111111111101 /* AgentConversationHistory.swift in Sources */,
 				DEC017222222222222222111 /* AgentReplyMotion.swift in Sources */,
@@ -1024,6 +1035,7 @@
 				118EBE272E92DE8400D54B5A /* NSMenu+AssociatedObject.swift in Sources */,
 				B1CE8CFE2C6F659400DD9871 /* KeyboardShortcutsHelper.swift in Sources */,
 				14D570C62C5F38210011E668 /* BoringHeader.swift in Sources */,
+				DEC020222222222222222102 /* NotchSpotlightGuide.swift in Sources */,
 				B17266E32C65F7FB0031BA0D /* WhatsNewView.swift in Sources */,
 				14C08BB62C8DE42D000F8AA0 /* CalendarManager.swift in Sources */,
 				14D570CD2C5F4BB70011E668 /* BoringBattery.swift in Sources */,

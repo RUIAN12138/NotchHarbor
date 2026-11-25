@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import Combine
 import CoreAudio
+import CryptoKit
 
 // Adapted from Agent Notch's SessionRowPresentation / UsageLimitMonitor.
 // Apache-2.0 attribution is retained in ThirdParty/AgentNotch.
@@ -80,6 +81,7 @@ struct AgentProgress: Codable, Equatable {
     var lastTool: String? = nil
     var recentTools: [AgentToolStep]? = nil
     var tokenUsage: AgentSessionTokens? = nil
+    var requestID: String? = nil
 
     var islandPhase: AgentIslandPhase? { AgentIslandPhase(rawValue: phase) }
 
@@ -87,7 +89,7 @@ struct AgentProgress: Codable, Equatable {
         islandPhase != nil
             && observedAt.isFinite && observedAt > 0 && children.count <= 16
             && children.allSatisfy { $0.id.count <= 64 }
-            && (lastTool?.count ?? 0) <= 96
+            && (lastTool?.count ?? 0) <= 96 && (requestID?.count ?? 0) <= 64
             && (recentTools.map { $0.count <= 6 && $0.allSatisfy(\.isValid) } ?? true)
             && (tokenUsage?.isValid ?? true)
     }
@@ -99,10 +101,73 @@ struct AgentProgress: Codable, Equatable {
         case "waiting_for_input": return "等待输入"
         case "finished": return "本轮已完成"
         case "failed": return "本轮异常结束"
+        case "idle": return "暂未活动"
         default: return "正在处理"
         }
     }
 }
+struct CodexApprovalRequest: Codable, Equatable {
+    enum Choice: String { case allow, deny, native }
+
+    let id: UUID
+    let sessionID: UUID
+    let tool: String
+    let cwd: String
+    let reason: String
+    let command: String?
+    let createdAt: TimeInterval
+    let expires: TimeInterval
+    let pid: Int32
+
+    var sessionActivityID: String {
+        SHA256.hash(data: Data(("codex|" + sessionID.uuidString.lowercased()).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".multiagent-notch/notch-harbor-approvals", isDirectory: true)
+
+    static func pending(in directory: URL, now: TimeInterval = Date().timeIntervalSince1970) -> [Self] {
+        guard privatePath(directory.deletingLastPathComponent(), type: .typeDirectory),
+              privatePath(directory, type: .typeDirectory),
+              let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        else { return [] }
+        return files.filter { $0.pathExtension == "json" }.prefix(128).compactMap { file in
+            guard let id = UUID(uuidString: file.deletingPathExtension().lastPathComponent),
+                  privatePath(file, type: .typeRegular, maxBytes: 32768),
+                  let data = try? Data(contentsOf: file),
+                  let request = try? JSONDecoder().decode(Self.self, from: data),
+                  request.id == id, request.createdAt <= now + 5, request.expires > now,
+                  (0...60).contains(request.expires - request.createdAt),
+                  request.pid > 1, kill(request.pid, 0) == 0
+            else { return nil }
+            return request
+        }.sorted { ($0.createdAt, $0.id.uuidString) < ($1.createdAt, $1.id.uuidString) }
+    }
+
+    func acknowledge(in directory: URL) {
+        let ready = directory.appendingPathComponent(id.uuidString.lowercased() + ".ready")
+        try? Data().write(to: ready, options: .withoutOverwriting)
+    }
+
+    func submit(_ choice: Choice, in directory: URL) throws {
+        guard Self.pending(in: directory).contains(self), choice != .allow || command != nil else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let decision = directory.appendingPathComponent(id.uuidString.lowercased() + ".decision")
+        try Data(choice.rawValue.utf8).write(to: decision, options: .withoutOverwriting)
+    }
+
+    private static func privatePath(_ url: URL, type: FileAttributeType, maxBytes: Int? = nil) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == type,
+              (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue,
+              permissions & 0o077 == 0 else { return false }
+        return maxBytes.map { (attributes[.size] as? NSNumber)?.intValue ?? Int.max <= $0 } ?? true
+    }
+}
+
 struct AgentUsageWindow: Codable, Equatable {
     var usedPercent: Double
     var windowMinutes: Int?
@@ -244,8 +309,9 @@ struct IslandActivity: Identifiable, Equatable, Codable {
     var progress: AgentProgress? = nil
     var sessionTitle: String? = nil
     var conversationID: String? = nil
+    var weatherStartsAt: Double? = nil
     enum CodingKeys: String, CodingKey {
-        case id, kind, title, detail, symbol, priority, expires, source, sessionID, progress, sessionTitle, conversationID
+        case id, kind, title, detail, symbol, priority, expires, source, sessionID, progress, sessionTitle, conversationID, weatherStartsAt
     }
 }
 
@@ -280,6 +346,19 @@ extension IslandActivity {
         kind == "agent" && progress?.islandPhase?.isTerminal == true
     }
 
+    var agentAttentionKey: String? {
+        guard kind == "agent", let phase = progress?.islandPhase,
+              phase == .waitingForApproval || phase == .waitingForInput else { return nil }
+        let request = progress?.requestID.map { ":" + $0 } ?? ""
+        return id + ":attention:" + phase.rawValue + request
+    }
+
+    var hasPendingAgentApproval: Bool {
+        kind == "agent" && progress?.islandPhase == .waitingForApproval
+    }
+
+    var needsDoubaoApproval: Bool { source == "doubao" && hasPendingAgentApproval }
+
     func destinationAgentID(in sessions: [IslandActivity]) -> String? {
         let conversation = conversationID ?? sessionID
         return sessions.first {
@@ -303,6 +382,7 @@ extension IslandActivity {
         sessionID = try? values.decode(String.self, forKey: .sessionID)
         sessionTitle = try? values.decode(String.self, forKey: .sessionTitle)
         conversationID = try? values.decode(String.self, forKey: .conversationID)
+        weatherStartsAt = try? values.decode(Double.self, forKey: .weatherStartsAt)
         // A missing or malformed optional extension must not discard a valid
         // legacy session, or the other sessions in the same snapshot.
         progress = try? values.decode(AgentProgress.self, forKey: .progress)
@@ -315,15 +395,56 @@ enum AgentReplyMotionSettings {
     static let previewPrefix = "preview:agent-reply-motion:"
 }
 
+struct CompactAlertCountdown: Equatable {
+    let duration: Duration
+    private var budget: Duration
+    private var runningSince: ContinuousClock.Instant?
+
+    init(duration: Duration, now: ContinuousClock.Instant, paused: Bool) {
+        self.duration = duration
+        budget = duration
+        runningSince = paused ? nil : now
+    }
+
+    var isPaused: Bool { runningSince == nil }
+
+    func remaining(at now: ContinuousClock.Instant) -> Duration {
+        let elapsed = runningSince.map { max(.zero, $0.duration(to: now)) } ?? .zero
+        return max(.zero, budget - elapsed)
+    }
+
+    func fractionRemaining(at now: ContinuousClock.Instant) -> Double {
+        duration > .zero ? remaining(at: now) / duration : 0
+    }
+
+    mutating func setPaused(_ paused: Bool, at now: ContinuousClock.Instant) {
+        guard paused != isPaused else { return }
+        budget = remaining(at: now)
+        runningSince = paused ? nil : now
+    }
+}
+
+enum AgentCompletionHaloSettings {
+    static let durationKey = "agentCompletionHaloDuration"
+    static let defaultDuration = 8.0
+    static let durationRange: ClosedRange<Double> = 0...20
+
+    static func readyTime(afterClosingAt closedAt: Date, reduceMotion: Bool) -> Date {
+        // Wait for the compact close spring and its content transition to settle.
+        closedAt.addingTimeInterval(reduceMotion ? 0 : 0.48)
+    }
+
+    static func normalizedDuration(_ value: Double) -> Double {
+        guard value.isFinite else { return defaultDuration }
+        return min(durationRange.upperBound, max(durationRange.lowerBound, value))
+    }
+}
+
 struct AgentCompletionHoverReplay {
     static let popupDuration: Duration = .seconds(2)
 
     static func replyPopupDuration(headphonesConnected: Bool, headControlEnabled: Bool) -> Duration {
         headphonesConnected || headControlEnabled ? .seconds(5) : popupDuration
-    }
-
-    static func canAutoDismiss(pointerInside: Bool, headActive: Bool) -> Bool {
-        !pointerInside && !headActive
     }
 
     let activity: IslandActivity
@@ -340,6 +461,7 @@ final class UnifiedActivities: ObservableObject {
     static let shared = UnifiedActivities()
     @Published private(set) var activities: [IslandActivity] = []
     @Published private(set) var completedAgentSessions: [IslandActivity] = []
+    var onAgentTurnFinished: ((IslandActivity) -> Void)?
     @Published private(set) var agentUsage: [AgentProviderUsage] = []
     @Published var showPanel = false
     @Published var showDashboard = false
@@ -372,9 +494,9 @@ final class UnifiedActivities: ObservableObject {
     @Published private(set) var bridgeAvailable = false
     private var dismissed: [String: Double] = [:]
     private var expiry: Task<Void, Never>?
+    private var expiryDeadline: TimeInterval?
     private var agentObserver: NSObjectProtocol?
     private var usageObserver: NSObjectProtocol?
-    private var watcher: DispatchSourceFileSystemObject?
     private var audioListener: AudioObjectPropertyListenerBlock?
     private var lastOutput: AudioDeviceID = 0
     private var lastHeadphoneNotice = Date.distantPast
@@ -409,6 +531,25 @@ final class UnifiedActivities: ObservableObject {
         generatingReplyWings.removeValue(forKey: id)
     }
 
+    @Published private var completionSummaries: [String: String] = [:]
+
+    func setAgentCompletionSummary(_ summary: String, session: IslandActivity) {
+        guard let stamp = session.progress?.observedAt else { return }
+        let id = session.id + ":completion:" + String(stamp)
+        if completionSummaries.count >= 24 {
+            completionSummaries = completionSummaries.filter { recentCompletionNotices[$0.key] != nil }
+        }
+        completionSummaries[id] = summary
+    }
+
+    func agentCompletionSummary(for alert: IslandActivity) -> String {
+        if let summary = completionSummaries[alert.id] { return summary }
+        if let task = alert.sessionTitle, !task.isEmpty {
+            return alert.progress?.phase == "failed" ? "「\(task)」本轮异常结束。" : "已完成「\(task)」。"
+        }
+        return alert.detail
+    }
+
     func announceAgentCompletion(_ original: IslandActivity, hasReplies: Bool) {
         let now = Date().timeIntervalSince1970
         guard original.isCompletedAgentSession, let finishedAt = original.progress?.observedAt else { return }
@@ -421,9 +562,10 @@ final class UnifiedActivities: ObservableObject {
         let agent = original.title.components(separatedBy: " · ").first ?? "Agent"
         let failed = original.progress?.phase == "failed"
         notice.title = agent + (failed ? " 运行异常" : " 已完成")
-        let task = original.sessionTitle ?? ""
-        let summary = hasReplies ? "快捷回复已准备好" : (failed ? "查看会话详情" : "本轮已结束")
-        notice.detail = task.isEmpty ? summary : task + " · " + summary
+        let fallback = hasReplies ? "任务已完成，可继续追问。" : (failed ? "查看会话详情" : "本轮任务已结束。")
+        notice.detail = completionSummaries[notice.id] ?? original.sessionTitle.map {
+            failed ? "「\($0)」本轮异常结束。" : "已完成「\($0)」。"
+        } ?? fallback
         notice.symbol = failed ? "exclamationmark.circle.fill" : "checkmark.circle.fill"
         completionNotices.append(notice)
         scheduleNextCompletion()
@@ -451,15 +593,82 @@ final class UnifiedActivities: ObservableObject {
         }
     }
 
+    @Published private var codexApprovals: [CodexApprovalRequest] = []
+    private let codexApprovalDirectory: URL
+    private var codexApprovalObserver: NSObjectProtocol?
+    private var codexApprovalPoll: Task<Void, Never>?
+
+    private func refreshCodexApprovals() {
+        let pending = CodexApprovalRequest.pending(in: codexApprovalDirectory)
+        if pending != codexApprovals {
+            let known = Set(codexApprovals.map(\.id))
+            for request in pending where !known.contains(request.id) {
+                request.acknowledge(in: codexApprovalDirectory)
+            }
+            codexApprovals = pending
+        }
+        if pending.isEmpty {
+            codexApprovalPoll?.cancel()
+            codexApprovalPoll = nil
+        } else if codexApprovalPoll == nil {
+            codexApprovalPoll = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    guard !Task.isCancelled, let self else { return }
+                    self.refreshCodexApprovals()
+                }
+            }
+        }
+    }
+
+    private var liveCodexApprovalActivities: [IslandActivity] {
+        var sessions = Set<UUID>()
+        let now = Date().timeIntervalSince1970
+        return codexApprovals.filter { $0.expires > now && sessions.insert($0.sessionID).inserted }
+            .map { request in
+                let id = request.sessionID.uuidString.lowercased()
+                let existing = (activities + agentHistory).first {
+                    $0.source == "codex" && ($0.conversationID ?? $0.sessionID)?.lowercased() == id
+                }
+                return IslandActivity(id: existing?.id ?? request.sessionActivityID, kind: "agent",
+                    title: "Codex · 已请求审批", detail: URL(fileURLWithPath: request.cwd).lastPathComponent,
+                    symbol: "hand.raised.fill", priority: 95, expires: request.expires, source: "codex",
+                    sessionID: id, progress: AgentProgress(phase: "waiting_for_approval",
+                        observedAt: request.createdAt, children: [], lastTool: request.tool,
+                        requestID: request.id.uuidString.lowercased()),
+                    sessionTitle: existing?.sessionTitle, conversationID: id)
+            }
+    }
+
+    func codexApproval(for item: IslandActivity) -> CodexApprovalRequest? {
+        guard item.hasPendingAgentApproval, item.source == "codex",
+              let id = item.progress?.requestID.flatMap(UUID.init(uuidString:)),
+              let session = (item.conversationID ?? item.sessionID).flatMap(UUID.init(uuidString:))
+        else { return nil }
+        return codexApprovals.first { $0.id == id && $0.sessionID == session &&
+            $0.expires > Date().timeIntervalSince1970 }
+    }
+
+    func submitCodexApproval(_ choice: CodexApprovalRequest.Choice, request: CodexApprovalRequest) throws {
+        try request.submit(choice, in: codexApprovalDirectory)
+    }
+
     var proactiveAlerts: [IslandActivity] {
-        activities.filter {
-            $0.kind == "preview" || $0.kind == "calendar" || $0.kind == "weather-warning" || $0.progress?.phase == "waiting_for_approval"
+        let approvals = liveCodexApprovalActivities
+        let liveIDs = Set(approvals.map(\.id))
+        return approvals + activities.filter { !liveIDs.contains($0.id) && (
+            $0.kind == "preview" || $0.kind == "calendar" || $0.kind == "agent-quota-reset" || $0.kind == "weather-warning" || $0.agentAttentionKey != nil)
         } + completionNotices + [headphoneLidNotice].compactMap { $0 }
+    }
+
+    func currentAgentAttention(for key: String) -> IslandActivity? {
+        let now = Date().timeIntervalSince1970
+        return proactiveAlerts.first { $0.agentAttentionKey == key && $0.expires > now }
     }
 
     var proactiveAlert: IslandActivity? { proactiveAlerts.first }
     var wingActivity: IslandActivity? {
-        proactiveAlerts.first { $0.kind != "headphone-lid" && $0.kind != "weather-warning" && !$0.isCompletedAgentSession }
+        proactiveAlerts.first { $0.kind != "headphone-lid" && $0.kind != "agent-quota-reset" && $0.kind != "weather-warning" && !$0.isCompletedAgentSession }
             ?? headphoneNotice
             ?? generatingReplyWings.values.max { ($0.progress?.observedAt ?? 0) < ($1.progress?.observedAt ?? 0) }
             ?? runningAgent
@@ -480,11 +689,8 @@ final class UnifiedActivities: ObservableObject {
         return activity
     }
     @Published private(set) var currentWeather: IslandActivity?
-    @Published private var latestWeatherWarning: IslandActivity?
-    var currentWeatherWarning: IslandActivity? {
-        guard let warning = latestWeatherWarning, warning.expires > Date().timeIntervalSince1970 else { return nil }
-        return warning
-    }
+    @Published private(set) var weatherWarnings: [IslandActivity] = []
+    private var weatherWarningExpiry: Task<Void, Never>?
     @Published private(set) var weatherUpdatedAt: Date?
     @Published private(set) var weatherRefreshMessage: String?
     private var requestedWeatherCity: String?
@@ -522,7 +728,8 @@ final class UnifiedActivities: ObservableObject {
 
     func showCalendarAlert(id: String, title: String, date: Date) {
         let alert = IslandActivity(id: "agenda:" + id, kind: "calendar", title: title,
-            detail: date.formatted(date: .omitted, time: .shortened), symbol: "calendar",
+            detail: date.formatted(date: Calendar.current.isDateInToday(date) ? .omitted : .abbreviated, time: .shortened),
+            symbol: "calendar.badge.clock",
             priority: 70, expires: Date().timeIntervalSince1970 + 45)
         publish(activities.filter { $0.id != alert.id } + [alert])
     }
@@ -534,8 +741,18 @@ final class UnifiedActivities: ObservableObject {
 
     func updateWeatherWarnings(_ warnings: [IslandActivity], popupIDs: Set<String> = []) {
         let now = Date().timeIntervalSince1970
-        let latest = warnings.filter { $0.expires > now }.sorted { $0.expires > $1.expires }
-        if latestWeatherWarning != latest.first { latestWeatherWarning = latest.first }
+        let latest = warnings.filter { $0.expires > now }
+        if weatherWarnings != latest {
+            weatherWarnings = latest
+            weatherWarningExpiry?.cancel()
+            if let expiry = latest.map(\.expires).min() {
+                weatherWarningExpiry = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(max(0.05, expiry - now)))
+                    guard !Task.isCancelled, let self else { return }
+                    self.updateWeatherWarnings(self.weatherWarnings)
+                }
+            }
+        }
         let warningIDs = Set(latest.map(\.id))
         let seen = recentlyPresentedWeatherWarnings(now: now)
         let retained = activities.filter {
@@ -602,13 +819,70 @@ final class UnifiedActivities: ObservableObject {
             }
     }
 
-    var agentSessions: [IslandActivity] {
-        let current = activities.filter { $0.kind == "agent" && !$0.isCompletedAgentSession }
-        let currentIDs = Set(current.map(\.id))
-        return current + completedAgentSessions.filter { !currentIDs.contains($0.id) }
+    static let retainedAgentSessions = 2
+    static let agentSessionLifetime: TimeInterval = 15 * 60
+    @Published private var recentDoubaoSessions: [IslandActivity] = []
+    @Published private var recentlyEndedSessions: [IslandActivity] = []
+
+    func setRecentDoubaoSessions(_ sessions: [IslandActivity]) {
+        let recent = Self.recentAgentHistory(sessions + recentDoubaoSessions, now: Date().timeIntervalSince1970)
+        if recent != recentDoubaoSessions { recentDoubaoSessions = recent }
+        scheduleExpiry()
     }
 
-    init(observeSystem: Bool = true, storageURL: URL? = nil) {
+    var hasPendingAgentApprovals: Bool {
+        proactiveAlerts.contains { $0.hasPendingAgentApproval && $0.expires > Date().timeIntervalSince1970 }
+    }
+
+    private static func recentAgentHistory(_ sessions: [IslandActivity], now: Double) -> [IslandActivity] {
+        var seen = Set<String>()
+        return sessions.sorted(by: newerSession).filter { item in
+            let stamp = item.progress?.observedAt ?? 0
+            return stamp.isFinite && stamp > 0 && stamp + agentSessionLifetime > now
+                && seen.insert(item.id).inserted
+        }
+    }
+
+    private static func newerSession(_ lhs: IslandActivity, _ rhs: IslandActivity) -> Bool {
+        let left = lhs.progress?.observedAt ?? 0
+        let right = rhs.progress?.observedAt ?? 0
+        if left != right { return left > right }
+        if lhs.id != rhs.id { return lhs.id < rhs.id }
+        return lhs.isCompletedAgentSession && !rhs.isCompletedAgentSession
+    }
+
+    private var agentHistory: [IslandActivity] {
+        completedAgentSessions + recentlyEndedSessions + recentDoubaoSessions
+    }
+
+    var agentSessions: [IslandActivity] {
+        let now = Date().timeIntervalSince1970
+        let approvals = liveCodexApprovalActivities
+        let approvalIDs = Set(approvals.map(\.id))
+        let current = approvals + activities.filter {
+            $0.kind == "agent" && !$0.isCompletedAgentSession && $0.expires > now && !approvalIDs.contains($0.id)
+        }
+        let currentIDs = Set(current.map(\.id))
+        var inactiveCounts: [String: Int] = [:]
+        let retained = Self.recentAgentHistory(agentHistory, now: now).filter { item in
+            let provider = item.source ?? ""
+            guard !currentIDs.contains(item.id),
+                  inactiveCounts[provider, default: 0] < Self.retainedAgentSessions else { return false }
+            inactiveCounts[provider, default: 0] += 1
+            return true
+        }
+        return (current + retained).sorted(by: Self.newerSession)
+    }
+
+    func agentSession(for id: String) -> IslandActivity? {
+        let now = Date().timeIntervalSince1970
+        return liveCodexApprovalActivities.first { $0.id == id }
+            ?? activities.first { $0.id == id && $0.kind == "agent" && $0.expires > now }
+            ?? Self.recentAgentHistory(agentHistory.filter { $0.id == id }, now: now).first
+    }
+
+    init(observeSystem: Bool = true, storageURL: URL? = nil, approvalDirectory: URL? = nil) {
+        codexApprovalDirectory = approvalDirectory ?? CodexApprovalRequest.directory
         observeDevices = observeSystem
         directory = storageURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("UnifiedActivities", isDirectory: true)
@@ -616,27 +890,32 @@ final class UnifiedActivities: ObservableObject {
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             if let data = try? Data(contentsOf: directory.appendingPathComponent("completed-agents.json")),
                let saved = try? JSONDecoder().decode([IslandActivity].self, from: data) {
-                rememberCompletedAgents(saved)
+                let now = Date().timeIntervalSince1970
+                completedAgentSessions = Self.recentAgentHistory(saved.filter(\.isCompletedAgentSession), now: now)
+                recentlyEndedSessions = Self.recentAgentHistory(
+                    saved.filter { $0.kind == "agent" && $0.progress?.phase == "idle" }, now: now
+                )
+                if completedAgentSessions.count + recentlyEndedSessions.count != saved.count {
+                    persistRecentAgentHistory()
+                }
+                scheduleExpiry()
             }
         }
         guard observeSystem else { return }
         // Warm artwork metadata once; later audio lookups refresh it.
         BluetoothInfo.warmArtworkCacheOnce()
-        let fd = open(directory.path, O_EVTONLY)
-        if fd >= 0 {
-            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename], queue: .main)
-            source.setEventHandler { [weak self] in Task { @MainActor in self?.readBridge() } }
-            source.setCancelHandler { close(fd) }
-            source.resume()
-            watcher = source
-        }
         agentObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("local.boringnotch.agent-state"), object: nil, queue: .main
         ) { [weak self] notification in
             guard let text = notification.object as? String, let data = text.data(using: .utf8) else { return }
             Task { @MainActor in self?.receiveAgents(data) }
         }
-        readBridge()
+        codexApprovalObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("local.boringnotch.codex-approval"), object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshCodexApprovals() }
+        }
+        refreshCodexApprovals()
         if let data = try? Data(contentsOf: directory.appendingPathComponent("agent-usage.json")) { receiveUsage(data) }
         usageObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("local.boringnotch.agent-usage"), object: nil, queue: .main
@@ -657,9 +936,35 @@ final class UnifiedActivities: ObservableObject {
     private func publish(_ items: [IslandActivity]) {
         let now = Date().timeIntervalSince1970
         dismissed = dismissed.filter { $0.value > now }
-        activities = items.filter { $0.expires > now && dismissed[$0.id] != $0.expires }.sorted {
+        let visible = items.filter { $0.expires > now && dismissed[$0.id] != $0.expires }.sorted {
             $0.priority == $1.priority ? $0.id < $1.id : $0.priority > $1.priority
         }
+        let incomingIDs = Set(visible.filter { $0.kind == "agent" }.map(\.id))
+        var ended = recentlyEndedSessions
+        for item in activities where item.kind == "agent" && !incomingIDs.contains(item.id)
+            && item.progress?.islandPhase?.isTerminal == false {
+            var recent = item
+            recent.progress?.phase = "idle"
+            recent.progress?.requestID = nil
+            recent.progress?.lastTool = nil
+            recent.progress?.children = []
+            recent.title = item.title.components(separatedBy: " · ").first ?? "Agent"
+            ended.append(recent)
+        }
+        let recentEnded = Self.recentAgentHistory(ended, now: now)
+        let previousCompletions = completedAgentSessions
+        let recentCompleted = Self.recentAgentHistory(
+            items.filter { $0.isCompletedAgentSession && $0.progress?.isValid == true } + completedAgentSessions,
+            now: now
+        )
+        if recentEnded != recentlyEndedSessions || recentCompleted != completedAgentSessions {
+            if recentEnded != recentlyEndedSessions { recentlyEndedSessions = recentEnded }
+            if recentCompleted != completedAgentSessions { completedAgentSessions = recentCompleted }
+            persistRecentAgentHistory()
+        }
+        let recentDoubao = Self.recentAgentHistory(recentDoubaoSessions, now: now)
+        if recentDoubao != recentDoubaoSessions { recentDoubaoSessions = recentDoubao }
+        if activities != visible { activities = visible }
         if !activities.contains(where: { $0.id == selectedActivityID }) { selectedActivityID = nil }
         if !activities.contains(where: { $0.kind == "headphones" }) {
             headphoneAlert = nil
@@ -667,20 +972,68 @@ final class UnifiedActivities: ObservableObject {
             recentWear = nil
             audioCueID = nil
         }
-        expiry?.cancel()
-        if let next = activities.map(\.expires).min() {
-            expiry = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(max(0.1, next - now)))
-                guard !Task.isCancelled, let self else { return }
-                self.publish(self.activities)
+        scheduleExpiry()
+        if let onAgentTurnFinished, recentCompleted != previousCompletions {
+            for item in recentCompleted where !previousCompletions.contains(where: {
+                $0.id == item.id && $0.progress?.observedAt == item.progress?.observedAt
+            }) {
+                onAgentTurnFinished(item)
             }
         }
     }
 
-    private func readBridge() {
-        let file = directory.appendingPathComponent("agents.json")
-        guard let data = try? Data(contentsOf: file) else { return }
-        receiveAgents(data)
+    private func scheduleExpiry() {
+        let now = Date().timeIntervalSince1970
+        let historyDeadlines = agentHistory.compactMap { $0.progress?.observedAt }
+            .map { $0 + Self.agentSessionLifetime }
+        let next = (activities.map(\.expires) + historyDeadlines).min()
+        guard next != expiryDeadline else { return }
+        expiry?.cancel()
+        expiryDeadline = next
+        guard let next else {
+            expiry = nil
+            return
+        }
+        expiry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0.02, next - now)))
+            guard !Task.isCancelled, let self else { return }
+            self.expiryDeadline = nil
+            self.publish(self.activities)
+        }
+    }
+
+    /// Only a newer provider sample can confirm a quota reset. A countdown
+    /// reaching zero alone does not imply that the service restored usage.
+    static func quotaResetAlerts(previous: [AgentProviderUsage], current: [AgentProviderUsage],
+                                 now: Double) -> [IslandActivity] {
+        current.compactMap { provider in
+            guard let old = previous.first(where: { $0.id == provider.id }),
+                  provider.updatedAt > old.updatedAt,
+                  now - provider.updatedAt < 180 else { return nil }
+            let resets = provider.windows.compactMap { window -> (String, Double)? in
+                guard (window.windowMinutes != nil || window.label != nil),
+                      let before = old.windows.first(where: {
+                        $0.windowMinutes == window.windowMinutes && $0.label == window.label
+                      }) else { return nil }
+                if let reset = before.resetsAt, let next = window.resetsAt,
+                   next > reset, reset <= provider.updatedAt, now - reset < 1800 {
+                    return (window.cycle, next)
+                }
+                if before.resetsAt == nil, window.resetsAt == nil,
+                   provider.updatedAt - old.updatedAt < 86400,
+                   before.usedPercent >= 5, window.usedPercent == 0 {
+                    return (window.cycle, provider.updatedAt)
+                }
+                return nil
+            }
+            guard !resets.isEmpty else { return nil }
+            let cycles = Array(Set(resets.map(\.0))).sorted().joined(separator: " · ")
+            let identity = resets.map { "\($0.0):\($0.1)" }.sorted().joined(separator: "|")
+            return IslandActivity(id: "quota-reset:" + provider.id + ":" + identity,
+                                  kind: "agent-quota-reset", title: provider.name + " 额度已重置",
+                                  detail: cycles, symbol: "arrow.clockwise", priority: 80,
+                                  expires: now + 75, source: provider.id)
+        }
     }
 
     private func receiveUsage(_ data: Data) {
@@ -698,7 +1051,12 @@ final class UnifiedActivities: ObservableObject {
         let safe = incoming.prefix(32).filter { $0.isValid && seen.insert($0.id).inserted }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         guard agentUsage != safe else { return }
+        let resets = Self.quotaResetAlerts(previous: agentUsage, current: safe, now: Date().timeIntervalSince1970)
         agentUsage = safe
+        if !resets.isEmpty {
+            let existing = Set(activities.map(\.id))
+            publish(activities + resets.filter { !existing.contains($0.id) })
+        }
         if let encoded = try? JSONEncoder().encode(safe) {
             try? encoded.write(to: directory.appendingPathComponent("agent-usage.json"), options: .atomic)
         }
@@ -708,8 +1066,8 @@ final class UnifiedActivities: ObservableObject {
         guard data.count < 131072,
               let incoming = try? JSONDecoder().decode([IslandActivity].self, from: data) else { return }
         bridgeAvailable = true
-        let cached = directory.appendingPathComponent("agents.json")
-        if (try? Data(contentsOf: cached)) != data { try? data.write(to: cached, options: .atomic) }
+        // The launch agent's regular heartbeat also recovers a missed change notification.
+        if observeDevices { refreshCodexApprovals() }
         // Only normalized agent metadata is accepted from the read-only helper.
         let valid = incoming.prefix(16).filter {
             $0.kind == "agent" && $0.title.count <= 80 && $0.detail.count <= 160 &&
@@ -731,26 +1089,35 @@ final class UnifiedActivities: ObservableObject {
             }
             return result
         }
-        rememberCompletedAgents(valid)
-        publish(activities.filter { $0.kind != "agent" } + valid)
+        let now = Date()
+        // A delayed hook cannot restore a request from an already-closed turn.
+        let history = Dictionary(uniqueKeysWithValues: Self.recentAgentHistory(
+            completedAgentSessions + recentlyEndedSessions, now: now.timeIntervalSince1970
+        ).map { ($0.id, $0) })
+        let live = Dictionary(activities.filter { $0.kind == "agent" && $0.expires > now.timeIntervalSince1970 }
+            .map { ($0.id, $0) }, uniquingKeysWith: { Self.newerSession($0, $1) ? $0 : $1 })
+        let newest = Dictionary(valid.map { ($0.id, $0) },
+                                uniquingKeysWith: { Self.newerSession($0, $1) ? $0 : $1 })
+        let accepted = newest.values.compactMap { item -> IslandActivity? in
+            let stamp = item.progress?.observedAt ?? 0
+            if let current = live[item.id], (current.progress?.observedAt ?? 0) > stamp { return current }
+            if let prior = history[item.id], let priorStamp = prior.progress?.observedAt {
+                if stamp < priorStamp || (stamp == priorStamp && !item.isCompletedAgentSession) { return nil }
+            }
+            return item
+        }.sorted(by: Self.newerSession)
+        let cached = directory.appendingPathComponent("agents.json")
+        if let encoded = try? JSONEncoder().encode(accepted),
+           (try? JSONDecoder().decode([IslandActivity].self, from: Data(contentsOf: cached))) != accepted {
+            try? encoded.write(to: cached, options: .atomic)
+        }
+        publish(activities.filter { $0.kind != "agent" } + accepted)
     }
 
-    private func rememberCompletedAgents(_ incoming: [IslandActivity]) {
-        var sessions = Dictionary(uniqueKeysWithValues: completedAgentSessions.map { ($0.id, $0) })
-        for item in incoming where item.isCompletedAgentSession && item.progress?.isValid == true {
-            if let previous = sessions[item.id],
-               (previous.progress?.observedAt ?? 0) > (item.progress?.observedAt ?? 0) { continue }
-            sessions[item.id] = item
-        }
-        let latest = Array(sessions.values.sorted {
-            let left = $0.progress?.observedAt ?? 0
-            let right = $1.progress?.observedAt ?? 0
-            return left == right ? $0.id < $1.id : left > right
-        }.prefix(3))
-        guard latest != completedAgentSessions else { return }
-        completedAgentSessions = latest
+    private func persistRecentAgentHistory() {
         let file = directory.appendingPathComponent("completed-agents.json")
-        if let data = try? JSONEncoder().encode(latest) { try? data.write(to: file, options: .atomic) }
+        let recent = (completedAgentSessions + recentlyEndedSessions).sorted(by: Self.newerSession)
+        if let data = try? JSONEncoder().encode(recent) { try? data.write(to: file, options: .atomic) }
     }
 
     func announceAirDrop(success: Bool) {
@@ -1097,13 +1464,18 @@ enum AgentSessionListMetrics {
     static let expandedCount = 4
     static let headingHeight: CGFloat = 18
     static let listInset: CGFloat = 2
+    static let inlinePreviewHeight: CGFloat = 88
 
     static func height(for rowCount: Int) -> CGFloat {
         headingHeight + listInset * 2 + CGFloat(rowCount) * rowHeight
     }
 
-    static func extraHeight(for count: Int) -> CGFloat {
-        CGFloat(max(0, min(count, expandedCount) - compactCount)) * rowHeight
+    static func visibleRows(total: Int, expanded: Bool, previewIndex: Int?, minimum: Int = 0) -> Int {
+        let visible = min(total, max(minimum, expanded ? expandedCount : compactCount))
+        guard let previewIndex, previewIndex + 1 < total else { return visible }
+        // An expanded list can be scrolled, so any hovered row might be at its bottom edge.
+        let needsNextRow = expanded || previewIndex == visible - 1
+        return needsNextRow ? min(total, visible + 1) : visible
     }
 }
 
@@ -1112,8 +1484,18 @@ private struct AgentSessionsPage: View {
     var viewportHeight: CGFloat
     let listHeightChanged: (CGFloat) -> Void
     @ObservedObject private var hub = UnifiedActivities.shared
+    @EnvironmentObject private var vm: BoringViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var listExpanded = false
+    @State private var heldListHeight: CGFloat = 0
+    @State private var heldVisibleRows = 0
+    @State private var revealedRows = 0
+    @State private var hoveredSessionID: String?
     private var sessions: [IslandActivity] { hub.agentSessions }
+    private var newestDoubaoSession: UUID? {
+        sessions.first { $0.source == "doubao" && $0.conversationID != nil }?
+            .conversationID.flatMap(UUID.init(uuidString:))
+    }
 
     // Agent Notch SessionListMetrics / ClaudeInstancesView (Apache-2.0).
     private let rowHeight = AgentSessionListMetrics.rowHeight
@@ -1122,7 +1504,7 @@ private struct AgentSessionsPage: View {
 
     var body: some View {
         Group {
-            if let selected = sessions.first(where: { $0.id == selectedID }) {
+            if let selectedID, let selected = hub.agentSession(for: selectedID) {
                 detailsPage(selected)
             } else if sessions.isEmpty {
                 VStack(spacing: 8) {
@@ -1149,47 +1531,94 @@ private struct AgentSessionsPage: View {
                     .frame(height: headingHeight)
                     ScrollView(.vertical) {
                         LazyVStack(spacing: 0) {
-                            ForEach(sessions) { item in
+                            ForEach(listExpanded ? sessions[...] : sessions.prefix(max(visibleRows, heldVisibleRows))) { item in
                                 AgentNotchTaskRow(
                                     item: item, name: agentName(item), title: sessionName(item),
                                     activity: currentAction(item, fallback: fallbackStatus(item)),
-                                    rowHeight: rowHeight
+                                    rowHeight: rowHeight, hoveredSessionID: $hoveredSessionID
                                 ) { open(item.id) }
                                 .id(item.id)
                             }
                         }
                         .padding(.vertical, listInset)
                     }
-                    .scrollDisabled(!listExpanded)
                     .scrollIndicators(.never)
                     .scrollBounceBehavior(.basedOnSize)
-                    // AppKit reports negative vertical deltas when scrolling toward later rows.
-                    .panGesture(direction: .up, threshold: 12, isEnabled: { canExpandList }) { _, phase in
-                        if phase == .began || phase == .changed { expandList() }
-                    }
-                    .accessibilityAction(named: "显示更多会话") { expandList() }
                 }
-                .frame(height: min(viewportHeight, AgentSessionListMetrics.height(for: visibleRowCount)))
+                .contentShape(Rectangle())
+                .panGesture(direction: .up, threshold: 12, startsWithMomentum: false, requiresEligibleStart: true,
+                            isEnabled: { canExpandList }) { _, phase in
+                    if phase == .began || phase == .changed { expandList() }
+                }
+                .accessibilityAction(named: "显示更多会话") { expandList() }
+                .frame(height: min(viewportHeight, max(listHeight, heldListHeight)), alignment: .top)
             }
         }
+        .task(id: selectedID == nil ? listHeight : 0) {
+            let extra = extraListHeight
+            let target = selectedID == nil ? listHeight : 0
+            if selectedID == nil, target < heldListHeight {
+                try? await Task.sleep(for: .milliseconds(1400))
+                guard !Task.isCancelled else { return }
+            }
+            withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
+                heldListHeight = target
+                heldVisibleRows = selectedID == nil ? visibleRows : 0
+                vm.agentListPreviewHeightHeld = previewIndex != nil
+                listHeightChanged(extra)
+            }
+        }
+        .onDisappear { vm.agentListPreviewHeightHeld = false }
+        .task {
+            while !Task.isCancelled {
+                let result = try? await AgentInteraction.shared.recentDoubaoSessions()
+                if let result, !Task.isCancelled { hub.setRecentDoubaoSessions(result) }
+                do { try await Task.sleep(for: .seconds(90)) }
+                catch { return }
+            }
+        }
+        .onChange(of: visibleRows) { _, rows in
+            guard previewIndex != nil, !listExpanded else { return }
+            if rows > AgentSessionListMetrics.expandedCount { listExpanded = true }
+            else { revealedRows = max(revealedRows, rows) }
+        }
+        .task(id: newestDoubaoSession) {
+            guard let id = newestDoubaoSession else { return }
+            _ = try? await AgentInteraction.shared.doubaoHistory(id)
+        }
+        .onChange(of: selectedID.flatMap { hub.agentSession(for: $0) } != nil) { _, isAvailable in
+            if !isAvailable { selectedID = nil }
+        }
         .onChange(of: sessions.map(\.id)) { _, ids in
-            if let selectedID, !ids.contains(selectedID) { self.selectedID = nil }
-            if listExpanded { listHeightChanged(AgentSessionListMetrics.extraHeight(for: ids.count)) }
+            if let hoveredSessionID, !ids.contains(hoveredSessionID) { self.hoveredSessionID = nil }
         }
     }
 
-    private var visibleRowCount: Int {
-        min(sessions.count, listExpanded ? AgentSessionListMetrics.expandedCount : AgentSessionListMetrics.compactCount)
+    private var previewIndex: Int? {
+        guard selectedID == nil, let id = vm.agentConversationPreviewID else { return nil }
+        return sessions.firstIndex(where: { $0.id == id })
+    }
+
+    private var visibleRows: Int {
+        AgentSessionListMetrics.visibleRows(total: sessions.count, expanded: listExpanded, previewIndex: previewIndex, minimum: revealedRows)
+    }
+
+    private var listHeight: CGFloat {
+        AgentSessionListMetrics.height(for: visibleRows) + (previewIndex == nil ? 0 : AgentSessionListMetrics.inlinePreviewHeight)
+    }
+
+    private var extraListHeight: CGFloat {
+        guard selectedID == nil else { return 0 }
+        return max(0, listHeight - AgentSessionListMetrics.height(for: AgentSessionListMetrics.compactCount))
     }
 
     private var canExpandList: Bool {
-        selectedID == nil && !listExpanded && sessions.count > AgentSessionListMetrics.compactCount
+        selectedID == nil && previewIndex == nil && !listExpanded && sessions.count > max(AgentSessionListMetrics.compactCount, revealedRows)
     }
 
     private func expandList() {
         guard canExpandList else { return }
         listExpanded = true
-        listHeightChanged(AgentSessionListMetrics.extraHeight(for: sessions.count))
     }
 
     private func open(_ id: String?) {
@@ -1215,50 +1644,144 @@ private struct AgentSessionsPage: View {
     }
 
     private func detailsPage(_ item: IslandActivity) -> some View {
-        let title = sessionName(item)
-        return VStack(spacing: 0) {
-            HStack(spacing: 4) {
-                Button { open(nil) } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.secondary).frame(width: 20, height: 20)
-                        AgentNotchBadge(activity: item, name: agentName(item))
-                        Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                        Spacer(minLength: 4)
-                    }.contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("返回任务列表")
-                .accessibilityIdentifier("agent-back-to-tasks")
-
-                if item.progress?.phase == "waiting_for_approval" {
-                    Button {
-                        AgentApplicationIcons.open(activity: item)
-                    } label: {
-                        Label("待审批 · 在原会话处理", systemImage: "hand.raised.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .buttonStyle(AgentNotchTaskButtonStyle())
-                }
-            }
-            .padding(.horizontal, 8).padding(.bottom, 2)
+        Group {
             if let source = item.source.flatMap(AgentConversationSource.init(rawValue:)),
                let id = (item.conversationID ?? item.sessionID).flatMap(UUID.init(uuidString:)) {
                 AgentConversationSection(source: source, sessionID: id, updatedAt: item.progress?.observedAt,
-                                         viewportHeight: max(38, viewportHeight - 31))
-                    .id(item.id)
-                    .padding(.horizontal, 12).padding(.bottom, 8)
+                                         viewportHeight: viewportHeight, allowsReply: !item.hasPendingAgentApproval) {
+                    detailHeader(item)
+                }
+                .id(item.id)
+                .padding(.horizontal, 12)
             } else {
-                Text("暂无可读取的对话")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                VStack(alignment: .leading, spacing: 6) {
+                    detailHeader(item)
+                    Text("暂无可读取的对话").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
             }
         }
         .accessibilityIdentifier("agent-session-detail")
     }
 
+    private func detailHeader(_ item: IslandActivity) -> some View {
+        VStack(spacing: 3) {
+            Button { open(nil) } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary).frame(width: 20, height: 20)
+                    AgentNotchBadge(activity: item, name: agentName(item))
+                    Text(sessionName(item)).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("返回任务列表")
+            .accessibilityIdentifier("agent-back-to-tasks")
+            if item.agentAttentionKey != nil { AgentSessionAttention(item: item) }
+        }
+        .padding(.vertical, 4)
+    }
+
     private func currentAction(_ item: IslandActivity, fallback: String) -> String { item.agentCurrentAction }
 
+}
+
+private struct AgentSessionAttention: View {
+    let item: IslandActivity
+    var openDetails: (() -> Void)? = nil
+    @ObservedObject private var activities = UnifiedActivities.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showCommand = true
+    @State private var submitted = false
+    @State private var submitFailed = false
+
+    private var needsApproval: Bool { item.progress?.islandPhase == .waitingForApproval }
+
+    var body: some View {
+        let request = activities.codexApproval(for: item)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 7) {
+                Label(needsApproval ? "需要审批" : "等待你的回复",
+                      systemImage: needsApproval ? "hand.raised.fill" : "questionmark.bubble.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.orange)
+                if needsApproval, let tool = item.progress?.lastTool {
+                    Text(tool).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if let request, request.command != nil {
+                    Button(openDetails == nil && showCommand ? "收起命令" : "查看并审批") {
+                        if let openDetails { openDetails() }
+                        else { withAnimation(reduceMotion ? nil : .smooth(duration: 0.22)) { showCommand.toggle() } }
+                    }
+                    .buttonStyle(AgentNotchTaskButtonStyle())
+                    .accessibilityIdentifier("agent-codex-review")
+                } else if item.needsDoubaoApproval {
+                    Text("请在豆包原终端确认")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button {
+                        if let request { submit(.native, request: request) }
+                        AgentApplicationIcons.open(activity: item)
+                    } label: {
+                        Label(needsApproval ? "前往审批" : "打开原会话", systemImage: "arrow.up.right")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(AgentNotchTaskButtonStyle())
+                }
+            }
+            .frame(height: 24)
+            if openDetails == nil, showCommand, let request, let command = request.command {
+                if !request.reason.isEmpty {
+                    Text(request.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Text(request.cwd).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(request.cwd)
+                ScrollView {
+                    Text(verbatim: command).font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .scrollIndicators(.hidden)
+                .frame(maxHeight: 52)
+                HStack {
+                    if submitFailed { Text("请求已失效，请在 Codex 查看").font(.caption).foregroundStyle(.orange) }
+                    Spacer()
+                    Button("回 Codex") {
+                        submit(.native, request: request)
+                        AgentApplicationIcons.open(activity: item)
+                    }
+                    Button("拒绝") { submit(.deny, request: request) }
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("agent-codex-deny")
+                    Button("仅允许这次") { submit(.allow, request: request) }
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("agent-codex-allow-once")
+                }
+                .buttonStyle(AgentNotchTaskButtonStyle())
+                .disabled(submitted)
+            }
+        }
+        .onChange(of: request?.id) {
+            showCommand = true
+            submitted = false
+            submitFailed = false
+        }
+    }
+
+    private func submit(_ choice: CodexApprovalRequest.Choice, request: CodexApprovalRequest) {
+        do {
+            try activities.submitCodexApproval(choice, request: request)
+            submitted = true
+            submitFailed = false
+        } catch {
+            submitFailed = true
+        }
+    }
 }
 
 /// InstanceRow and TaskRowButtonStyle from Agent Notch, adapted to IslandActivity.
@@ -1268,8 +1791,26 @@ private struct AgentNotchTaskRow: View {
     let title: String
     let activity: String
     let rowHeight: CGFloat
+    @Binding var hoveredSessionID: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let openDetails: () -> Void
+    @EnvironmentObject private var vm: BoringViewModel
     @State private var isHovered = false
+    @State private var previewHovered = false
+    @State private var previewBusy = false
+    @State private var recentMessages: [AgentConversationMessage] = []
+    @State private var historyFile: URL?
+
+    private var previewOpen: Bool { vm.agentConversationPreviewID == item.id }
+    private var shouldClosePreview: Bool {
+        previewOpen && !isHovered && !previewHovered && hoveredSessionID == nil
+    }
+
+    private var previewTarget: (AgentConversationSource, UUID)? {
+        guard let source = item.source.flatMap(AgentConversationSource.init(rawValue:)),
+              let id = (item.conversationID ?? item.sessionID).flatMap(UUID.init(uuidString:)) else { return nil }
+        return (source, id)
+    }
 
     private var phase: String { item.progress?.phase ?? "" }
     private var working: Bool { ["processing", "running_tool", "compacting"].contains(phase) }
@@ -1283,6 +1824,7 @@ private struct AgentNotchTaskRow: View {
         case "waiting_for_input": "等待输入"
         case "finished": "已完成"
         case "failed": "失败"
+        case "idle": "最近会话"
         default: "空闲"
         }
     }
@@ -1296,11 +1838,63 @@ private struct AgentNotchTaskRow: View {
         }
     }
     private var statusColor: Color {
-        waiting ? .orange : phase == "finished" ? .green : phase == "failed" ? .red : .secondary
+        item.hasPendingAgentApproval ? .red : waiting ? .orange : phase == "finished" ? .green : phase == "failed" ? .red : .secondary
     }
 
     var body: some View {
-        Button(action: openDetails) {
+        VStack(spacing: 0) {
+            rowButton
+            if previewOpen {
+                transcriptPreview
+                    .transition(.opacity.combined(with: .offset(y: -4)))
+                    .onHover { previewHovered = $0 }
+            }
+        }
+        .task(id: shouldClosePreview) {
+            guard shouldClosePreview else { return }
+            try? await Task.sleep(for: .milliseconds(330))
+            guard !Task.isCancelled, shouldClosePreview else { return }
+            closePreview()
+        }
+        .onChange(of: previewOpen) { _, open in
+            if !open { previewHovered = false }
+        }
+        .task(id: previewOpen) {
+            guard previewOpen, let (source, id) = previewTarget else { return }
+            if source == .doubao {
+                if let cached = AgentInteraction.shared.cachedDoubaoHistory(id) {
+                    recentMessages = Array(cached.messages.suffix(4))
+                    previewBusy = false
+                }
+                let result = try? await AgentInteraction.shared.doubaoHistory(id)
+                guard !Task.isCancelled, previewOpen else { return }
+                if let result { recentMessages = Array(result.messages.suffix(4)) }
+                previewBusy = false
+                return
+            }
+            let bookmark = UserDefaults.standard.data(forKey: "agentConversationRoot.\(source.rawValue)")
+            let knownFile = historyFile
+            let task = Task.detached(priority: .utility) {
+                try? AgentConversationHistory.read(bookmark: bookmark, source: source, id: id, before: nil, knownFile: knownFile)
+            }
+            let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+            guard !Task.isCancelled, previewOpen else { return }
+            historyFile = result?.file
+            recentMessages = Array(result?.page.messages.suffix(4) ?? [])
+            previewBusy = false
+        }
+        .onDisappear {
+            if hoveredSessionID == item.id { hoveredSessionID = nil }
+            closePreview()
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var rowButton: some View {
+        Button {
+            closePreview()
+            openDetails()
+        } label: {
             HStack(spacing: 9) {
                 ActivityAvatar(activity: item, size: 18).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
@@ -1330,13 +1924,88 @@ private struct AgentNotchTaskRow: View {
             Rectangle().fill(.primary.opacity(0.12)).frame(height: 0.5)
                 .padding(.horizontal, 12).allowsHitTesting(false)
         }
-        .onHover { isHovered = $0 }
-        .accessibilityElement(children: .contain)
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering, previewTarget != nil || waiting { hoveredSessionID = item.id }
+            else if hoveredSessionID == item.id { hoveredSessionID = nil }
+        }
+        .task(id: isHovered) {
+            guard isHovered, !previewOpen, previewTarget != nil || waiting,
+                  !vm.systemIslandPresentationActive else { return }
+            let delay: Duration = vm.agentConversationPreviewID == nil ? .milliseconds(570) : .milliseconds(240)
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, isHovered, hoveredSessionID == item.id, vm.notchState == .open,
+                  !previewOpen, !vm.systemIslandPresentationActive, NSEvent.pressedMouseButtons == 0 else { return }
+            previewBusy = previewTarget != nil
+            withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
+                vm.agentConversationPreviewID = item.id
+            }
+        }
+    }
+
+    private var transcriptPreview: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if waiting { AgentSessionAttention(item: item, openDetails: openDetails) }
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 6) {
+                    if recentMessages.isEmpty {
+                        if previewBusy { ProgressView().controlSize(.small) }
+                        else { Text("暂无可读取的对话").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    ForEach(recentMessages) { message in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(message.role == "user" ? "你" : name)
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            AgentConversationMessageText(entry: message)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+                .background(AgentPreviewScrollBoundary())
+            }
+            .defaultScrollAnchor(.bottom)
+            .scrollIndicators(.never)
+            .scrollBounceBehavior(.basedOnSize)
+            .modifier(AgentTranscriptEdgeFade(length: 10))
+        }
+        .frame(height: AgentSessionListMetrics.inlinePreviewHeight - 22, alignment: .topLeading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .foregroundStyle(.white)
+        .background {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(.ultraThinMaterial.opacity(0.32))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(.linearGradient(colors: [.black.opacity(0.62), .black.opacity(0.23)],
+                                              startPoint: .top, endPoint: .bottom))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(.white.opacity(0.14), lineWidth: 1)
+                }
+        }
+        .environment(\.colorScheme, .dark)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .accessibilityIdentifier("agent-conversation-hover-preview")
+    }
+
+    private func closePreview() {
+        guard previewOpen else { return }
+        withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
+            vm.agentConversationPreviewID = nil
+        }
     }
 
     private var statusLabel: some View {
         HStack(spacing: 5) {
-            if working {
+            if item.hasPendingAgentApproval {
+                Circle().fill(.red).frame(width: 6, height: 6).accessibilityHidden(true)
+            } else if working {
                 AgentNotchProcessingSpinner(color: accent).frame(width: 12, height: 12)
                     .accessibilityHidden(true)
             } else {
@@ -1432,6 +2101,7 @@ private struct AgentNotchProcessingSpinner: View {
 private struct AgentReplyField: NSViewRepresentable {
     @Binding var text: String
     var canSubmit: Bool
+    var placeholder = "回复当前会话…"
     var submit: () -> Void
     var voiceFocus: UUID?
     var voiceReady: () -> Void
@@ -1490,7 +2160,7 @@ private struct AgentReplyField: NSViewRepresentable {
             guard let input = notification.object as? Input else { return }
             let panel = input.window as? BoringNotchSkyLightWindow
             Task { @MainActor [weak input, weak panel] in
-                if let input { panel?.endAgentReplyEditing(input) }
+                if let input, input.currentEditor() == nil { panel?.endAgentReplyEditing(input) }
             }
         }
 
@@ -1524,7 +2194,7 @@ private struct AgentReplyField: NSViewRepresentable {
         input.focusRingType = .none
         input.drawsBackground = false
         input.usesSingleLineMode = true
-        input.placeholderString = "回复当前会话…"
+        input.placeholderString = placeholder
         input.setAccessibilityIdentifier("agent-reply-input")
         input.setContentHuggingPriority(.defaultLow, for: .horizontal)
         return input
@@ -1535,11 +2205,15 @@ private struct AgentReplyField: NSViewRepresentable {
         input.pendingVoiceFocus = voiceFocus
         input.voiceReady = voiceReady
         input.scheduleVoiceFocus()
-        guard input.stringValue != text,
-              (input.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
-        input.stringValue = text
-        if let editor = input.currentEditor() as? NSTextView, editor.string != text {
+        if let editor = input.currentEditor() as? NSTextView {
+            guard !editor.hasMarkedText(), editor.string != text else { return }
+            let selection = editor.selectedRange()
             editor.string = text
+            let end = (text as NSString).length
+            let location = min(selection.location, end)
+            editor.setSelectedRange(NSRange(location: location, length: min(selection.length, end - location)))
+        } else if input.stringValue != text {
+            input.stringValue = text
         }
     }
 
@@ -1550,12 +2224,13 @@ private struct AgentReplyField: NSViewRepresentable {
 }
 
 @MainActor
-private struct AgentConversationSection: View {
+private struct AgentConversationSection<Header: View>: View {
     let source: AgentConversationSource
     let sessionID: UUID
     let updatedAt: Double?
     @ObservedObject private var interaction = AgentInteraction.shared
-    @AppStorage(AgentSuggestionAPI.enabledKey) private var useSuggestionAPI = false
+    @AppStorage(AgentQuickReplySource.preferenceKey) private var quickReplySource = AgentQuickReplySource.current
+    @AppStorage(AgentQuickReplySource.customRepliesKey) private var customReplyData = Data()
     @AppStorage("agentConversationRoot.codex") private var codexRoot: Data?
     @AppStorage("agentConversationRoot.gemini") private var geminiRoot: Data?
     @AppStorage("agentConversationRoot.antigravity") private var antigravityRoot: Data?
@@ -1572,12 +2247,16 @@ private struct AgentConversationSection: View {
     @AppStorage(AgentVoiceEngine.preferenceKey) private var voiceEngine = AgentVoiceEngine.onDevice
     @State private var draft = ""
 
+    private var showsComposer: Bool { allowsReply }
+
+
     private var bookmark: Data? {
         switch source {
         case .codex: codexRoot
         case .claude: claudeRoot
         case .gemini: geminiRoot
         case .antigravity: antigravityRoot
+        case .doubao: nil
         }
     }
     private struct Refresh: Equatable {
@@ -1586,67 +2265,38 @@ private struct AgentConversationSection: View {
     }
 
     var viewportHeight: CGFloat
-    @State private var contentHeight: CGFloat = 44
+    var allowsReply = true
+    @ViewBuilder var header: () -> Header
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    private var baseMessageViewportHeight: CGFloat {
-        let controls: CGFloat = !source.supportsQuickReplies ? 0 : (interaction.state(sessionID).status == nil ? 63 : 78)
-        return max(18, min(viewportHeight - controls, contentHeight))
-    }
-
-    private var glassUnderlap: CGFloat {
-        source.supportsQuickReplies && !reduceTransparency && contentHeight > baseMessageViewportHeight ? 36 : 0
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: glassUnderlap > 0 ? -glassUnderlap : 3) {
+        VStack(spacing: 0) {
+            header()
+                .padding(.horizontal, 2)
             ScrollViewReader { proxy in
                 ScrollView(.vertical) {
-                    VStack(spacing: 0) {
-                        conversationContent
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .onGeometryChange(for: CGFloat.self) { geometry in
-                                geometry.size.height
-                            } action: { height in
-                                contentHeight = height
-                            }
-                        // Start with a little of the last line behind the first
-                        // control row. The remaining inset lets it scroll clear.
-                        let restingInset = min(15, glassUnderlap)
-                        Color.clear.frame(height: 1 + restingInset).id("agent-conversation-end")
-                        Color.clear.frame(height: glassUnderlap - restingInset)
-                    }
+                    conversationContent
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 16)
+                    Color.clear.frame(height: 16).id("agent-conversation-end")
                 }
-                .frame(height: baseMessageViewportHeight + glassUnderlap)
                 .scrollIndicators(.never)
                 .scrollBounceBehavior(.basedOnSize)
-                .mask(alignment: .bottom) {
-                    VStack(spacing: 0) {
-                        Rectangle()
-                        if glassUnderlap > 0 {
-                            LinearGradient(colors: [.black, .black.opacity(0.42)], startPoint: .top, endPoint: .bottom)
-                                .frame(height: glassUnderlap)
-                        }
-                    }
-                }
+                .modifier(AgentTranscriptEdgeFade(length: 16))
                 .onChange(of: messages.last?.id) { _, _ in
-                    if !showingOlder { proxy.scrollTo("agent-conversation-end", anchor: .bottom) }
-                }
-                .onChange(of: glassUnderlap) { old, new in
-                    if old == 0, new > 0, !showingOlder, !messages.isEmpty {
-                        proxy.scrollTo("agent-conversation-end", anchor: .bottom)
-                    }
+                    guard !showingOlder, !vm.isAgentReplyEditing else { return }
+                    proxy.scrollTo("agent-conversation-end", anchor: .bottom)
                 }
             }
-            if source.supportsQuickReplies {
+            if showsComposer {
                 quickReplies
-                    .background(alignment: .top) {
-                        if glassUnderlap > 0 { conversationControlGlass }
-                    }
-                    .layoutPriority(1)
-                    .zIndex(1)
+                    .padding(.horizontal, 6)
+                    .padding(.top, 6)
+                    .padding(.bottom, 6)
+                    .background { conversationControlGlass }
             }
         }
+        .frame(height: viewportHeight)
         .onAppear { draft = interaction.draft(for: sessionID) }
         .onChange(of: voice.isActive) { _, active in vm.isAgentVoiceReplyActive = active }
         .onChange(of: vm.isAgentReplyEditing) { _, editing in
@@ -1663,6 +2313,9 @@ private struct AgentConversationSection: View {
                 if !showingOlder { Task { await load(before: nil) } }
             }
         }
+        .onChange(of: interaction.state(sessionID).deliveredAt) { _, date in
+            if source == .doubao, date != nil { Task { await load(before: nil, refresh: true) } }
+        }
         .task(id: Refresh(bookmark: bookmark, updatedAt: updatedAt)) {
             guard !showingOlder else { return }
             // Coalesce the burst of session updates for successive tool calls.
@@ -1673,55 +2326,59 @@ private struct AgentConversationSection: View {
     }
 
     private var conversationControlGlass: some View {
-        Rectangle()
-            .fill(.ultraThinMaterial)
-            .opacity(0.28)
-            .overlay {
-                LinearGradient(colors: [.clear, .black.opacity(0.28)], startPoint: .top, endPoint: .bottom)
-            }
-            .frame(height: glassUnderlap)
-            .mask {
-                LinearGradient(stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .black.opacity(0.82), location: 0.22),
-                    .init(color: .black, location: 1)
-                ], startPoint: .top, endPoint: .bottom)
-            }
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0),
+                .init(color: .black.opacity(reduceTransparency ? 0.96 : 0.58), location: 0.30),
+                .init(color: .black.opacity(reduceTransparency ? 0.96 : 0.73), location: 1)
+            ], startPoint: .top, endPoint: .bottom
+        )
+        .padding(.top, -6)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private var quickReplies: some View {
         let state = interaction.state(sessionID)
+        let replyOptions: [AgentReplyOption] = switch quickReplySource {
+        case .standard: AgentInteraction.immediateReplies(messages: messages, title: "")
+        case .api: interaction.apiReplies(id: sessionID, messages: messages)
+        case .custom: AgentQuickReplySource.customReplies(from: customReplyData)
+        }
         return VStack(alignment: .leading, spacing: 5) {
-            if !state.detailReplyOptions.isEmpty {
+            if !replyOptions.isEmpty {
                 ScrollView(.horizontal) {
                     HStack(spacing: 6) {
-                        ForEach(state.detailReplyOptions, id: \.body) { reply in
+                        ForEach(replyOptions, id: \.body) { reply in
                             Button {
                                 interaction.send(reply.body, source: source.rawValue, id: sessionID)
                             } label: {
-                                Text(reply.title).lineLimit(1).frame(maxWidth: 240, alignment: .leading)
+                                Text(AgentMarkdownFormatting.inline(reply.title))
+                                    .lineLimit(1)
+                                    .frame(maxWidth: 240, alignment: .leading)
                             }
                             .buttonStyle(AgentNotchTaskButtonStyle())
                             .disabled(state.sending)
                             .help(reply.body)
                         }
                     }
-                }.frame(height: 28).scrollIndicators(.never)
-            } else {
+                }
+                .frame(height: 28)
+                .scrollIndicators(.never)
+                .reservesHorizontalNotchScrolling()
+            } else if quickReplySource == .api {
                 Button {
-                    interaction.generate(source: source.rawValue, id: sessionID, messages: messages)
+                    Task { await interaction.generateAPIReplies(id: sessionID, messages: messages) }
                 } label: {
                     HStack(spacing: 5) {
                         if state.generating { ProgressView().controlSize(.mini) }
                         else { Image(systemName: "sparkles") }
-                        Text(state.generating ? "正在生成回复…" : useSuggestionAPI ? "生成 API 建议" : "让 \(source.appName) 建议回复")
+                        Text(state.generating ? "正在生成回复…" : "生成 API 建议")
                     }
                 }
                 .buttonStyle(AgentNotchTaskButtonStyle())
                 .disabled(messages.isEmpty || state.generating || state.sending)
-                .help(useSuggestionAPI ? "使用设置中选定的 API，根据最近对话生成建议" : "根据最近对话生成回复，使用现有 Agent 账号的模型额度")
+                .help("使用设置中选定的 API，根据最近对话生成建议")
                 .accessibilityIdentifier("agent-generate-replies")
             }
             HStack(spacing: 5) {
@@ -1735,6 +2392,7 @@ private struct AgentConversationSection: View {
                     voiceFocus: vm.agentVoiceFocus?.sessionID == sessionID ? vm.agentVoiceFocus?.id : nil,
                     voiceReady: startVoiceReply
                 )
+                .frame(maxWidth: .infinity, minHeight: 28)
                 Button {
                     vm.agentVoiceFocus = AgentVoiceFocus(sessionID: sessionID)
                 } label: {
@@ -1769,12 +2427,15 @@ private struct AgentConversationSection: View {
                 HStack(spacing: 8) {
                     Text(status).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).help(status)
                     if let text = state.unsentReply {
-                        Button(source == .codex ? "复制并打开会话" : "复制引导语") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(text, forType: .string)
+                        let label: LocalizedStringKey = source == .antigravity ? "复制并打开 Antigravity"
+                            : source == .codex ? "复制并打开会话" : "复制引导语"
+                        Button(label) {
+                            guard AgentInteraction.copyReply(text) else { return }
                             interaction.dismissUnsent(sessionID)
                             if source == .codex, let url = URL(string: "codex://threads/\(sessionID.uuidString.lowercased())") {
                                 NSWorkspace.shared.open(url)
+                            } else if source == .antigravity {
+                                AgentApplicationIcons.open(source: source.rawValue)
                             }
                         }.buttonStyle(.plain).font(.caption)
                     }
@@ -1815,28 +2476,21 @@ private struct AgentConversationSection: View {
             }
             if let message {
                 Text(message).font(.caption).foregroundStyle(.secondary)
-                Button("选择会话记录目录…", action: chooseFolder)
-                    .buttonStyle(.plain).font(.caption)
+                if source == .doubao {
+                    Button("重试读取") { Task { await load(before: nil, refresh: true) } }
+                        .buttonStyle(.plain).font(.caption)
+                } else {
+                    Button("选择会话记录目录…", action: chooseFolder)
+                        .buttonStyle(.plain).font(.caption)
+                }
             } else if messages.isEmpty && !isLoading {
-                Text("等待回复…").font(.caption).foregroundStyle(.secondary)
+                Text("这条会话还没有保存聊天正文").font(.caption).foregroundStyle(.secondary)
+                Button("重新读取") { Task { await load(before: nil) } }
+                    .buttonStyle(.plain).font(.caption)
             }
             ForEach(messages) { entry in
-                if entry.role == "user" {
-                    HStack {
-                        Spacer(minLength: 24)
-                        messageText(entry)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(.primary.opacity(0.15), in: RoundedRectangle(cornerRadius: 16))
-                    }
-                } else {
-                    HStack(alignment: .top, spacing: 6) {
-                        Circle().fill((source == .claude
-                            ? Color(red: 0.85, green: 0.47, blue: 0.34) : .primary).opacity(0.9))
-                            .frame(width: 6, height: 6).padding(.top, 5).accessibilityHidden(true)
-                        messageText(entry).foregroundStyle(.primary.opacity(0.9))
-                        Spacer(minLength: 24)
-                    }
-                }
+                conversationRow(entry)
+                    .id(entry.id)
             }
             if isLoading && messages.isEmpty { ProgressView().controlSize(.small) }
             if showingOlder {
@@ -1852,12 +2506,25 @@ private struct AgentConversationSection: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func messageText(_ entry: AgentConversationMessage) -> some View {
-        Text(verbatim: entry.text)
-            .font(.system(size: 13))
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
-            .accessibilityIdentifier("agent-conversation-message")
+    @ViewBuilder
+    private func conversationRow(_ entry: AgentConversationMessage) -> some View {
+        if entry.role == "user" {
+            HStack {
+                Spacer(minLength: 24)
+                AgentConversationMessageText(entry: entry)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(.primary.opacity(0.15), in: RoundedRectangle(cornerRadius: 16))
+            }
+        } else {
+            HStack(alignment: .top, spacing: 6) {
+                Circle().fill((source == .claude
+                    ? Color(red: 0.85, green: 0.47, blue: 0.34) : .primary).opacity(0.9))
+                    .frame(width: 6, height: 6).padding(.top, 5).accessibilityHidden(true)
+                AgentConversationMessageText(entry: entry)
+                    .foregroundStyle(.primary.opacity(0.9))
+                Spacer(minLength: 24)
+            }
+        }
     }
 
     private func chooseFolder() {
@@ -1883,13 +2550,14 @@ private struct AgentConversationSection: View {
             case .claude: claudeRoot = data
             case .gemini: geminiRoot = data
             case .antigravity: antigravityRoot = data
+            case .doubao: break
             }
         } catch {
             message = "无法保存该目录的读取授权"
         }
     }
 
-    private func load(before: UInt64?) async {
+    private func load(before: UInt64?, refresh: Bool = false) async {
         let bookmark = bookmark
         let request = UUID()
         activeRequest = request
@@ -1897,6 +2565,24 @@ private struct AgentConversationSection: View {
         defer { if activeRequest == request { isLoading = false } }
         let source = source
         let id = sessionID
+        if source == .doubao {
+            if before == nil, let cached = interaction.cachedDoubaoHistory(id) {
+                messages = cached.messages
+                cursor = cached.before
+            }
+            do {
+                let page = try await interaction.doubaoHistory(id, before: before, refresh: refresh)
+                guard activeRequest == request, !Task.isCancelled else { return }
+                cursor = page.before
+                if before == nil { messages = page.messages }
+                else { messages.insert(contentsOf: page.messages, at: 0) }
+                interaction.updateContext(id: sessionID, messages: messages)
+                message = nil
+            } catch {
+                if activeRequest == request, !Task.isCancelled, messages.isEmpty { message = error.localizedDescription }
+            }
+            return
+        }
         let knownFile = fileHint
         let worker = Task.detached(priority: .utility) {
             try AgentConversationHistory.read(bookmark: bookmark, source: source, id: id,
@@ -1918,10 +2604,250 @@ private struct AgentConversationSection: View {
             return
         } catch {
             guard activeRequest == request, !Task.isCancelled else { return }
-            message = (error as? AgentConversationHistory.AccessError) == .noSession
-                ? "在所选目录里找不到这个会话"
-                : "无法读取会话记录"
+            switch error as? AgentConversationHistory.AccessError {
+            case .noSession:
+                message = "在会话日志目录里找不到这条记录"
+            case .noAccess:
+                message = "无法读取日志目录，请选择对应目录授权"
+            default:
+                message = "无法读取会话记录"
+            }
         }
+    }
+}
+
+// === AGENT_TRANSCRIPT_EDGES_BEGIN ===
+private struct AgentTranscriptEdges: Equatable {
+    var top: Bool
+    var bottom: Bool
+
+    static func visible(offset: CGFloat, contentHeight: CGFloat, viewportHeight: CGFloat,
+                        topInset: CGFloat, bottomInset: CGFloat) -> Self {
+        let hiddenAbove = offset + topInset
+        let maximumOffset = max(0, contentHeight + topInset + bottomInset - viewportHeight)
+        return Self(top: hiddenAbove > 1, bottom: maximumOffset - hiddenAbove > 1)
+    }
+}
+
+private struct AgentTranscriptEdgeFade: ViewModifier {
+    let length: CGFloat
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var edges = AgentTranscriptEdges(top: false, bottom: false)
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content
+                .onScrollGeometryChange(for: AgentTranscriptEdges.self) { geometry in
+                    AgentTranscriptEdges.visible(offset: geometry.contentOffset.y,
+                        contentHeight: geometry.contentSize.height, viewportHeight: geometry.containerSize.height,
+                        topInset: geometry.contentInsets.top, bottomInset: geometry.contentInsets.bottom)
+                } action: { _, next in
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.13)) { edges = next }
+                }
+                .mask { gradient(for: edges) }
+        } else {
+            // Matching end padding keeps fully visible text outside these fades.
+            content.mask { gradient(for: .init(top: true, bottom: true)) }
+        }
+    }
+
+    private func gradient(for edges: AgentTranscriptEdges) -> some View {
+        GeometryReader { viewport in
+            let inset = min(0.30, length / max(1, viewport.size.height))
+            LinearGradient(
+                stops: [
+                    .init(color: .black.opacity(edges.top ? 0 : 1), location: 0),
+                    .init(color: .black, location: inset),
+                    .init(color: .black, location: 1 - inset),
+                    .init(color: .black.opacity(edges.bottom ? 0 : 1), location: 1)
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+        }
+    }
+}
+// === AGENT_TRANSCRIPT_EDGES_END ===
+
+private struct AgentConversationMessageText: View {
+    let entry: AgentConversationMessage
+
+    var body: some View {
+        Group {
+            if entry.role == "user" {
+                Text(verbatim: entry.text)
+                    .font(.system(size: 13))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            } else {
+                AgentMarkdownReply(markdown: entry.text).equatable()
+            }
+        }
+        .accessibilityIdentifier("agent-conversation-message")
+    }
+}
+
+enum AgentMarkdownFormatting {
+    // A link label is useful in a summary or button, but the enclosing control
+    // owns the action.
+    static func inline(_ markdown: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        let value = (try? AttributedString(markdown: markdown, options: options)) ?? AttributedString(markdown)
+        return value.transformingAttributes(\.link) { $0.value = nil }
+    }
+
+    static func permitsLink(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http"
+    }
+}
+
+private struct AgentMarkdownReply: View, Equatable {
+    let markdown: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(AgentMarkdownBlock.parse(markdown)) { block in
+                if !block.tableRows.isEmpty {
+                    table(block.tableRows)
+                } else if block.isDivider {
+                    Divider()
+                } else {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        if let marker = block.marker {
+                            Text(verbatim: marker)
+                                .font(.system(size: 12, weight: .medium).monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(block.text)
+                            .font(block.font)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, block.isCode ? 6 : 0)
+                    .padding(.horizontal, block.isCode ? 8 : 0)
+                    .background {
+                        if block.isCode {
+                            RoundedRectangle(cornerRadius: 7).fill(.primary.opacity(0.08))
+                        }
+                    }
+                    .padding(.leading, block.isQuote ? 8 : 0)
+                    .overlay(alignment: .leading) {
+                        if block.isQuote {
+                            RoundedRectangle(cornerRadius: 1)
+                                .fill(.primary.opacity(0.27))
+                                .frame(width: 2)
+                        }
+                    }
+                    .padding(.leading, CGFloat(max(0, block.listDepth - 1)) * 11)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
+    }
+
+    private func table(_ rows: [[AttributedString]]) -> some View {
+        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 0) {
+            ForEach(rows.indices, id: \.self) { index in
+                if index == 1 { Divider().gridCellUnsizedAxes(.horizontal) }
+                GridRow {
+                    ForEach(rows[index].indices, id: \.self) { cell in
+                        Text(rows[index][cell])
+                            .font(.system(size: 12, weight: index == 0 ? .semibold : .regular))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.vertical, 4)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 7)
+        .background(.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+private struct AgentMarkdownBlock: Identifiable {
+    let id: Int
+    var text: AttributedString
+    var heading: Int?
+    var marker: String?
+    var listDepth = 0
+    var isCode = false
+    var isQuote = false
+    var isDivider = false
+    var tableRows: [[AttributedString]] = []
+
+    var font: Font {
+        if let heading {
+            return .system(size: heading == 1 ? 17 : heading == 2 ? 15 : 13, weight: .semibold)
+        }
+        return .system(size: isCode ? 12 : 13, design: isCode ? .monospaced : .default)
+    }
+
+    static func parse(_ markdown: String) -> [Self] {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
+        guard let value = try? AttributedString(markdown: markdown, options: options),
+              !value.characters.isEmpty else {
+            return [.init(id: 0, text: AttributedString(markdown))]
+        }
+
+        var blocks: [Self] = []
+        var seenItems: Set<Int> = []
+        var previousTableRow: Int?
+        for run in value.runs {
+            var segment = AttributedString(value[run.range])
+            if let url = run.link, !AgentMarkdownFormatting.permitsLink(url) {
+                segment.link = nil
+            }
+            let components = run.presentationIntent?.components ?? []
+            if components.count >= 3,
+               case .tableCell(let column) = components[0].kind,
+               case .table(let columns) = components[2].kind,
+               columns.indices.contains(column) {
+                let rowID = components[1].identity
+                let tableID = components[2].identity
+                if blocks.last?.id != tableID {
+                    blocks.append(.init(id: tableID, text: AttributedString()))
+                    previousTableRow = nil
+                }
+                let tableIndex = blocks.count - 1
+                if previousTableRow != rowID {
+                    blocks[tableIndex].tableRows.append(Array(repeating: AttributedString(), count: columns.count))
+                    previousTableRow = rowID
+                }
+                let rowIndex = blocks[tableIndex].tableRows.count - 1
+                blocks[tableIndex].tableRows[rowIndex][column] += segment
+                continue
+            }
+            let id = components.first?.identity ?? 0
+            if blocks.last?.id == id {
+                blocks[blocks.count - 1].text += segment
+                continue
+            }
+
+            var block = Self(id: id, text: segment)
+            var item: (id: Int, position: Int)?
+            for component in components {
+                switch component.kind {
+                case .header(let level): block.heading = level
+                case .codeBlock: block.isCode = true
+                case .blockQuote: block.isQuote = true
+                case .thematicBreak: block.isDivider = true
+                case .listItem(let ordinal):
+                    block.listDepth += 1
+                    if item == nil { item = (component.identity, ordinal) }
+                case .orderedList, .unorderedList:
+                    if let marker = item {
+                        if seenItems.insert(marker.id).inserted {
+                            block.marker = component.kind == .orderedList ? "\(marker.position)." : "•"
+                        }
+                        item = nil
+                    }
+                default: break
+                }
+            }
+            blocks.append(block)
+        }
+        return blocks
     }
 }
 
@@ -1929,11 +2855,11 @@ private struct AgentUsageSummary: View {
     @ObservedObject var hub: UnifiedActivities
     @ObservedObject private var apiUsage = AgentAPIUsageLedger.shared
     @AppStorage(AgentUsageSelection.key) private var preferred = ""
-    @AppStorage(AgentSuggestionAPI.enabledKey) private var apiEnabled = false
+    @AppStorage(AgentQuickReplySource.preferenceKey) private var quickReplySource = AgentQuickReplySource.current
 
     var body: some View {
         switch AgentUsageSelection.resolve(hub.agentUsage, preferred: preferred, active: hub.runningAgent?.source,
-                                           apiEnabled: apiEnabled, today: apiUsage.today) {
+                                           apiEnabled: quickReplySource == .api, today: apiUsage.today) {
         case .provider(let snapshot):
             providerBadge(snapshot)
         case .replyAPI(let today):
@@ -1970,10 +2896,12 @@ private struct AgentUsageSummary: View {
 
 struct UnifiedActivityPanel: View {
     @Binding var selectedID: String?
-    var viewportHeight: CGFloat = 104
+    var viewportHeight: CGFloat
+    var previewColorScheme: ColorScheme
     var listHeightChanged: (CGFloat) -> Void = { _ in }
     var body: some View {
-        AgentSessionsPage(selectedID: $selectedID, viewportHeight: viewportHeight, listHeightChanged: listHeightChanged)
+        AgentSessionsPage(selectedID: $selectedID, viewportHeight: viewportHeight,
+                          listHeightChanged: listHeightChanged)
     }
 }
 
@@ -2014,11 +2942,12 @@ struct ActivityAvatar: View {
     }
     var body: some View {
         Group {
-            if activity?.kind == "agent" || activity?.isGeneratingAgentReply == true,
+            if activity?.kind == "agent" || activity?.kind == "agent-quota-reset" || activity?.isGeneratingAgentReply == true,
                let icon = AgentApplicationIcons.icon(for: source) {
                 Image(nsImage: icon).resizable().interpolation(.high).scaledToFit()
             } else {
-                Image(systemName: activity?.symbol ?? "circle")
+                Image(systemName: activity?.kind == "agent-quota-reset" && source == "gemini"
+                      ? "sparkles" : activity?.symbol ?? "circle")
                     .resizable().scaledToFit().padding(3)
             }
         }
@@ -2028,23 +2957,28 @@ struct ActivityAvatar: View {
 }
 
 @MainActor
-private enum AgentApplicationIcons {
+enum AgentApplicationIcons {
     static var cache: [String: NSImage] = [:]
     static var agentNotchURL: URL? {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: "io.github.lihao505.AgentNotch")
     }
-    static func open(activity: IslandActivity) {
+    @discardableResult
+    static func open(activity: IslandActivity) -> Bool {
         let source = activity.source ?? ""
-        if source == "codex", let id = activity.sessionID,
+        if source == "codex", let id = activity.sessionID ?? activity.conversationID,
            UUID(uuidString: id) != nil,
            let url = URL(string: "codex://threads/\(id)"),
-           NSWorkspace.shared.open(url) { return }
-        open(source: source)
+           NSWorkspace.shared.open(url) { return true }
+        return open(source: source)
     }
-    static func open(source: String) {
+
+    @discardableResult
+    static func open(source: String) -> Bool {
         let identifiers = ["codex": "com.openai.codex", "gpt": "com.openai.codex", "claude": "com.anthropic.claudefordesktop", "codebuddy": "com.tencent.codebuddy", "workbuddy": "com.workbuddy.workbuddy-ai", "antigravity": "com.google.antigravity"]
-        guard let id = identifiers[source.lowercased()], let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return }
+        guard let id = identifiers[source.lowercased()],
+              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return false }
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        return true
     }
     static func icon(for source: String) -> NSImage? {
         if let image = cache[source] { return image }
@@ -2052,7 +2986,8 @@ private enum AgentApplicationIcons {
             "codex": "com.openai.codex", "gpt": "com.openai.codex",
             "claude": "com.anthropic.claudefordesktop",
             "codebuddy": "com.tencent.codebuddy", "workbuddy": "com.workbuddy.workbuddy-ai",
-            "antigravity": "com.google.antigravity"
+            "antigravity": "com.google.antigravity",
+            "gemini": "com.google.gemini", "doubao": "com.bot.pc.doubao"
         ]
         guard let identifier = identifiers[source],
               let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) else { return nil }

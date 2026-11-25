@@ -1,6 +1,6 @@
 # Agent Notch reuse
 
-Source: user-owned /Users/apple/project/vibe-notch (Agent Notch, derived from Vibe Notch / Claude Island).
+Source: Agent Notch (derived from Vibe Notch / Claude Island).
 License: Apache-2.0; original LICENSE and UPSTREAM_NOTICE retained.
 
 Adapted: session-row presentation and local Codex token_count.rate_limits parsing from Services/Usage/UsageLimitMonitor.swift, UI/Components/UsageLimitBar.swift and UI/Views/ClaudeInstancesView.swift.

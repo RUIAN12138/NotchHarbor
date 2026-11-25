@@ -5,7 +5,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / 'boringNotch/components/Clipboard/ClipboardHistoryView.swift').read_text()
 geometry = source[source.index('enum ClipboardWheelNavigation {'):source.index('\nprivate struct ClipboardWheelScrollBridge:')]
-harness = 'import AppKit\n' + geometry + '''
+bridge = source[source.index('private struct ClipboardWheelScrollBridge:'):]
+harness = 'import AppKit\nimport SwiftUI\n' + geometry + bridge + '\nenum NotchScrollHitRegion {\n    static func contains(eventWindow: NSWindow?, locationInWindow: NSPoint, in view: NSView) -> Bool { false }\n}\n' + '''
 let app = NSApplication.shared
 app.setActivationPolicy(.prohibited)
 let scroll = NSScrollView(frame: CGRect(x: 0, y: 0, width: 400, height: 92))
@@ -33,7 +34,35 @@ assert(ClipboardWheelNavigation.targetX(current: 4, deltaY: 10, precise: false, 
 assert(ClipboardWheelNavigation.targetX(current: 0, deltaY: .nan, precise: false, minimum: 0, maximum: 600) == nil)
 assert(ClipboardWheelNavigation.targetX(current: 0, deltaY: -1, precise: false, minimum: 0, maximum: 0) == nil)
 assert(ClipboardWheelNavigation.targetX(current: 0, deltaY: 0, precise: true, minimum: 0, maximum: 600) == nil)
-print("PASS: native clip scrolling, wheel directions, precise deltas, bounds, invalid inputs and enclosing scroll view; no pasteboard writes or events posted")
+
+let window = NSWindow(contentRect: scroll.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+window.isReleasedWhenClosed = false
+window.contentView = scroll
+var remembered: CGFloat = 243.5
+private func attach() -> ClipboardWheelScrollBridge.WheelView {
+    let marker = ClipboardWheelScrollBridge.WheelView()
+    marker.savedOffset = { remembered }
+    marker.onOffsetChanged = { remembered = $0 }
+    document.addSubview(marker)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    return marker
+}
+private let firstPage = attach()
+assert(clip.bounds.minX == 243.5)
+clip.scroll(to: NSPoint(x: 352.5, y: 0))
+assert(remembered == 352.5)
+firstPage.removeFromSuperview()
+clip.scroll(to: .zero)
+assert(remembered == 352.5)
+private let reopenedPage = attach()
+assert(clip.bounds.minX == 352.5)
+reopenedPage.removeFromSuperview()
+remembered = 900
+private let shortenedPage = attach()
+assert(clip.bounds.minX == maximum)
+shortenedPage.removeFromSuperview()
+print("PASS: native scroll geometry, exact offset through page reattachment, and bounds clamping")
+
 '''
 with tempfile.TemporaryDirectory(prefix='notch-clipboard-wheel-') as directory:
     directory = Path(directory)

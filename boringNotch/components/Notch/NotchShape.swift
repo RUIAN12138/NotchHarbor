@@ -78,8 +78,9 @@ struct NotchContentReveal: ViewModifier, Animatable {
         set { progress = newValue }
     }
     func body(content: Content) -> some View {
-        let visibility = notchPhase(progress, from: 0.36, to: 0.89)
-        content.opacity(Double(visibility)).offset(y: (1 - visibility) * 4)
+        let visibility = notchPhase(progress, from: 0.28, to: 0.88)
+        let travel = notchPhase(progress, from: 0.18, to: 1)
+        content.opacity(Double(visibility)).offset(y: (travel - 1) * 8)
     }
 }
 
@@ -147,6 +148,8 @@ struct NotchGlassBackground: View, Animatable {
     var musicSignal: MusicSpectrumSignal?
     var desktopRefractionEnabled: Bool
     var usesDarkGlassAppearance: Bool
+    var transparency: Double
+    var previewCaptureSize: CGSize?
     private var agentConversationContrast: CGFloat
 
     /// Driven by `isExpanded`, but interpolated between states instead of
@@ -169,7 +172,9 @@ struct NotchGlassBackground: View, Animatable {
         musicSignal: MusicSpectrumSignal? = nil,
         desktopRefractionEnabled: Bool = false,
         keepsAgentConversationContrast: Bool = false,
-        usesDarkGlassAppearance: Bool = false
+        usesDarkGlassAppearance: Bool = false,
+        transparency: Double = 0.5,
+        previewCaptureSize: CGSize? = nil
     ) {
         self.shape = shape
         self.isExpanded = isExpanded
@@ -187,6 +192,8 @@ struct NotchGlassBackground: View, Animatable {
         self.desktopRefractionEnabled = desktopRefractionEnabled
         self.agentConversationContrast = keepsAgentConversationContrast ? 1 : 0
         self.usesDarkGlassAppearance = usesDarkGlassAppearance
+        self.transparency = transparency
+        self.previewCaptureSize = previewCaptureSize
         self.reveal = isExpanded ? 1 : 0
     }
 
@@ -206,6 +213,12 @@ struct NotchGlassBackground: View, Animatable {
     private var effectiveLightIntensity: Double {
         lightIntensity.isFinite ? min(1, max(0, lightIntensity)) : 1
     }
+
+    private var transmission: Double {
+        transparency.isFinite ? min(1, max(0, transparency)) : 0.5
+    }
+
+    private var density: Double { 1.65 - 1.3 * transmission }
 
     private var usesSystemGlass: Bool {
         if #available(macOS 26, *) { return true }
@@ -229,17 +242,18 @@ struct NotchGlassBackground: View, Animatable {
             // texture starts, and after it stops or is denied.
             baseSurface
 
-            if opticalSurfaceActive && desktopRefractionEnabled && isExpanded && clampedReveal > 0.001 {
-                NotchDesktopRefraction(shape: shape, intensity: effectiveLightIntensity)
+            if opticalSurfaceActive && desktopRefractionEnabled && clampedReveal > 0.08 {
+                NotchDesktopRefraction(shape: shape, intensity: effectiveLightIntensity, previewCaptureSize: previewCaptureSize)
+                    .opacity(Double(notchPhase(clampedReveal, from: 0.08, to: 0.70)))
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
-                    .transition(reduceMotion ? .identity : .opacity)
+                    .transition(.identity)
             }
 
             if glassEnabled {
                 let conversation = min(1, max(0, agentConversationContrast))
                 NotchGlassBacking(darkAppearance: usesDarkGlassAppearance, conversation: conversation,
-                                  reduceTransparency: reduceTransparency)
+                                  reduceTransparency: reduceTransparency, density: density)
                     .opacity(Double(clampedReveal) * (usesDarkGlassAppearance ? 1 : Double(conversation)))
             }
 
@@ -386,6 +400,7 @@ struct NotchGlassBackground: View, Animatable {
                 headerHeight: headerHeight,
                 hardwareWidth: hardwareWidth,
                 intensity: effectiveLightIntensity,
+                density: density,
                 tint: tint,
                 motionActive: motionActive || attentionGlow,
                 attentionGlow: attentionGlow,
@@ -494,13 +509,14 @@ struct NotchGlassBackground: View, Animatable {
         } else if reduceTransparency {
             shape.fill(Color(nsColor: .windowBackgroundColor))
         } else if #available(macOS 26.0, *) {
-            Color.clear
+            let layer = Color.clear
                 // SiriGlass pairs clear compositor glass with an independent
                 // optical ink/light layer. A light smoky tint preserves depth
                 // while keeping the water-drop clarity and highlights crisp.
-                .glassEffect(opticalSurfaceActive ? .clear.tint(.black.opacity(0.045)) : .regular, in: shape)
+                .glassEffect(opticalSurfaceActive ? .clear.tint(.black.opacity(0.045 * density)) : .regular, in: shape)
+            layer.opacity(min(1, 1.3 - 0.6 * transmission))
         } else {
-            shape.fill(.regularMaterial)
+            shape.fill(.regularMaterial).opacity(min(1, 1.3 - 0.6 * transmission))
         }
     }
 }
@@ -511,6 +527,9 @@ private struct NotchGlassBacking: View {
     let darkAppearance: Bool
     let conversation: CGFloat
     let reduceTransparency: Bool
+    let density: Double
+
+    private func ink(_ opacity: Double) -> Double { 1 - pow(1 - opacity, density) }
 
     var body: some View {
         if reduceTransparency {
@@ -528,11 +547,11 @@ private struct NotchGlassBacking: View {
 
             LinearGradient(stops: [
                 .init(color: .black, location: 0),
-                .init(color: graphiteColor.opacity(bodyOpacity), location: 0.29),
-                .init(color: graphiteColor.opacity(bodyOpacity - 0.12 * emphasis), location: 0.58),
-                .init(color: lowerGlass.opacity(lowerOpacity), location: 0.91),
-                .init(color: graphiteColor.opacity(controlOpacity - 0.32 * emphasis), location: 0.966),
-                .init(color: graphiteColor.opacity(lipOpacity), location: 1),
+                .init(color: graphiteColor.opacity(ink(bodyOpacity)), location: 0.29),
+                .init(color: graphiteColor.opacity(ink(bodyOpacity - 0.12 * emphasis)), location: 0.58),
+                .init(color: lowerGlass.opacity(ink(lowerOpacity)), location: 0.91),
+                .init(color: graphiteColor.opacity(ink(controlOpacity - 0.32 * emphasis)), location: 0.966),
+                .init(color: graphiteColor.opacity(ink(lipOpacity)), location: 1),
             ], startPoint: .top, endPoint: .bottom)
             .mask {
                 LinearGradient(stops: [
@@ -545,6 +564,84 @@ private struct NotchGlassBacking: View {
                 ], startPoint: .leading, endPoint: .trailing)
             }
         }
+    }
+}
+
+/// The compact popup's remaining time, drawn on the same path as its glass.
+struct CompactAlertEdgeLight: View {
+    let shape: NotchShape
+    let countdown: CompactAlertCountdown
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: reduceMotion ? 0.25 : 1.0 / 24, paused: countdown.isPaused)) { _ in
+            let remaining = countdown.fractionRemaining(at: .now)
+            Canvas { context, size in
+                guard remaining > 0, size.width > 6, size.height > 6 else { return }
+                let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2)
+                let band = shape.path(in: bounds).trimmedPath(from: 0, to: remaining)
+                context.stroke(band, with: .color(.white.opacity(0.13)),
+                               style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                context.stroke(band, with: .linearGradient(
+                    Gradient(colors: [.white.opacity(0.46), .white.opacity(0.9)]),
+                    startPoint: CGPoint(x: bounds.midX, y: bounds.minY),
+                    endPoint: CGPoint(x: bounds.midX, y: bounds.maxY)
+                ), style: StrokeStyle(lineWidth: 1.4, lineCap: .round, lineJoin: .round))
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// A soft, outward falloff around the physical camera cutout.
+struct AgentCompletionHalo: View {
+    let startedAt: Date
+    let duration: TimeInterval
+    let cutout: CGSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24, paused: reduceMotion)) { timeline in
+            let elapsed = max(0, timeline.date.timeIntervalSince(startedAt))
+            let progress = min(1, elapsed / duration)
+            let fade = reduceMotion ? 0.68 : notchPhase(progress, from: 0, to: 0.055)
+                * (1 - notchPhase(progress, from: 0.86, to: 1))
+            let shimmer = reduceMotion ? 0.85 : 0.86 + 0.09 * sin(elapsed * 3.1) + 0.035 * sin(elapsed * 6.3)
+            Canvas { context, size in
+                let camera = CGRect(x: (size.width - cutout.width) / 2, y: -16,
+                                    width: cutout.width, height: cutout.height + 16)
+                let silhouette = NotchShape(topCornerRadius: 0, bottomCornerRadius: 9,
+                                            topCornerIsConvex: true).path(in: camera)
+                let bounds = Path(CGRect(origin: .zero, size: size))
+                let drift = reduceMotion ? 0.5 : 0.5 - 0.43 * cos(progress * .pi * 4)
+                let pool = CGPoint(x: camera.minX + cutout.width * drift, y: cutout.height + 2)
+
+                context.drawLayer { halo in
+                    halo.opacity = Double(fade) * shimmer
+                    halo.fill(bounds, with: .color(.white.opacity(0.60)))
+                    halo.fill(bounds, with: .radialGradient(
+                        Gradient(colors: [.white.opacity(0.82), .clear]),
+                        center: pool, startRadius: 2, endRadius: cutout.width * 0.36
+                    ))
+                    halo.opacity = 1
+                    halo.blendMode = .destinationIn
+                    halo.drawLayer { mask in
+                        mask.addFilter(.blur(radius: 6))
+                        mask.stroke(silhouette, with: .color(.white),
+                                    style: StrokeStyle(lineWidth: 14, lineJoin: .round))
+                    }
+                    halo.blendMode = .destinationOut
+                    halo.drawLayer { inset in
+                        inset.addFilter(.blur(radius: 1.6))
+                        inset.fill(silhouette, with: .color(.white))
+                    }
+                }
+            }
+        }
+        .frame(width: cutout.width + 44, height: cutout.height + 23)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -585,8 +682,6 @@ private struct NotchWaveBands: View {
         isEntering || motionActive || musicSignal != nil ? 1.0 / 30.0 : 1.0 / 8.0
     }
 
-    // Ordinary light stays near the edge. Music has a taller travel region.
-    private static let stripInset: CGFloat = 22
     private static let steps = 72
     /// The bottom bands step back ~15% so the shoulder stays the focal light.
     private static let bottomBandOpacity: Double = 0.85
@@ -595,7 +690,7 @@ private struct NotchWaveBands: View {
         TimelineView(.animation(minimumInterval: minimumFrameInterval, paused: reduceMotion)) { timeline in
             let music = (reduceMotion ? nil : musicSignal)?.lightResponse()
             let phase = reduceMotion ? 0.9 : clock.elapsed(at: timeline.date) * 1.15
-            let time = phase + (music.map { Double($0.y * 0.45 + $0.z * 0.25) } ?? 0)
+            let time = phase
             Canvas { context, size in
                 guard size.width > 0, size.height > 70 else { return }
 
@@ -610,30 +705,51 @@ private struct NotchWaveBands: View {
                     warm: warm, cool: ice
                 )
 
-                let depth: CGFloat = music == nil ? Self.stripInset : 37
-                let strip = CGRect(x: 0, y: size.height - depth, width: size.width, height: depth - 4)
+                let bands = music ?? .zero
+                let musicWeight = min(1, max(0, Double((bands.max() - 0.02) / 0.15)))
                 var bandContext = context
+                let strip = CGRect(x: 0, y: size.height - 39, width: size.width, height: 35)
                 bandContext.clip(to: Path(strip))
-                var sideContext = bandContext
-                if let music {
-                    bandContext.opacity = 0.42 + Double(music.x) * 0.55
-                    bandContext.translateBy(x: 0, y: -19 * CGFloat(music.x))
-                    sideContext.opacity = 0.38 + Double(max(music.y, music.z * 0.65)) * 0.54
-                    sideContext.translateBy(x: 0, y: -12 * CGFloat(music.y))
-                } else {
-                    bandContext.opacity = Self.bottomBandOpacity
-                    sideContext.opacity = Self.bottomBandOpacity
-                }
-
+                var ambient = bandContext
+                ambient.opacity = Self.bottomBandOpacity * (1 - 0.64 * musicWeight)
                 Self.drawBand(
-                    in: &bandContext, size: size, time: time,
+                    in: &ambient, size: size, time: time,
                     index: 0, colorA: ice, colorB: violet, core: warm, tint: nil
                 )
                 Self.drawBand(
-                    in: &sideContext, size: size, time: time,
+                    in: &ambient, size: size, time: time,
                     index: 1, colorA: violet, colorB: ice, core: warm, tint: nil
                 )
-                Self.drawRidge(in: &bandContext, size: size, time: time, warm: warm)
+                Self.drawRidge(in: &ambient, size: size, time: time, warm: warm)
+
+                if musicWeight > 0 {
+                    let intervals = MusicSpectrumSignal.lightBandCount - 1
+                    var band = Path()
+                    for step in 0...Self.steps {
+                        let fraction = CGFloat(step) / CGFloat(Self.steps)
+                        let x = 0.025 + 0.95 * fraction
+                        let position = min(1, max(0, (x - 0.14) / 0.72)) * CGFloat(intervals)
+                        let left = min(Int(position), intervals - 1)
+                        let t = position - CGFloat(left)
+                        let blend = t * t * (3 - 2 * t)
+                        let low = 0.8 * bands[left] + 0.1 * (bands[max(0, left - 1)] + bands[left + 1])
+                        let high = 0.8 * bands[left + 1] + 0.1 * (bands[left] + bands[min(intervals, left + 2)])
+                        let level = CGFloat(low) * (1 - blend) + CGFloat(high) * blend
+                        let endFade = min(1, min(fraction, 1 - fraction) * 8)
+                        let point = CGPoint(x: size.width * x, y: size.height - 4 - (14 + 10 * level) * endFade)
+                        if step == 0 { band.move(to: point) } else { band.addLine(to: point) }
+                    }
+                    band.addLine(to: CGPoint(x: size.width * 0.975, y: size.height))
+                    band.addLine(to: CGPoint(x: size.width * 0.025, y: size.height))
+                    band.closeSubpath()
+                    bandContext.opacity = 0.54 * musicWeight
+                    bandContext.addFilter(.blur(radius: 4))
+                    bandContext.fill(band, with: .linearGradient(
+                        Gradient(colors: [.clear, .white.opacity(0.85), .white.opacity(0.50)]),
+                        startPoint: CGPoint(x: 0, y: size.height - 29),
+                        endPoint: CGPoint(x: 0, y: size.height)
+                    ))
+                }
             }
         }
         .allowsHitTesting(false)

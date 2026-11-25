@@ -21,20 +21,36 @@ struct MusicPlayerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let albumArtNamespace: Namespace.ID
     let viewportHeight: CGFloat
+    var hasUnidentifiedAudio = false
+    @State private var showsUnidentifiedAudio = false
+
+    private var detectsUnidentifiedAudio: Bool {
+        hasUnidentifiedAudio && (!music.isPlaying || !music.hasPanelMedia)
+    }
 
     var body: some View {
         Group {
-            if music.hasPanelMedia {
+            if music.hasPanelMedia && (music.isPlaying || !showsUnidentifiedAudio) {
                 MusicControlsView(albumArtNamespace: albumArtNamespace, viewportHeight: max(1, viewportHeight - 4))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background { albumAtmosphere }
             } else {
-                MusicStandbyView()
+                MusicStandbyView(hasUnidentifiedAudio: showsUnidentifiedAudio)
                     .frame(maxWidth: .infinity, minHeight: min(64, viewportHeight))
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: music.hasPanelMedia)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: showsUnidentifiedAudio)
+        .task(id: detectsUnidentifiedAudio) {
+            guard detectsUnidentifiedAudio else {
+                showsUnidentifiedAudio = false
+                return
+            }
+            do { try await Task.sleep(for: .milliseconds(300)) }
+            catch { return }
+            showsUnidentifiedAudio = true
+        }
         .onAppear {
             if !UserDefaults.standard.bool(forKey: "lyricsFocusedMusicConfigured") {
                 Defaults[.enableLyrics] = true
@@ -63,18 +79,20 @@ struct MusicPlayerView: View {
 }
 
 private struct MusicStandbyView: View {
+    let hasUnidentifiedAudio: Bool
+
     var body: some View {
         HStack(spacing: 9) {
-            Image(systemName: "music.note")
+            Image(systemName: hasUnidentifiedAudio ? "waveform" : "music.note")
                 .font(.system(size: 15, weight: .medium))
                 .frame(width: 29, height: 29)
                 .background(.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("尚未播放")
+                Text(hasUnidentifiedAudio ? LocalizedStringKey("未知播放器") : "尚未播放")
                     .font(.system(size: 13, weight: .semibold))
-                Text("在播放器或浏览器中开始播放")
+                Text(hasUnidentifiedAudio ? LocalizedStringKey("正在播放系统音频") : "在播放器或浏览器中开始播放")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -132,8 +150,18 @@ struct AlbumArtView: View {
         Group {
             if Defaults[.lightingEffect] {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(Color(nsColor: musicManager.avgColor).opacity(musicManager.isPlaying ? 0.25 : 0.0))
-                    .blur(radius: 24)
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                Color(nsColor: musicManager.avgColor).opacity(musicManager.isPlaying ? 0.28 : 0.0),
+                                Color(nsColor: musicManager.avgColor).opacity(musicManager.isPlaying ? 0.10 : 0.0),
+                                .clear,
+                            ],
+                            center: .center,
+                            startRadius: 2,
+                            endRadius: 36
+                        )
+                    )
                     .scaleEffect(1.06)
                     .allowsHitTesting(false)
                     .animation(.easeInOut(duration: 0.25), value: musicManager.isPlaying)
@@ -144,46 +172,49 @@ struct AlbumArtView: View {
     }
 }
 
+@MainActor
+private enum BundleAppDisplayNameCache {
+    private static var names: [String: String] = [:]
+
+    static func displayName(for bundleIdentifier: String) -> String {
+        if let cached = names[bundleIdentifier] { return cached }
+        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+            names[bundleIdentifier] = ""
+            return ""
+        }
+        let name = FileManager.default.displayName(atPath: app.path).replacingOccurrences(of: ".app", with: "")
+        names[bundleIdentifier] = name
+        return name
+    }
+}
+
 struct MusicControlsView: View {
     let albumArtNamespace: Namespace.ID
     let viewportHeight: CGFloat
     @ObservedObject var musicManager = MusicManager.shared
     @EnvironmentObject private var vm: BoringViewModel
     @Environment(\.usesSharedGlassShell) private var usesSharedGlassShell
-    @State private var sliderValue: Double = 0
     @State private var dragging: Bool = false
-    @State private var lastDragged: Date = .distantPast
     @Default(.musicControlSlots) private var slotConfig
     @Default(.musicControlSlotLimit) private var slotLimit
     @Default(.enableLyrics) private var lyricsEnabled
 
     var body: some View {
-        let stageHeight = max(1, viewportHeight - 36)
+        let seekHeight: CGFloat = showsProgress ? 27 : 0
+        let stageHeight = max(1, viewportHeight - seekHeight)
+        let controlsWidth = transportWidth
         let artworkSize = max(1, min(58, stageHeight - 2))
         VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .center, spacing: 14) {
-                AlbumArtView(vm: vm, albumArtNamespace: albumArtNamespace)
-                    .frame(width: artworkSize, height: artworkSize)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(.white.opacity(0.14), lineWidth: 1)
-                            .allowsHitTesting(false)
-                    }
-                VStack(alignment: .leading, spacing: 2) {
-                    songInfo
-                        .frame(height: 17)
-                    if !trimmedTitle.isEmpty && lyricsEnabled && musicManager.isSong && stageHeight >= 36 {
-                        MusicLyricsFocusView()
-                            .frame(height: min(48, stageHeight - 19), alignment: .topLeading)
-                            .clipped()
-                            .id(scrubTrackIdentity)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            GeometryReader { geometry in
+                musicStage(height: stageHeight, artworkSize: artworkSize,
+                           transportSpace: min(controlsWidth, floor(geometry.size.width * 0.40)))
             }
             .frame(height: stageHeight)
             .clipped()
-            controlDeck
+
+            if showsProgress {
+                musicSlider.frame(height: 24)
+            }
         }
         .buttonStyle(PlainButtonStyle())
         .onChange(of: showsProgress) { _, visible in
@@ -197,13 +228,41 @@ struct MusicControlsView: View {
         .onDisappear { cancelScrub() }
     }
 
+    private func musicStage(height: CGFloat, artworkSize: CGFloat, transportSpace: CGFloat) -> some View {
+        HStack(spacing: 10) {
+            AlbumArtView(vm: vm, albumArtNamespace: albumArtNamespace)
+                .frame(width: artworkSize, height: artworkSize)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(.white.opacity(0.14), lineWidth: 1)
+                        .allowsHitTesting(false)
+                }
+            VStack(alignment: .leading, spacing: 2) {
+                songInfo.frame(height: 17)
+                if !trimmedTitle.isEmpty && lyricsEnabled && musicManager.isSong && height >= 36 {
+                    MusicLyricsFocusView()
+                        .frame(height: min(54, height - 19), alignment: .topLeading)
+                        .clipped()
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if transportSpace > 0 {
+                transportControls(in: transportSpace)
+                    .frame(width: transportSpace, height: 30)
+                    .padding(.bottom, showsProgress ? 5 : 0)
+                    .frame(height: height, alignment: showsProgress ? .bottom : .center)
+            }
+        }
+        .frame(height: height)
+    }
+
     private var scrubTrackIdentity: [String] {
         [musicManager.bundleIdentifier ?? "", musicManager.songTitle, musicManager.artistName, musicManager.album]
     }
 
     private func cancelScrub() {
         dragging = false
-        lastDragged = .distantPast
         vm.isMusicScrubbing = false
     }
 
@@ -270,57 +329,38 @@ struct MusicControlsView: View {
         .accessibilityValue(value)
     }
 
-    private var controlDeck: some View {
+    private var transportWidth: CGFloat {
         let slots = activeSlots
-        let buttonsWidth = slots.reduce(CGFloat.zero) { $0 + ($1 == .playPause ? 34 : 26) }
-            + CGFloat(max(0, slots.count - 1)) * 2
-        let controlsWidth = buttonsWidth + 8
-        return GeometryReader { geometry in
-            let spacing: CGFloat = showsProgress && !slots.isEmpty ? 8 : 0
-            let trackReserve: CGFloat = showsProgress ? min(124, geometry.size.width * 0.40) : 0
-            let strip = min(controlsWidth, max(0, geometry.size.width - trackReserve - spacing))
-            HStack(spacing: spacing) {
-                if showsProgress {
-                    musicSlider.frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Spacer(minLength: 0)
-                }
-                if !slots.isEmpty {
-                    if strip + 0.5 < controlsWidth {
-                        ScrollView(.horizontal) { slotToolbar }
-                            .scrollIndicators(.never)
-                            .reservesHorizontalNotchScrolling()
-                            .frame(width: strip)
-                    } else {
-                        slotToolbar.frame(width: controlsWidth)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        let buttons = slots.reduce(CGFloat.zero) { $0 + ($1 == .playPause ? 34 : 26) }
+        return buttons + CGFloat(max(0, slots.count - 1)) * 2
+    }
+
+    @ViewBuilder
+    private func transportControls(in width: CGFloat) -> some View {
+        if width < transportWidth {
+            ScrollView(.horizontal) { slotToolbar }
+                .scrollIndicators(.never)
+                .reservesHorizontalNotchScrolling()
+        } else {
+            slotToolbar
         }
-        .frame(height: 33)
     }
 
     /// Pause the tick when the player is idle; lyrics and the scrubber share
     /// the same media clock when a track is playing.
     private var musicSlider: some View {
         let track = scrubTrackIdentity
-        return TimelineView(.animation(minimumInterval: 0.1, paused: !musicManager.isPlaying)) { timeline in
-            MusicSliderView(
-                sliderValue: $sliderValue,
-                duration: musicManager.songDuration,
-                lastDragged: $lastDragged,
-                color: musicManager.avgColor,
-                dragging: $dragging,
-                currentDate: timeline.date,
-                timestampDate: musicManager.timestampDate,
-                elapsedTime: musicManager.elapsedTime,
-                playbackRate: musicManager.playbackRate,
-                isPlaying: musicManager.isPlaying
-            ) { newValue in
-                guard scrubTrackIdentity == track, vm.notchState == .open, !vm.systemIslandPresentationActive else { return }
-                musicManager.seek(to: newValue)
-            }
+        return MusicSliderView(
+            duration: musicManager.songDuration,
+            color: musicManager.avgColor,
+            dragging: $dragging,
+            timestampDate: musicManager.timestampDate,
+            elapsedTime: musicManager.elapsedTime,
+            playbackRate: musicManager.playbackRate,
+            isPlaying: musicManager.isPlaying
+        ) { newValue in
+            guard scrubTrackIdentity == track, vm.notchState == .open, !vm.systemIslandPresentationActive else { return }
+            musicManager.seek(to: newValue)
         }
         .id(track)
     }
@@ -335,9 +375,8 @@ struct MusicControlsView: View {
 
     private var sourceSubtitle: String {
         if !trimmedArtist.isEmpty { return trimmedArtist }
-        guard !musicManager.isSong, let bundle = musicManager.bundleIdentifier,
-              let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) else { return "" }
-        return FileManager.default.displayName(atPath: app.path).replacingOccurrences(of: ".app", with: "")
+        guard !musicManager.isSong, let bundle = musicManager.bundleIdentifier else { return "" }
+        return BundleAppDisplayNameCache.displayName(for: bundle)
     }
 
     private var showsProgress: Bool {
@@ -355,13 +394,6 @@ struct MusicControlsView: View {
             ForEach(Array(slots.enumerated()), id: \.offset) { index, slot in
                 slotView(for: slot)
             }
-        }
-        .padding(.horizontal, 4)
-        .background {
-            Capsule()
-                .fill(.black.opacity(0.23))
-                .strokeBorder(.white.opacity(0.12))
-                .allowsHitTesting(false)
         }
         .fixedSize(horizontal: true, vertical: false)
     }
@@ -386,7 +418,7 @@ struct MusicControlsView: View {
                 MusicManager.shared.toggleShuffle()
             }
         case .previous:
-            MusicDeckButton(icon: "backward.fill", label: musicManager.isSong ? "上一首" : "上一项") {
+            MusicDeckButton(icon: "backward.end.fill", label: musicManager.isSong ? "上一首" : "上一项") {
                 MusicManager.shared.previousTrack()
             }
         case .playPause:
@@ -395,7 +427,7 @@ struct MusicControlsView: View {
                 MusicManager.shared.togglePlay()
             }
         case .next:
-            MusicDeckButton(icon: "forward.fill", label: musicManager.isSong ? "下一首" : "下一项") {
+            MusicDeckButton(icon: "forward.end.fill", label: musicManager.isSong ? "下一首" : "下一项") {
                 MusicManager.shared.nextTrack()
             }
         case .repeatMode:
@@ -653,13 +685,13 @@ struct VolumeControlView: View {
 struct NotchHomeView: View {
     @EnvironmentObject var vm: BoringViewModel
     @ObservedObject var webcamManager = WebcamManager.shared
-    @ObservedObject var batteryModel = BatteryStatusViewModel.shared
     @ObservedObject var coordinator = BoringViewCoordinator.shared
     @ObservedObject private var activities = UnifiedActivities.shared
     @Default(.notchWeatherCity) private var weatherCity
     let albumArtNamespace: Namespace.ID
     var compactMusic = false
     var viewportHeight: CGFloat = 100
+    var hasUnidentifiedAudio = false
     var refreshWeather: () -> Void = {}
 
     var body: some View {
@@ -693,7 +725,8 @@ struct NotchHomeView: View {
                     .environmentObject(vm)
                     .transition(.opacity)
             } else {
-                MusicPlayerView(albumArtNamespace: albumArtNamespace, viewportHeight: viewportHeight)
+                MusicPlayerView(albumArtNamespace: albumArtNamespace, viewportHeight: viewportHeight,
+                                hasUnidentifiedAudio: hasUnidentifiedAudio)
             }
 
             if shouldShowCamera {
@@ -707,7 +740,8 @@ struct NotchHomeView: View {
     }
 
     private var weatherColumn: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let warnings = activities.weatherWarnings.filter { $0.expires > Date().timeIntervalSince1970 }
+        return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
                 Label("天气", systemImage: "cloud.sun")
                     .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
@@ -730,7 +764,7 @@ struct NotchHomeView: View {
                         Text(weather.detail).font(.caption.weight(.semibold))
                             .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                         Text(weather.title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        if activities.currentWeatherWarning == nil, let updated = activities.weatherUpdatedAt {
+                        if warnings.isEmpty, let updated = activities.weatherUpdatedAt {
                             Text("更新于 \(updated.formatted(date: .omitted, time: .shortened))")
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
@@ -743,15 +777,8 @@ struct NotchHomeView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if let warning = activities.currentWeatherWarning, let url = warning.weatherWarningURL {
-                Link(destination: url) {
-                    Label("气象预警", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.orange)
-                }
-                .buttonStyle(.plain)
-                .help(warning.title)
-                .accessibilityLabel(warning.title)
+            if !warnings.isEmpty {
+                WeatherWarningsButton(warnings: warnings)
             } else if activities.currentWeather != nil, let message = activities.weatherRefreshMessage {
                 Text(message).font(.caption2).foregroundStyle(.secondary)
             }
@@ -759,6 +786,57 @@ struct NotchHomeView: View {
         .frame(maxWidth: .infinity, minHeight: 64, alignment: .topLeading)
         .padding(4)
         .background(.primary.opacity(0.07), in: .rect(cornerRadius: 12))
+    }
+}
+
+private struct WeatherWarningsButton: View {
+    let warnings: [IslandActivity]
+    @State private var open = false
+    @EnvironmentObject private var vm: BoringViewModel
+
+    var body: some View {
+        Button { open.toggle() } label: {
+            Label("气象预警 \(warnings.count)", systemImage: "exclamationmark.triangle")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.orange)
+                .lineLimit(1)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("notch-weather-warnings")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 9) {
+                Text("气象预警").font(.headline)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(warnings) { warning in
+                            if let url = warning.weatherWarningURL {
+                                Link(destination: url) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(warning.title).font(.subheadline.weight(.semibold))
+                                        Text(warning.detail)
+                                            .font(.caption).foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        if let start = warning.weatherStartsAt {
+                                            let date = Date(timeIntervalSince1970: start)
+                                            Text(date > Date() ? "即将生效 · \(date.formatted(.dateTime.month().day().hour().minute()))"
+                                                : date.formatted(.dateTime.month().day().hour().minute()))
+                                                .monospacedDigit().font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 215)
+            }
+            .padding(13)
+            .frame(width: 292, alignment: .leading)
+        }
+        .onChange(of: open) { _, value in vm.isWeatherWarningListOpen = value }
+        .onDisappear { vm.isWeatherWarningListOpen = false }
     }
 }
 
@@ -822,6 +900,9 @@ private struct MusicLyricsFocusView: View {
                                 let active = distance == 0
                                 let line = index < 0 ? "前奏" : music.syncedLyrics[index].text
                                 let label = line.isEmpty ? "间奏" : line
+                                let isCredit = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .range(of: #"^(?:作[词詞曲]|[编編]曲|[词詞曲]|[製制]作人?)\s*[:：]"#,
+                                           options: .regularExpression) != nil
                                 let start = index < 0 ? 0 : music.syncedLyrics[index].time
                                 let end = index + 1 < music.syncedLyrics.count
                                     ? music.syncedLyrics[index + 1].time : max(start + 0.25, music.songDuration)
@@ -830,7 +911,7 @@ private struct MusicLyricsFocusView: View {
                                     if index >= 0 { music.seek(toLyric: music.syncedLyrics[index].time) }
                                 } label: {
                                     lyricText(label, active: active, progress: fraction)
-                                        .font(.system(size: 20, weight: .bold))
+                                        .font(.system(size: isCredit ? 14 : 20, weight: isCredit ? .semibold : .bold))
                                         .shadow(color: Color(red: 0.23, green: 0.29, blue: 0.39).opacity(0.75), radius: 1, y: 1)
                                         .lineLimit(2)
                                         .fixedSize(horizontal: false, vertical: true)
@@ -933,12 +1014,10 @@ private struct FoliaLyricsRail: NSViewRepresentable {
 
     func updateNSView(_ web: WKWebView, context: Context) {
         context.coordinator.reduced = reduceMotion
-        context.coordinator.updateTicker()
         context.coordinator.sync()
     }
 
     static func dismantleNSView(_ web: WKWebView, coordinator: Bridge) {
-        coordinator.tick?.invalidate()
         coordinator.timeout?.cancel()
         web.configuration.userContentController.removeScriptMessageHandler(forName: "foliaReady")
         web.configuration.userContentController.removeScriptMessageHandler(forName: "foliaSeek")
@@ -948,14 +1027,17 @@ private struct FoliaLyricsRail: NSViewRepresentable {
     final class Bridge: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let music: MusicManager
         weak var web: WKWebView?
-        var tick: Timer?
         var timeout: Task<Void, Never>?
         let reportRender: (Bool) -> Void
         var reduced = false
         private var ready = false
         private var inFlight = false
-        private var lastElapsed: Double?
+        private var pendingSync = false
         private var lastKey: String?
+        private var lastRawElapsed: Double?
+        private var lastTimestampDate: Date?
+        private var lastPlaying: Bool?
+        private var lastRate: Double?
         private var lastReduced: Bool?
         private var lastAlbumInk: String?
 
@@ -975,7 +1057,6 @@ private struct FoliaLyricsRail: NSViewRepresentable {
                 reportRender(true)
             } else if message.name == "foliaReady", !ready {
                 ready = true
-                updateTicker()
                 sync()
             } else if message.name == "foliaSeek", let time = message.body as? Double, time.isFinite,
                       music.syncedLyrics.contains(where: { abs($0.time - time) < 0.001 }) {
@@ -983,24 +1064,17 @@ private struct FoliaLyricsRail: NSViewRepresentable {
             }
         }
 
-        func updateTicker() {
-            guard ready, music.isPlaying else {
-                tick?.invalidate()
-                tick = nil
+        func sync() {
+            guard ready, let web else { return }
+            if inFlight {
+                pendingSync = true
                 return
             }
-            guard tick == nil else { return }
-            let timer = Timer(timeInterval: 1.0 / 24, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.sync() }
-            }
-            timer.tolerance = 0.008
-            RunLoop.main.add(timer, forMode: .common)
-            tick = timer
-        }
-
-        func sync() {
-            guard ready, !inFlight, let web else { return }
             let elapsed = music.estimatedPlaybackPosition()
+            let rawElapsed = music.elapsedTime
+            let timestampDate = music.timestampDate
+            let playing = music.isPlaying
+            let rate = music.playbackRate.isFinite ? music.playbackRate : 1
             let lyrics = music.syncedLyrics
             // Include actual timeline revisions and duration; the prior
             // first/last-line heuristic missed replacements of middle times.
@@ -1011,22 +1085,32 @@ private struct FoliaLyricsRail: NSViewRepresentable {
                 Int((min(1, max(0, $0 ?? 1)) * 255).rounded())
             }
             let albumInk = String(format: "#%02x%02x%02x", channels[0], channels[1], channels[2])
-            guard changed || lastReduced != reduced || lastAlbumInk != albumInk
-                    || abs((lastElapsed ?? -1) - elapsed) >= 0.02 else { return }
-            var payload: [String: Any] = ["key": key, "elapsed": elapsed, "reduced": reduced,
+            let anchorChanged = lastRawElapsed != rawElapsed || lastTimestampDate != timestampDate
+                || lastPlaying != playing || lastRate != rate
+            guard changed || anchorChanged || lastReduced != reduced || lastAlbumInk != albumInk else { return }
+            var payload: [String: Any] = ["key": key, "elapsed": elapsed, "rate": rate,
+                                           "playing": playing, "reduced": reduced,
                                            "albumInk": albumInk,
                                            "duration": music.songDuration.isFinite ? music.songDuration : 0]
             if changed { payload["lines"] = lyrics.map { ["time": $0.time, "text": $0.text] } }
             inFlight = true
+            pendingSync = false
             web.callAsyncJavaScript("window.updateFolia(snapshot)", arguments: ["snapshot": payload],
                                     in: nil, in: .page) { [weak self] result in
                 guard let self else { return }
                 self.inFlight = false
                 if case .success = result {
                     self.lastKey = key
-                    self.lastElapsed = elapsed
+                    self.lastRawElapsed = rawElapsed
+                    self.lastTimestampDate = timestampDate
+                    self.lastPlaying = playing
+                    self.lastRate = rate
                     self.lastReduced = payload["reduced"] as? Bool
                     self.lastAlbumInk = albumInk
+                }
+                if self.pendingSync {
+                    self.pendingSync = false
+                    self.sync()
                 }
             }
         }
@@ -1034,69 +1118,81 @@ private struct FoliaLyricsRail: NSViewRepresentable {
 }
 
 struct MusicSliderView: View {
-    @Binding var sliderValue: Double
     let duration: Double
-    @Binding var lastDragged: Date
     var color: NSColor
     @Binding var dragging: Bool
-    let currentDate: Date
     let timestampDate: Date
     let elapsedTime: Double
     let playbackRate: Double
     let isPlaying: Bool
     var onValueChange: (Double) -> Void
 
+    @State private var scrubValue: Double = 0
+    @State private var lastDragged: Date = .distantPast
+    @State private var hoverTime: Double?
+
     private var safeDuration: Double {
         duration.isFinite && duration > 0 ? duration : 0
     }
 
     var body: some View {
-        HStack(spacing: 6) {
-            timeLabel(sliderValue)
-            CustomSlider(
-                value: $sliderValue,
-                range: 0...safeDuration,
-                color: Defaults[.sliderColor] == SliderColorEnum.albumArt
-                    ? Color(nsColor: color).ensureMinimumBrightness(factor: 0.8)
-                    : Defaults[.sliderColor] == SliderColorEnum.accent ? .effectiveAccent : .primary,
-                dragging: $dragging,
-                lastDragged: $lastDragged,
-                effectiveHeight: 24,
-                accessibilityName: "播放进度",
-                accessibilityText: timeString(from: sliderValue),
-                onValueChange: onValueChange
-            )
-            .frame(minWidth: 20, maxWidth: .infinity)
-            timeLabel(safeDuration)
-        }
-        .frame(height: 26)
-        .onChange(of: currentDate) {
-            syncSliderValue(at: currentDate)
-        }
-        .onChange(of: elapsedTime) {
-            syncSliderValue(at: currentDate)
-        }
-        .onChange(of: timestampDate) {
-            syncSliderValue(at: currentDate)
-        }
-        .onChange(of: duration) {
-            syncSliderValue(at: currentDate)
-        }
-        .onChange(of: isPlaying) {
-            syncSliderValue(at: currentDate)
-        }
-        .onChange(of: dragging) { _, active in
-            if !active { syncSliderValue(at: Date()) }
+        TimelineView(.animation(minimumInterval: 0.1, paused: !isPlaying || dragging)) { timeline in
+            let currentValue = displayedValue(at: timeline.date)
+            HStack(spacing: 9) {
+                timeLabel(dragging ? currentValue : hoverTime ?? currentValue)
+                    .allowsHitTesting(false)
+                CustomSlider(
+                    value: Binding(
+                        get: { currentValue },
+                        set: { scrubValue = $0 }
+                    ),
+                    range: 0...safeDuration,
+                    color: Defaults[.sliderColor] == SliderColorEnum.albumArt
+                        ? Color(nsColor: color).ensureMinimumBrightness(factor: 0.86)
+                        : Defaults[.sliderColor] == SliderColorEnum.accent ? .effectiveAccent : .white,
+                    dragging: $dragging,
+                    lastDragged: $lastDragged,
+                    effectiveHeight: 24,
+                    baseTrackHeight: 7,
+                    accessibilityName: "播放进度",
+                    accessibilityText: timeString(from: currentValue),
+                    onValueChange: onValueChange,
+                    onPreviewChange: { hoverTime = $0 }
+                )
+                .frame(minWidth: 24, maxWidth: .infinity)
+                timeLabel(safeDuration)
+                    .allowsHitTesting(false)
+            }
         }
         .task(id: lastDragged) {
             guard lastDragged != .distantPast else { return }
             try? await Task.sleep(for: .seconds(MusicScrubPosition.confirmationWindow + 0.02))
             guard !Task.isCancelled else { return }
-            syncSliderValue(at: Date())
+            if !dragging { lastDragged = .distantPast }
         }
-        .onAppear {
-            syncSliderValue(at: currentDate)
+    }
+
+    private func displayedValue(at date: Date) -> Double {
+        if dragging { return min(max(scrubValue, 0), safeDuration) }
+        if !MusicScrubPosition.shouldFollowPlayback(
+            target: scrubValue,
+            observedPosition: elapsedTime,
+            anchor: timestampDate,
+            committedAt: lastDragged,
+            now: date
+        ) {
+            return min(max(scrubValue, 0), safeDuration)
         }
+        let estimated = PlaybackPositionClock.position(
+            elapsed: elapsedTime,
+            anchor: timestampDate,
+            rate: playbackRate,
+            playing: isPlaying,
+            duration: safeDuration,
+            now: date
+        )
+        guard estimated.isFinite else { return 0 }
+        return min(max(estimated, 0), safeDuration)
     }
 
     private func timeLabel(_ seconds: Double) -> some View {
@@ -1105,20 +1201,8 @@ struct MusicSliderView: View {
             .font(.system(size: 10, weight: .semibold).monospacedDigit())
             .lineLimit(1)
             .fixedSize()
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
-            .background(.black.opacity(0.65), in: Capsule())
+            .shadow(color: .black.opacity(0.70), radius: 2)
             .accessibilityHidden(true)
-    }
-
-    /// Keeps the paused slider in sync with media state without a running timeline.
-    private func syncSliderValue(at date: Date) {
-        guard !dragging, MusicScrubPosition.shouldFollowPlayback(target: sliderValue,
-            observedPosition: elapsedTime, anchor: timestampDate, committedAt: lastDragged, now: Date()) else { return }
-        let estimated = PlaybackPositionClock.position(elapsed: elapsedTime, anchor: timestampDate,
-            rate: playbackRate, playing: isPlaying, duration: safeDuration, now: date)
-        guard estimated.isFinite else { return }
-        sliderValue = min(max(estimated, 0), safeDuration)
     }
 
     func timeString(from seconds: Double) -> String {
@@ -1143,6 +1227,7 @@ struct CustomSlider: View {
     @Binding var dragging: Bool
     @Binding var lastDragged: Date
     var effectiveHeight: CGFloat = 10
+    var baseTrackHeight: CGFloat = 3.5
     var accessibilityName = "进度"
     var accessibilityText: String?
     var onValueChange: ((Double) -> Void)?
@@ -1161,12 +1246,12 @@ struct CustomSlider: View {
             let progress = value.isFinite && span.isFinite && span > 0
                 ? min(1, max(0, (value - range.lowerBound) / span)) : 0
             let engaging = dragging || hovering
-            let trackHeight: CGFloat = engaging ? 4.5 : 3.0
-            let marker: CGFloat = 7
+            let trackHeight = baseTrackHeight + (engaging ? 2 : 0)
+            let marker = max(8, baseTrackHeight + 4)
             let fill = width * progress
 
             ZStack(alignment: .leading) {
-                Capsule().fill(.primary.opacity(engaging ? 0.18 : 0.11))
+                Capsule().fill(.primary.opacity(engaging ? 0.27 : 0.18))
                     .frame(height: trackHeight)
                 Capsule().fill(color.opacity(engaging ? 1 : 0.86))
                     .frame(width: fill, height: trackHeight)
@@ -1177,6 +1262,7 @@ struct CustomSlider: View {
                         .allowsHitTesting(false)
                 }
                 Circle().fill(color)
+                    .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
                     .frame(width: marker, height: marker)
                     .offset(x: min(max(width - marker, 0), max(0, fill - marker / 2)))
                     .opacity(engaging ? 1 : 0)
@@ -1198,22 +1284,27 @@ struct CustomSlider: View {
                     onPreviewChange?(nil)
                 }
             }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($trackingDrag) { _, tracking, _ in tracking = true }
-                    .onChanged { gesture in
-                        guard let position = position(gesture.location.x, width: width) else { return }
-                        if !dragging { dragging = true }
-                        value = position
-                        onDragChange?(position)
+            .highPriorityGesture(
+                SpatialTapGesture().exclusively(before:
+                    DragGesture(minimumDistance: 3)
+                        .updating($trackingDrag) { _, tracking, _ in tracking = true }
+                        .onChanged { gesture in
+                            guard let target = position(gesture.location.x, width: width) else { return }
+                            dragging = true
+                            value = target
+                            onDragChange?(target)
+                        }
+                )
+                .onEnded { gesture in
+                    let x: CGFloat
+                    switch gesture {
+                    case .first(let click): x = click.location.x
+                    case .second(let drag): x = drag.location.x
                     }
-                    .onEnded { gesture in
-                        guard dragging else { return }
-                        if let position = position(gesture.location.x, width: width) { value = position }
-                        lastDragged = Date()
-                        dragging = false
-                        onValueChange?(value)
-                    }
+                    defer { dragging = false }
+                    guard let target = position(x, width: width) else { return }
+                    commit(target)
+                }
             )
             .onChange(of: trackingDrag) { _, tracking in
                 if !tracking && dragging {
@@ -1229,14 +1320,20 @@ struct CustomSlider: View {
         .accessibilityAdjustableAction { direction in
             guard span.isFinite, span > 0 else { return }
             let step = span >= 10 ? min(5, span * 0.08) : span * 0.05
+            let target: Double
             switch direction {
-            case .increment: value = min(range.upperBound, value + step)
-            case .decrement: value = max(range.lowerBound, value - step)
+            case .increment: target = min(range.upperBound, value + step)
+            case .decrement: target = max(range.lowerBound, value - step)
             @unknown default: return
             }
-            lastDragged = Date()
-            onValueChange?(value)
+            commit(target)
         }
+    }
+
+    private func commit(_ target: Double) {
+        value = target
+        lastDragged = Date()
+        onValueChange?(target)
     }
 
     private func position(_ x: CGFloat, width: CGFloat) -> Double? {

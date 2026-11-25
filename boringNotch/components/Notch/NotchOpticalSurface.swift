@@ -121,6 +121,7 @@ struct NotchOpticalSurface: View {
     var headerHeight: CGFloat
     var hardwareWidth: CGFloat
     var intensity: Double
+    var density: Double = 1
     var tint: Color?
     var motionActive: Bool
     var attentionGlow: Bool
@@ -229,9 +230,10 @@ struct NotchOpticalSurface: View {
     }
 
     private func shader(geometry: NotchSurfaceGeometry, time: TimeInterval, motionLevel: Double,
-                        music: SIMD3<Float>?) -> Shader {
+                        music: SIMD16<Float>?) -> Shader {
         let rect = geometry.rect
         let tint = tintVector
+        let bands = music ?? .zero
         let function = edgeOnly ? ShaderLibrary.default.notchEdgeOptics : ShaderLibrary.default.notchOpticalSurface
         return function(
             .float4(
@@ -249,7 +251,11 @@ struct NotchOpticalSurface: View {
                 Float(motionLevel)
             ),
             .float4(tint.x, tint.y, tint.z, tint.w),
-            .float4(music?.x ?? 0, music?.y ?? 0, music?.z ?? 0, music == nil ? 0 : 1)
+            .float4(bands[0], bands[1], bands[2], bands[3]),
+            .float4(bands[4], bands[5], bands[6], bands[7]),
+            .float4(bands[8], bands[9], bands[10], bands[11]),
+            .float4(bands[12], bands[13], bands[14], bands[15]),
+            .float(Float(density))
         )
     }
 }

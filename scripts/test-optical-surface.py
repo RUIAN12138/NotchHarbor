@@ -311,7 +311,7 @@ do {
         length: width * height * 16, options: .storageModeShared
     ) else { die("probe buffer") }
 
-    func render(time: Float, intensity: Float, motion: Float, path: String, edgeOnly: Bool = false, music: SIMD4<Float> = .zero) {
+    func render(time: Float, intensity: Float, motion: Float, path: String, edgeOnly: Bool = false, music: SIMD16<Float> = .zero, density: Float = 1) {
         var rect = simd_float4(0, 0, Float(width), Float(height))
         var radii = simd_float4(topRadius, bottomRadius, header, hardware)
         var params = simd_float4(time, intensity, 0, motion)
@@ -343,8 +343,11 @@ do {
 
         var music = music
         withUnsafeBytes(of: &music) {
-            encoder.setBytes($0.baseAddress!, length: 16, index: 6)
+            encoder.setBytes($0.baseAddress!, length: 64, index: 6)
         }
+
+        var density = density
+        encoder.setBytes(&density, length: MemoryLayout<Float>.size, index: 7)
 
         let threadWidth = pipeline.threadExecutionWidth
         let threadHeight = max(
@@ -375,6 +378,8 @@ do {
     }
 
     render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-t1.bin")
+    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-transparent.bin", density: 0.35)
+    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-dense.bin", density: 1.65)
     render(time: 9.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-t9.bin")
     render(time: 1.0, intensity: 0.0, motion: 1.0, path: outputPrefix + "-off.bin")
     render(time: 1.0, intensity: 0.0, motion: 0.0, path: outputPrefix + "-off-idle.bin")
@@ -382,10 +387,10 @@ do {
     render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-edge.bin", edgeOnly: true)
     render(time: 1.0, intensity: 0.0, motion: 0.0, path: outputPrefix + "-edge-off.bin", edgeOnly: true)
 
-    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-silence.bin", music: .init(0, 0, 0, 1))
-    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-soft.bin", music: .init(0.22, 0.03, 0.01, 1))
-    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-mids.bin", music: .init(0, 0.8, 0, 1))
-    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-on.bin", music: .init(0.9, 0.55, 0.25, 1))
+    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-silence.bin", music: .zero)
+    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-soft.bin", music: .init(repeating: 0.19))
+    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-mids.bin", music: .init(0.19, 0.19, 0.19, 0.19, 0.19, 0.19, 0.19, 0.90, 0.19, 0.19, 0.19, 0.19, 0.19, 0.19, 0.19, 0.19))
+    render(time: 1.0, intensity: 1.0, motion: 0.0, path: outputPrefix + "-music-on.bin", music: .init(0.9, 0.4, 0.3, 0.72, 0.49, 0.31, 0.56, 0.23, 0.77, 0.28, 0.39, 0.54, 0.18, 0.45, 0.68, 0.59))
 
     let geometry = NotchSurfaceGeometry(
         rect: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)),
@@ -492,14 +497,15 @@ kernel void opticalProbe(
     constant float4 &params [[buffer(3)]],
     constant float4 &tint [[buffer(4)]],
     constant uint2 &dims [[buffer(5)]],
-    constant float4 &music [[buffer(6)]],
+    constant float4 *music [[buffer(6)]],
+    constant float &density [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= dims.x || gid.y >= dims.y) { return; }
     float2 uv = (float2(gid) + 0.5) / float2(dims);
     float2 position = rect.xy + uv * rect.zw;
     half4 result = notchOpticalSurface(
-        position, half4(0.0), rect, radii, params, tint, music
+        position, half4(0.0), rect, radii, params, tint, music[0], music[1], music[2], music[3], density
     );
     output[gid.y * dims.x + gid.x] = float4(result);
 }
@@ -510,14 +516,15 @@ kernel void edgeProbe(
     constant float4 &params [[buffer(3)]],
     constant float4 &tint [[buffer(4)]],
     constant uint2 &dims [[buffer(5)]],
-    constant float4 &music [[buffer(6)]],
+    constant float4 *music [[buffer(6)]],
+    constant float &density [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= dims.x || gid.y >= dims.y) { return; }
     float2 uv = (float2(gid) + 0.5) / float2(dims);
     float2 position = rect.xy + uv * rect.zw;
     half4 result = notchEdgeOptics(
-        position, half4(0.0), rect, radii, params, tint, music
+        position, half4(0.0), rect, radii, params, tint, music[0], music[1], music[2], music[3], density
     );
     output[gid.y * dims.x + gid.x] = float4(result);
 }
@@ -738,6 +745,18 @@ def run_metal_tests(tmp: pathlib.Path) -> int:
                 header_ok = False
     check(header_ok, "header stays opaque black")
 
+    clear = read_floats(tmp / "probe-transparent.bin")
+    dense = read_floats(tmp / "probe-dense.bin")
+    centre = width // 2
+    body = index(centre, int(height * 0.65))
+    header = index(centre, int(header_height / 2))
+    check(clear[body + 3] < t1[body + 3] < dense[body + 3],
+          "glass transparency changes body absorption monotonically")
+    check(clear[header + 3] == dense[header + 3] == 1.0 and clear[header:header+3] == dense[header:header+3],
+          "glass transparency preserves the black camera shoulder")
+    check(max(abs(a - b) for i, (a, b) in enumerate(zip(clear, dense)) if i % 4 != 3) < 0.0005,
+          "glass transparency preserves reflection color and intensity")
+
     # The lower body must release the absorption instead of keeping a mask.
     lower_ok = True
     for y in range(int(height * 0.72), int(height * 0.90)):
@@ -852,7 +871,7 @@ def run_metal_tests(tmp: pathlib.Path) -> int:
     def mean_reflection(rows: range) -> float:
         total = 0.0
         count = 0
-        centre_x = width // 2
+        centre_x = int(width * 0.15)
         for y in rows:
             if not inside(centre_x, y):
                 continue
@@ -926,7 +945,7 @@ def run_metal_tests(tmp: pathlib.Path) -> int:
     body_row = int(height * 0.42)
     left_x = int(top_radius) + 2
     right_x = width - int(top_radius) - 3
-    centre_x = width // 2
+    centre_x = int(width * 0.15)
     sides_inside = (
         inside(left_x, body_row) and inside(right_x, body_row)
         and inside(centre_x, body_row)
@@ -996,43 +1015,33 @@ def run_metal_tests(tmp: pathlib.Path) -> int:
         "active and idle differ only in the bottom optical strip",
     )
 
-    body_end = (height - 37) * width * 4
+    body_end = (height - 39) * width * 4
     check(music_on[:body_end] == music_silence[:body_end],
           "music energy does not alter the controls, header or glass above the bottom strip")
     music_lift = max(on - off for on, off in zip(music_on[body_end:], music_silence[body_end:]))
     check(music_lift > 0.08, "real music levels visibly brighten the bottom field")
 
-    def crest_row(pixels):
-        columns = range(width // 2 - 12, width // 2 + 13)
-        return max(range(height - 37, height - 2), key=lambda y: sum(
-            pixels[(y * width + x) * 4] - music_silence[(y * width + x) * 4]
-            for x in columns
-        ))
+    check(t1 == music_silence, "silence leaves the original white breathing light in place")
 
-    quiet_crest = crest_row(music_soft)
-    strong_crest = crest_row(music_on)
-    print(f"  music crest: quiet y={quiet_crest}, strong y={strong_crest}, vertical travel={quiet_crest - strong_crest}px")
-    check(quiet_crest - strong_crest >= 12,
-          "a strong musical accent physically raises the optical crest")
-    centre_x = width // 2
-    row_response = [
-        music_on[(y * width + centre_x) * 4] - music_silence[(y * width + centre_x) * 4]
-        for y in range(height - 37, height - 2)
-    ]
-    check(sum(value >= max(row_response) * 0.5 for value in row_response) >= 8,
-          "the audio crest keeps a broad white core and halo")
-    check(max(t1[i] - music_silence[i] for i in range(body_end, len(t1), 4)) >= 0.035,
-          "idle glass retains its visible layered white light")
+    # A filled band spreads through several neighboring rows. Compare an
+    # accent against the quiet playback render to isolate local movement.
+    def accent_rows(pixels, x, reference, threshold):
+        return [y for y in range(height - 33, height - 3)
+                if pixels[index(x, y)] - reference[index(x, y)] > threshold]
 
-    def midrange_delta(x):
-        return max(
-            music_mids[index(x, y)] - music_silence[index(x, y)]
-            for y in range(height - 37, height - 2)
-        )
+    accent_x = round(width * (0.14 + 0.72 * 7 / 15))
+    other_x = round(width * (0.14 + 0.72 * 11 / 15))
+    rows = accent_rows(music_mids, accent_x, music_soft, 0.025)
+    reach = height - min(rows) if rows else 0
+    print(f"  band accent reach={reach}px, illuminated rows={len(rows)}")
+    check(12 <= reach <= 27 and len(rows) >= 8,
+          "the accent spreads softly through a shallow area")
+    check(not accent_rows(music_mids, other_x, music_soft, 0.025),
+          "an accent changes its own band without lifting distant quiet bands")
 
-    check(min(midrange_delta(int(width * 0.26)), midrange_delta(int(width * 0.74)))
-          > midrange_delta(width // 2) + 0.08,
-          "midrange spreads two separate pools of white light out to the sides")
+    active_columns = range(round(width * 0.15), round(width * 0.85) + 1)
+    check(all(accent_rows(music_on, x, music_silence, 0.025) for x in active_columns),
+          "the shallow glow remains connected along the lower edge")
 
     # Intensity zero must erase the voice field and its shadow even when the
     # motion state is active: the two zero-intensity renders are identical.

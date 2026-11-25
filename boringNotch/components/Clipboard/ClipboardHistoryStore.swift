@@ -277,6 +277,10 @@ final class ClipboardHistoryStore: ObservableObject {
     @Published private(set) var notice: ClipboardNotice?
     @Published private(set) var persistenceStatus: ClipboardPersistenceStatus
 
+    // The clipboard page is recreated each time the notch closes.
+    var carouselFilter = "all"
+    var carouselPositions: [String: (entryID: UUID, inset: CGFloat, offset: CGFloat)] = [:]
+
     let maxItems: Int
     let maxTotalBytes: Int
     let maxImageBytes: Int

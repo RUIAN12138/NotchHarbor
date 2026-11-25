@@ -73,11 +73,16 @@ enum NotchPage: Int, CaseIterable, Identifiable {
             activities.showDashboard = false
         case .shelf:
             coordinator.currentView = .shelf
+            activities.showPanel = false
+            activities.showDashboard = false
         case .clipboard:
             coordinator.currentView = .clipboard
+            activities.showPanel = false
+            activities.showDashboard = false
         case .agent:
             coordinator.currentView = .home
             activities.showPanel = true
+            activities.showDashboard = false
         case .calendar:
             coordinator.currentView = .home
             activities.showPanel = false
@@ -101,6 +106,7 @@ struct BoringHeader: View {
     var cameraClearanceWidth: CGFloat? = nil
     /// Expanded header row height, normally the physical notch height (32 pt).
     var headerHeight: CGFloat = 32
+    var previewPage: Binding<NotchPage>?
 
     /// Hit target stays inside the header row and never exceeds 36 pt.
     private var controlHitHeight: CGFloat {
@@ -144,13 +150,17 @@ struct BoringHeader: View {
     }
 
     private func navButton(_ destination: NotchPage, width: CGFloat, adjacentToHover: Bool) -> some View {
-        let selected = NotchPage.selection(coordinator: coordinator, activities: activities) == destination
+        let selected = (previewPage?.wrappedValue ?? NotchPage.selection(coordinator: coordinator, activities: activities)) == destination
         let hovered = hoveredDestination == destination
         let magnification: CGFloat = reduceMotion ? 0 : (hovered ? 1 : adjacentToHover ? 0.30 : 0)
         let iconSize = min(16, max(11, width * 0.56))
 
         return Button {
-            destination.activate(coordinator: coordinator, activities: activities)
+            if let previewPage {
+                previewPage.wrappedValue = destination
+            } else {
+                destination.activate(coordinator: coordinator, activities: activities)
+            }
         } label: {
             ZStack {
                 NotchControlSurface(shape: Capsule(), emphasized: selected, isHovered: hovered)
@@ -164,6 +174,12 @@ struct BoringHeader: View {
                     .foregroundStyle(selected || hovered ? Color.primary : Color.primary.opacity(0.76))
                     .shadow(color: selected ? Color.primary.opacity(0.45) : .clear,
                             radius: selected ? 4 : 0)
+
+                if destination == .agent, activities.hasPendingAgentApprovals {
+                    Circle().fill(.red).frame(width: 5, height: 5)
+                        .offset(x: iconSize * 0.45, y: -iconSize * 0.38)
+                        .accessibilityHidden(true)
+                }
             }
             // Move the glass button and its glyph as one object, while the
             // outer pointer target remains stable during Dock-style motion.
@@ -183,6 +199,7 @@ struct BoringHeader: View {
         }
         .help(destination.title)
         .accessibilityLabel(destination.title)
+        .accessibilityValue(destination == .agent && activities.hasPendingAgentApprovals ? "有待审批请求" : "")
         .accessibilityIdentifier(destination.assetName)
         .accessibilityAddTraits(selected ? AccessibilityTraits.isSelected : [])
     }
@@ -252,6 +269,12 @@ struct BoringHeader: View {
                                 Button { showsTools = false; SettingsWindowController.shared.showWindow() } label: {
                                     Label("打开设置", systemImage: "gear")
                                 }
+                            }
+                            Button {
+                                showsTools = false
+                                NotchSpotlightGuideController.shared.start(force: true)
+                            } label: {
+                                Label("高光使用引导", systemImage: "sparkles")
                             }
                             if showMirror {
                                 Button { showsTools = false; vm.toggleCameraPreview() } label: {

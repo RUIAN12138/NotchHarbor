@@ -7,6 +7,8 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import sqlite3
+from contextlib import closing
 import stat
 import time
 import uuid
@@ -122,26 +124,83 @@ def last_tool(path):
     return activity_details(path)[0]
 
 
+def latest_codex_lifecycle(stream, size):
+    """Walk back past large tool results to find the latest lifecycle event."""
+    end = size
+    minimum = max(0, size - 8 * 1024 * 1024)
+    fragment = b''
+    while end > minimum:
+        start = max(minimum, end - 64 * 1024)
+        stream.seek(start)
+        lines = (stream.read(end - start) + fragment).split(b'\n')
+        fragment = lines.pop(0) if start > 0 else b''
+        for line in reversed(lines):
+            if not any(marker in line for marker in (b'"task_started"', b'"task_complete"', b'"turn_aborted"')):
+                continue
+            try:
+                row = json.loads(line)
+                kind = row.get('payload', {}).get('type')
+                if row.get('type') == 'event_msg' and kind in ('task_started', 'task_complete', 'turn_aborted'):
+                    timestamp = datetime.fromisoformat(row['timestamp'])
+                    if timestamp.tzinfo:
+                        return kind, timestamp.timestamp()
+            except (AttributeError, KeyError, ValueError, TypeError, OverflowError):
+                continue
+        end = start
+    return None
+
+
+RECENT_SESSION_LIFETIME = 15 * 60
+CODEX_RUNNING_LIFETIME = 6 * 60
+
+
+def indexed_codex_paths(root, now):
+    """Find recently updated threads whose rollouts live in old date folders."""
+    databases = []
+    for path in root.parent.glob('state_*.sqlite'):
+        version = re.fullmatch(r'state_(\d+)\.sqlite', path.name)
+        try:
+            info = path.lstat()
+            if version and stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                databases.append((int(version[1]), path))
+        except OSError:
+            continue
+    for _, database in sorted(databases, reverse=True):
+        try:
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=0.15)) as connection:
+                return [Path(row[0]) for row in connection.execute(
+                    'SELECT rollout_path FROM threads WHERE archived = 0 AND updated_at >= ? '
+                    'ORDER BY updated_at DESC LIMIT 32', (int(now - RECENT_SESSION_LIFETIME),)
+                ) if isinstance(row[0], str)]
+        except (ValueError, sqlite3.Error):
+            continue
+    return []
+
+
 def recent_codex_sessions(root, now):
     """Find active Desktop/CLI threads even if their hooks never wrote a snapshot."""
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         return []
-    candidates = []
+    root = root.resolve()
+    candidates = {}
     today = datetime.fromtimestamp(now).date()
+    paths = indexed_codex_paths(root, now)
     for delta in (0, 1):
         day = root / (today - timedelta(days=delta)).strftime('%Y/%m/%d')
-        if not day.resolve().is_relative_to(root.resolve()):
+        if day.resolve().is_relative_to(root):
+            paths.extend(day.glob('rollout-*.jsonl'))
+    for path in paths:
+        try:
+            meta = path.lstat()
+            if (stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid()
+                    and 0 <= now - meta.st_mtime <= RECENT_SESSION_LIFETIME
+                    and path.resolve().is_relative_to(root)):
+                candidates[path] = meta.st_mtime
+        except (OSError, ValueError):
             continue
-        for path in day.glob('rollout-*.jsonl'):
-            try:
-                meta = path.lstat()
-                if stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid() and 0 <= now-meta.st_mtime <= 360:
-                    candidates.append((meta.st_mtime, path))
-            except OSError:
-                continue
     found = {}
-    for stamp, path in sorted(candidates, reverse=True)[:32]:
+    for path, stamp in sorted(candidates.items(), key=lambda item: item[1], reverse=True)[:32]:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, 'rb') as stream:
@@ -149,6 +208,7 @@ def recent_codex_sessions(root, now):
                 if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
                     continue
                 row = json.loads(stream.readline(131072))
+                lifecycle = latest_codex_lifecycle(stream, info.st_size)
             if row.get('type') != 'session_meta':
                 continue
             meta = row['payload']
@@ -159,17 +219,19 @@ def recent_codex_sessions(root, now):
                 continue
             if '/.cache/boringnotch-agent-suggestions/' in str(meta.get('cwd', '')):
                 continue
-            lifecycle = []
-            activity_details(path, lifecycle, tail_bytes=524288)
-            if lifecycle and lifecycle[-1][1] <= now+5:
-                kind, started = lifecycle[-1]
+            if lifecycle and lifecycle[1] <= now+5:
+                kind, started = lifecycle
                 # Preserve the latest file for a thread even when that file is
                 # terminal, so an older fork log cannot revive it.
                 found[identity] = (kind, started, stamp, meta.get('cwd', ''))
         except (OSError, KeyError, AttributeError, TypeError, ValueError, OverflowError):
             continue
-    return [(identity, started, stamp, cwd) for identity, (kind, started, stamp, cwd) in found.items()
-            if kind == 'task_started' and started <= stamp+5]
+    return [(identity, kind, event_time, stamp, cwd)
+            for identity, (kind, event_time, stamp, cwd) in found.items()
+            if event_time <= stamp + 5 and (
+                (kind == 'task_started' and now - stamp < CODEX_RUNNING_LIFETIME)
+                or (kind == 'task_complete' and now - event_time < RECENT_SESSION_LIFETIME)
+            )]
 
 
 def enrich_progress(items, root, cache):

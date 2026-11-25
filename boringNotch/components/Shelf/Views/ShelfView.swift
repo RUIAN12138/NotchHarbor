@@ -24,7 +24,7 @@ struct ShelfView: View {
     /// An internal item drag is rejected by `handleDrop`, so it must not read as
     /// a file-receiving hit.
     private var isReceivingDrop: Bool {
-        isPanelTargeted && !selection.isDragging
+        isPanelTargeted && !vm.dropZoneTargeting && !selection.isDragging
     }
 
     private enum ShelfHint: Equatable {
@@ -76,16 +76,21 @@ struct ShelfView: View {
 
     var body: some View {
         GeometryReader { layout in
-            let shareSize = min(104, min(layout.size.height, layout.size.width * 0.30))
-            HStack(spacing: 10) {
+            let regions = ShelfDropLayout(size: layout.size)
+            HStack(spacing: 5) {
                 FileShareView()
-                    .frame(width: shareSize, height: shareSize)
+                    .frame(width: regions.shareSize, height: regions.shareSize)
                 panel
-                    .onDrop(of: [.fileURL, .url, .utf8PlainText, .plainText, .data], isTargeted: $vm.dragDetectorTargeting) { providers in
-                        handleDrop(providers: providers)
-                    }
+                    .padding(ShelfDropLayout.tileInset)
+                    .frame(width: regions.shelf.width, height: regions.shelf.height)
+                    .contentShape(Rectangle())
+                    .onDrop(of: GeneralDropTargetDelegate.types,
+                            delegate: GeneralDropTargetDelegate(isTargeted: $vm.dragDetectorTargeting,
+                                enabled: !selection.isDragging, receive: handleDrop))
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         }
+        .onDisappear { vm.dragDetectorTargeting = false }
         // Bind Quick Look to shelf selection
         .onChange(of: selection.selectedIDs) {
             updateQuickLookSelection()

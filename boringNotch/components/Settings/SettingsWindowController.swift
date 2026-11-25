@@ -10,13 +10,25 @@ import SwiftUI
 import Defaults
 import Sparkle
 
+@MainActor
+final class SettingsPreviewSession: ObservableObject {
+    @Published var liveModel: BoringViewModel?
+}
+
+private final class AppearanceTransitionCover: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 class SettingsWindowController: NSWindowController {
     static let shared = SettingsWindowController()
+    private let previewSession = SettingsPreviewSession()
+    private weak var themeCover: AppearanceTransitionCover?
+    var previewModel: (() -> BoringViewModel?)?
     private var updaterController: SPUStandardUpdaterController?
     
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 766, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 872, height: 690),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -45,7 +57,7 @@ class SettingsWindowController: NSWindowController {
         window.titleVisibility = .hidden
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.contentMinSize = NSSize(width: 650, height: 465)
+        window.contentMinSize = NSSize(width: 770, height: 510)
         window.toolbarStyle = .unified
         window.isMovableByWindowBackground = true
         
@@ -57,22 +69,73 @@ class SettingsWindowController: NSWindowController {
         window.isExcludedFromWindowsMenu = false
         
         // Configure window to be a standard document-style window
-        window.isRestorable = true
+        window.isRestorable = false
         window.identifier = NSUserInterfaceItemIdentifier("BoringNotchSettingsWindow")
         
         // Create the SwiftUI content
-        let settingsView = SettingsView(updaterController: updaterController) { [weak window] language in
+        let settingsView = SettingsView(previewSession: previewSession, updaterController: updaterController) { [weak window] language in
             window?.title = language == "en" ? "Notch Harbor Settings" : "Notch Harbor 设置"
         }
         let hostingView = NSHostingView(rootView: settingsView)
-        window.contentView = hostingView
+        hostingView.sizingOptions = []
+        let container = NSView(frame: window.contentView?.bounds ?? .zero)
+        hostingView.frame = container.bounds
+        hostingView.autoresizingMask = [.width, .height]
+        container.addSubview(hostingView)
+        window.contentView = container
         
         // Handle window closing
         window.delegate = self
     }
     
+    func switchAppearance(to mode: HarborAppearance, animated: Bool) {
+        guard Defaults[.appAppearance] != mode else { return }
+        let appearance = mode.name.flatMap { NSAppearance(named: $0) }
+        let choices: [NSAppearance.Name] = [.aqua, .darkAqua]
+        let previousPalette = window?.effectiveAppearance.bestMatch(from: choices)
+        let cover = animated ? makeThemeCover() : nil
+
+        Defaults[.appAppearance] = mode
+        NSApp.appearance = appearance
+
+        guard let cover else { return }
+        // Let AppKit and SwiftUI resolve the new appearance under the cover.
+        DispatchQueue.main.async { [weak self, weak cover] in
+            guard let self, let cover, self.themeCover === cover else { return }
+            if self.window?.effectiveAppearance.bestMatch(from: choices) == previousPalette {
+                cover.removeFromSuperview()
+                return
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.24
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                cover.animator().alphaValue = 0
+            } completionHandler: { [weak cover] in
+                cover?.removeFromSuperview()
+            }
+        }
+    }
+
+    private func makeThemeCover() -> AppearanceTransitionCover? {
+        guard let window, window.isVisible, !window.isMiniaturized, let content = window.contentView,
+              let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { return nil }
+        content.cacheDisplay(in: content.bounds, to: bitmap)
+        themeCover?.removeFromSuperview()
+        let image = NSImage(size: content.bounds.size)
+        image.addRepresentation(bitmap)
+        let cover = AppearanceTransitionCover(frame: content.bounds)
+        cover.image = image
+        cover.imageScaling = .scaleAxesIndependently
+        cover.autoresizingMask = [.width, .height]
+        cover.setAccessibilityElement(false)
+        content.addSubview(cover, positioned: .above, relativeTo: nil)
+        themeCover = cover
+        return cover
+    }
+
     func showWindow() {
         guard let window else { return }
+        previewSession.liveModel = previewModel?()
         NSApp.setActivationPolicy(.regular)
         // Run after the notch panel's non-activating mouse event has finished.
         DispatchQueue.main.async { [weak window] in
@@ -92,6 +155,8 @@ class SettingsWindowController: NSWindowController {
     }
     
     private func relinquishFocus() {
+        themeCover?.removeFromSuperview()
+        previewSession.liveModel = nil
         window?.orderOut(nil)
         
         // Set app back to accessory mode immediately

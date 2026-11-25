@@ -53,11 +53,11 @@ struct LottieView: NSViewRepresentable {
 
 enum WeatherAlertAnimation: String {
     case wind
-    case rain = "extreme-rain"
-    case thunder = "thunderstorms-day-rain"
-    case snow
-    case heat = "thermometer-warmer"
-    case sun = "clear-day"
+    case rain = "cloud-rain"
+    case thunder = "cloud-lightning"
+    case snow = "cloud-snow"
+    case heat = "thermometer"
+    case sun
 
     static func matching(_ description: String) -> Self? {
         let patterns: [(Self, [String])] = [
@@ -69,18 +69,6 @@ enum WeatherAlertAnimation: String {
             (.sun, ["晴"])
         ]
         return patterns.first { $0.1.contains(where: description.contains) }?.0
-    }
-
-    // Retain the source artwork and timings inside a representative excerpt.
-    var frames: ClosedRange<AnimationFrameTime> {
-        switch self {
-        case .wind: 24...180
-        case .rain: 10...131
-        case .thunder: 18...50
-        case .snow: 5...126
-        case .heat: 20...142
-        case .sun: 0...180
-        }
     }
 
     var symbol: String {
@@ -95,18 +83,9 @@ enum WeatherAlertAnimation: String {
     }
 
     @MainActor func applyPalette(to view: LottieAnimationView, dark: Bool) {
-        switch self {
-        case .wind:
-            let color = dark ? LottieColor(r: 0.80, g: 0.93, b: 0.98, a: 1)
-                : LottieColor(r: 0.13, g: 0.39, b: 0.48, a: 1)
-            view.setValueProvider(ColorValueProvider(color), keypath: AnimationKeypath(keypath: "**.Color"))
-        case .snow, .thunder:
-            let color = dark ? LottieColor(r: 0.90, g: 0.94, b: 0.99, a: 1)
-                : LottieColor(r: 0.34, g: 0.42, b: 0.51, a: 1)
-            view.setValueProvider(ColorValueProvider(color), keypath: AnimationKeypath(keypath: "Clouds.**.Color"))
-        default:
-            break
-        }
+        let color = dark ? LottieColor(r: 0.90, g: 0.95, b: 1, a: 1)
+            : LottieColor(r: 0.18, g: 0.27, b: 0.37, a: 1)
+        view.setValueProvider(ColorValueProvider(color), keypath: AnimationKeypath(keypath: "**.Color"))
     }
 }
 
@@ -138,7 +117,7 @@ struct WeatherAlertLottieView: NSViewRepresentable {
         }
         guard context.coordinator.playing != playing else { return }
         context.coordinator.playing = playing
-        let frames = asset.frames
+        let frames = animation.startFrame...animation.endFrame
         if playing {
             view.animationSpeed = (frames.upperBound - frames.lowerBound) / animation.framerate / duration
             view.play(fromFrame: frames.lowerBound, toFrame: frames.upperBound, loopMode: .playOnce) { finished in

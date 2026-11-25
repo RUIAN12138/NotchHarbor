@@ -32,7 +32,11 @@ class CalendarManager: ObservableObject {
     @Published private(set) var isLoading = false
     private var queryGeneration = 0
     private var agendaAlertTask: Task<Void, Never>?
-    private var shownAgendaAlerts: [String: Date] = [:]
+    private var alertPreferenceTask: Task<Void, Never>?
+    private var agendaAlertEvents: [EventModel] = []
+    private static let deliveredAlertKey = "notchDeliveredCalendarAlerts"
+    private var shownAgendaAlerts = UserDefaults.standard.dictionary(forKey: deliveredAlertKey) as? [String: Double] ?? [:]
+    private var wakeObserver: NSObjectProtocol?
     private var refreshObservers: [NSObjectProtocol] = []
     var hasCalendarAccess: Bool { calendarAuthorizationStatus == .fullAccess }
     var selectedEventCalendarCount: Int { eventCalendars.filter(getCalendarSelected).count }
@@ -49,12 +53,26 @@ class CalendarManager: ObservableObject {
                 Task { @MainActor in await self?.reloadCalendarAndReminderLists() }
             })
         }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.reloadCalendarAndReminderLists() }
+        }
+        alertPreferenceTask = Task { [weak self] in
+            for await _ in Defaults.updates(.notchCalendarAlerts, .notchCalendarAlertLeadMinutes, initial: false) {
+                guard let self else { return }
+                self.scheduleAgendaAlerts()
+            }
+        }
         Task {
             await reloadCalendarAndReminderLists()
         }
     }
 
     deinit {
+        alertPreferenceTask?.cancel()
+        agendaAlertTask?.cancel()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
         refreshObservers.forEach(NotificationCenter.default.removeObserver)
         if let observer = eventStoreChangedObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -174,6 +192,8 @@ class CalendarManager: ObservableObject {
     }
 
     private func updateEvents() async {
+        agendaAlertTask?.cancel()
+        agendaAlertEvents = []
         queryGeneration += 1
         let generation = queryGeneration
         isLoading = true
@@ -193,42 +213,53 @@ class CalendarManager: ObservableObject {
             .sorted { $0.start == $1.start ? $0.agendaOccurrenceID < $1.agendaOccurrenceID : $0.start < $1.start }
         events = result
         isLoading = false
-        let today = currentDay
-        let alertEvents = anchor == today ? result : await calendarService.events(
-            from: today, to: AgendaDateRange.end(anchor: today),
-            calendars: selectedCalendars.map(\.id))
+        let alertWindow = AgendaAlertLead.queryWindow(now: .now)
+        let alertEvents = await calendarService.events(
+            from: alertWindow.lowerBound, to: alertWindow.upperBound,
+            calendars: selected.map(\.id))
         guard generation == queryGeneration else { return }
-        scheduleAgendaAlerts(alertEvents)
+        agendaAlertEvents = alertEvents
+        scheduleAgendaAlerts()
     }
 
-    private func scheduleAgendaAlerts(_ events: [EventModel]) {
+    private func scheduleAgendaAlerts() {
         agendaAlertTask?.cancel()
-        let eligible = events.filter { event in
-            guard !event.isAllDay else { return false }
+        guard Defaults[.notchCalendarAlerts] else { return }
+        let now = Date()
+        let leads = Defaults[.notchCalendarAlertLeadMinutes].compactMap(AgendaAlertLead.init(rawValue:))
+            .filter { $0 != .atTime }
+        var reminderIDs = Set<String>()
+        let upcoming = agendaAlertEvents.flatMap { (event) -> [(event: EventModel, time: Date, id: String)] in
+            guard !event.isAllDay else { return [] }
+            let offsets: [AgendaAlertLead]
             switch event.type {
-            case .event(let status): return status != .declined && hasCalendarAccess
-            case .reminder(let completed): return !completed && reminderAuthorizationStatus == .fullAccess
-            case .birthday: return false
+            case .event(let status) where status != .declined && hasCalendarAccess: offsets = leads
+            case .reminder(let completed) where !completed && reminderAuthorizationStatus == .fullAccess: offsets = [.atTime]
+            default: return []
             }
-        }.sorted { $0.start < $1.start }
+            return offsets.compactMap { lead in
+                let time = lead.triggerTime(for: event.start)
+                let id = lead.deliveryID(calendarID: event.calendar.id, eventID: event.id, start: event.start)
+                guard AgendaAlertLead.isTimely(time, now: now),
+                      shownAgendaAlerts[id] == nil, reminderIDs.insert(id).inserted else { return nil }
+                return (event, time, id)
+            }
+        }.sorted { $0.time < $1.time }
+
+        shownAgendaAlerts = shownAgendaAlerts.filter { $0.value > now.timeIntervalSince1970 }
         agendaAlertTask = Task { @MainActor [weak self] in
-            for event in eligible {
-                let lead: TimeInterval = event.type.isReminder ? 0 : 600
-                let delay = event.start.timeIntervalSinceNow - lead
-                if delay > 0 { try? await Task.sleep(until: .now + .seconds(delay), clock: .continuous) }
-                guard !Task.isCancelled, let self else { return }
-                let now = Date()
-                guard Defaults[.notchCalendarAlerts], now < event.start.addingTimeInterval(60) else { continue }
-                let identity = event.id + ":" + String(event.start.timeIntervalSince1970)
-                self.shownAgendaAlerts = self.shownAgendaAlerts.filter { $0.value > now }
-                guard self.shownAgendaAlerts[identity] == nil else { continue }
-                self.shownAgendaAlerts[identity] = event.start.addingTimeInterval(60)
-                UnifiedActivities.shared.showCalendarAlert(id: identity, title: event.title, date: event.start)
-                try? await Task.sleep(for: .seconds(5))
+            for alert in upcoming {
+                let delay = alert.time.timeIntervalSinceNow
+                if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+                guard !Task.isCancelled, let self, Defaults[.notchCalendarAlerts] else { return }
+                guard AgendaAlertLead.isTimely(alert.time, now: .now),
+                      alert.time <= Date(), self.shownAgendaAlerts[alert.id] == nil else { continue }
+                self.shownAgendaAlerts[alert.id] = alert.event.start.addingTimeInterval(3_600).timeIntervalSince1970
+                UserDefaults.standard.set(self.shownAgendaAlerts, forKey: Self.deliveredAlertKey)
+                UnifiedActivities.shared.showCalendarAlert(id: alert.id, title: alert.event.title, date: alert.event.start)
             }
         }
     }
-    
 
     func setReminderCompleted(reminderID: String, completed: Bool) async {
         await calendarService.setReminderCompleted(reminderID: reminderID, completed: completed)
@@ -255,6 +286,30 @@ enum AgendaDateRange {
         let lower = calendar.startOfDay(for: day)
         guard let upper = calendar.date(byAdding: .day, value: 1, to: lower) else { return false }
         return start < upper && (end > lower || (start == end && start >= lower))
+    }
+}
+enum AgendaAlertLead: Int, CaseIterable {
+    case atTime = 0, tenMinutes = 10, halfHour = 30, oneDay = 1440
+
+    func triggerTime(for start: Date, calendar: Calendar = .current) -> Date {
+        if self == .oneDay,
+           let previousDay = calendar.date(byAdding: .day, value: -1, to: start) { return previousDay }
+        return start.addingTimeInterval(Double(-rawValue * 60))
+    }
+
+    func deliveryID(calendarID: String, eventID: String, start: Date) -> String {
+        AgendaDateRange.occurrenceKey(calendarID: calendarID, eventID: eventID, start: start, end: start)
+            + ":" + String(rawValue)
+    }
+
+    static func queryWindow(now: Date, calendar: Calendar = .current) -> Range<Date> {
+        let start = now.addingTimeInterval(-120)
+        let end = calendar.date(byAdding: .day, value: 2, to: now) ?? now.addingTimeInterval(172_800)
+        return start..<end
+    }
+
+    static func isTimely(_ scheduled: Date, now: Date) -> Bool {
+        now.timeIntervalSince(scheduled) <= 120
     }
 }
 // === AGENDA_DATE_RANGE_END ===

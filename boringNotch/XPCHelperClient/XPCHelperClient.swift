@@ -69,6 +69,14 @@ final class XPCHelperClient {
         )
     }
     
+    @MainActor
+    func appMemoryRanking() async -> Data {
+        let service = ensureRemoteService()
+        return (try? await service.withContinuation { service, continuation in
+            service.appMemoryRanking { continuation.resume(returning: $0) }
+        }) ?? Data()
+    }
+
     // MARK: - Accessibility
     
     nonisolated func requestAccessibilityAuthorization() {

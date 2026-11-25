@@ -52,30 +52,35 @@ private enum HarborSettingsPage: String, CaseIterable {
 
 struct SettingsView: View {
     @Default(.settingsLanguage) private var settingsLanguage
+    @ObservedObject var previewSession = SettingsPreviewSession()
     @State private var page: HarborSettingsPage = .general
     @State private var hoveredPage: HarborSettingsPage?
-    @State private var accent = Color.effectiveAccent
     @Namespace private var sidebarSelection
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var updaterController: SPUStandardUpdaterController? = nil
     var onLanguageChanged: (String) -> Void = { _ in }
 
+    private var panelPaper: Color { Color(white: colorScheme == .dark ? 0.095 : 0.985) }
+    private var sidebarPaper: Color { Color(white: colorScheme == .dark ? 0.13 : 0.937) }
+    private var monochromeInk: Color { colorScheme == .dark ? .white : .black }
+    private var reverseInk: Color { colorScheme == .dark ? .black : .white }
+
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-                .frame(width: 207)
+                .frame(width: 176)
+                .background(sidebarPaper)
 
             VStack(alignment: .leading, spacing: 0) {
                 heading
                 if page == .general {
                     languagePreference
-                } else if page == .appearance {
-                    HarborNotchPreview()
-                        .padding(.horizontal, 23)
-                        .padding(.bottom, 4)
+                } else if page == .appearance, let model = previewSession.liveModel {
+                    HarborNotchPreview(liveModel: model)
+                        .padding(.horizontal, 27)
+                        .padding(.bottom, 8)
                 }
                 ZStack {
                     pageContent
@@ -87,53 +92,34 @@ struct SettingsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: page)
             }
-            .padding(.vertical, 8)
-            .background {
-                let surface = RoundedRectangle(cornerRadius: 21, style: .continuous)
-                surface.fill(Color(nsColor: .windowBackgroundColor))
-                    .overlay {
-                        surface.strokeBorder(.primary.opacity(0.08), lineWidth: 1)
-                    }
-                    .shadow(color: .black.opacity(colorScheme == .dark ? 0.24 : 0.07), radius: 12, y: 4)
-            }
-            .padding(.top, 12)
-            .padding([.trailing, .bottom], 12)
+            .padding(.top, 26)
+            .background(panelPaper)
         }
-        .frame(minWidth: 650, minHeight: 465)
-        .background {
-            if reduceTransparency {
-                Color(nsColor: .underPageBackgroundColor)
-            } else {
-                VisualEffectView(material: .sidebar, blendingMode: .behindWindow)
-                LinearGradient(colors: [accent.opacity(colorScheme == .dark ? 0.17 : 0.10), .clear],
-                               startPoint: .topLeading, endPoint: .bottomTrailing)
-            }
-        }
+        .frame(minWidth: 770, minHeight: 510)
+        .background(panelPaper)
         .environment(\.locale, Locale(identifier: settingsLanguage))
-        .tint(accent)
+        .tint(monochromeInk)
         .onChange(of: settingsLanguage, initial: true) { _, language in onLanguageChanged(language) }
-        .onReceive(NotificationCenter.default.publisher(for: .init("AccentColorChanged"))) { _ in
-            accent = .effectiveAccent
-        }
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 9) {
-                Image("NotchHarborBrand").resizable().frame(width: 36, height: 36)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.topthird.inset.filled")
+                    .font(.system(size: 17, weight: .semibold))
                     .accessibilityHidden(true)
                 Text("Notch Harbor")
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .font(.system(size: 15, weight: .bold))
                     .lineLimit(1)
             }
             .padding(.horizontal, 21)
             .padding(.top, 40)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 11) {
-                    pageGroup("应用", [.general, .appearance, .shortcuts])
+                VStack(alignment: .leading, spacing: 13) {
+                    pageGroup("应用", [.general, .appearance])
                     pageGroup("功能", [.media, .agent, .calendar, .shelf, .hud, .battery])
-                    pageGroup("更多", [.advanced, .about])
+                    pageGroup("更多", [.shortcuts, .advanced, .about])
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 15)
@@ -157,30 +143,29 @@ struct SettingsView: View {
                     guard item != page else { return }
                     withAnimation(reduceMotion ? nil : .smooth(duration: 0.22)) { page = item }
                 } label: {
-                    HStack(spacing: 9) {
+                    HStack(spacing: 10) {
                         Image(systemName: item.symbol)
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.system(size: 15, weight: .semibold))
                             .frame(width: 22)
-                            .foregroundStyle(item == page && colorScheme == .dark ? Color.white : .secondary)
-                        Text(item.title).font(.system(size: 13, weight: item == page ? .semibold : .medium))
+                        Text(item.title).font(.system(size: 14, weight: item == page ? .semibold : .medium))
                         Spacer(minLength: 4)
                     }
-                    .padding(.horizontal, 9)
-                    .frame(height: 32)
+                    .foregroundStyle(item == page ? reverseInk : monochromeInk)
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
                     .background {
                         let shape = RoundedRectangle(cornerRadius: 10)
                         if item == page {
-                            NotchControlSurface(shape: shape, emphasized: true)
-                                .overlay { shape.strokeBorder(accent.opacity(0.34), lineWidth: 0.75) }
-                                .environment(\.usesSharedGlassShell, colorScheme == .dark)
-                                .matchedGeometryEffect(id: "selected-page", in: sidebarSelection)
+                            shape.fill(monochromeInk)
+                                .matchedGeometryEffect(id: "selected-page", in: sidebarSelection,
+                                                       properties: .position)
                         } else if hoveredPage == item {
-                            shape.fill(.primary.opacity(0.065))
+                            shape.fill(.primary.opacity(0.075))
                         }
                     }
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(HarborSettingsPressStyle())
                 .accessibilityAddTraits(item == page ? .isSelected : [])
                 .accessibilityIdentifier("harbor-settings-\(item.rawValue)")
                 .onHover { inside in
@@ -195,14 +180,8 @@ struct SettingsView: View {
 
     private var heading: some View {
         HStack(spacing: 13) {
-            Image(systemName: page.symbol)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(accent)
-                .frame(width: 40, height: 40)
-                .background(accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
-                .accessibilityHidden(true)
             Text(page.title)
-                .font(.system(size: 24, weight: .semibold, design: .rounded))
+                .font(.system(size: 36, weight: .bold))
                 .accessibilityAddTraits(.isHeader)
             Spacer()
             if page == .general {
@@ -210,9 +189,9 @@ struct SettingsView: View {
                     .controlSize(.small)
             }
         }
-        .padding(.horizontal, 23)
-        .padding(.top, 17)
-        .padding(.bottom, 15)
+        .padding(.horizontal, 27)
+        .padding(.top, 12)
+        .padding(.bottom, 17)
     }
 
     private var languagePreference: some View {
@@ -237,7 +216,7 @@ struct SettingsView: View {
     private var pageContent: some View {
         switch page {
         case .general: GeneralSettings()
-        case .appearance: Appearance(accent: accent)
+        case .appearance: Appearance()
         case .media: Media()
         case .agent: AgentSuggestionSettings()
         case .calendar: CalendarSettings()
@@ -248,6 +227,18 @@ struct SettingsView: View {
         case .advanced: Advanced()
         case .about: About(updaterController: updaterController)
         }
+    }
+}
+
+private struct HarborSettingsPressStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .animation(reduceMotion ? nil : .spring(response: 0.23, dampingFraction: 0.83),
+                       value: configuration.isPressed)
     }
 }
 
@@ -305,6 +296,8 @@ private struct HarborLoginItemControls: View {
 }
 
 struct GeneralSettings: View {
+    @AppStorage(HarborMenuMetric.key) private var menuMetric: HarborMenuMetric = .quota
+    @Default(.menubarIcon) private var showsMenuIcon
     @State private var screens: [(uuid: String, name: String)] = NSScreen.screens.compactMap { screen in
         guard let uuid = screen.displayUUID else { return nil }
         return (uuid, screen.localizedName)
@@ -334,6 +327,13 @@ struct GeneralSettings: View {
                     Text("Show menu bar icon")
                 }
                 .tint(.effectiveAccent)
+                Picker("菜单栏图标", selection: $menuMetric) {
+                    ForEach(HarborMenuMetric.allCases, id: \.self) { metric in
+                        Text(metric.title).tag(metric)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(!showsMenuIcon)
                 HarborLoginItemControls()
                 Defaults.Toggle(key: .showOnAllDisplays) {
                     Text("Show on all displays")
@@ -433,6 +433,25 @@ struct GeneralSettings: View {
             }
 
             gestureControls()
+
+            Section {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("高光使用引导")
+                        Text("在顶部刘海内交互式高亮演示五大核心工作台与快捷操作。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        NotchSpotlightGuideController.shared.start(force: true)
+                    } label: {
+                        Label("开始引导", systemImage: "sparkles")
+                    }
+                }
+            } header: {
+                Text("快速上手")
+            }
         }
         .accentColor(.effectiveAccent)
         .navigationTitle("General")
@@ -498,14 +517,13 @@ struct GeneralSettings: View {
             Toggle("Remember last notch page", isOn: $coordinator.openLastTabByDefault)
                 .help("Resume the last page when opening the notch")
             if showIslandSideActivities {
-                Picker("Agent 审批提醒", selection: $expandNotchForAlerts) {
+                Picker("Agent 提问与审批提醒", selection: $expandNotchForAlerts) {
                     Text("刘海两侧").tag(false)
                     Text("弹出提醒").tag(true)
                 }
             } else {
-                LabeledContent("Agent 审批提醒", value: String(localized: "弹出提醒"))
+                LabeledContent("Agent 提问与审批提醒", value: String(localized: "弹出提醒"))
             }
-            Defaults.Toggle(key: .notchCalendarAlerts) { Text("日程与提醒事项") }
             HStack {
                 TextField("天气城市（例如：北京）", text: $weatherCityInput)
                     .onSubmit { notchWeatherCity = weatherCityInput.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -780,126 +798,103 @@ struct Media: View {
 
 struct CalendarSettings: View {
     @ObservedObject private var calendarManager = CalendarManager.shared
-    @Default(.hideCompletedReminders) var hideCompletedReminders
-    @Default(.hideAllDayEvents) var hideAllDayEvents
-    @Default(.autoScrollToNextEvent) var autoScrollToNextEvent
+    @Default(.notchCalendarAlerts) private var calendarAlerts
+    @Default(.notchCalendarAlertLeadMinutes) private var alertLeadMinutes
 
     var body: some View {
         Form {
-            Defaults.Toggle(key: .hideCompletedReminders) {
-                Text("Hide completed reminders")
-            }
-            Defaults.Toggle(key: .hideAllDayEvents) {
-                Text("Hide all-day events")
-            }
-            Defaults.Toggle(key: .autoScrollToNextEvent) {
-                Text("Auto-scroll to next event")
-            }
-            Defaults.Toggle(key: .showFullEventTitles) {
-                Text("Always show full event titles")
-            }
-            Section(header: Text("Calendars")) {
-                if calendarManager.calendarAuthorizationStatus != .fullAccess {
-                    Button("连接系统日历") {
-                        Task { await calendarManager.checkCalendarAuthorization() }
+            Section("日程提醒") {
+                Toggle(isOn: $calendarAlerts) {
+                    Label("在灵动岛弹出提醒", systemImage: "bell.badge")
+                }
+                Group {
+                    leadToggle("提前一天", lead: .oneDay)
+                    leadToggle("提前半小时", lead: .halfHour)
+                    leadToggle("提前十分钟", lead: .tenMinutes)
+                }
+                .disabled(!calendarAlerts)
+
+                LabeledContent {
+                    Button("预览弹窗") {
+                        UnifiedActivities.shared.showCalendarAlert(
+                            id: "preview-" + UUID().uuidString,
+                            title: String(localized: "日程提醒预览"),
+                            date: Date().addingTimeInterval(600)
+                        )
                     }
-                    Text("查看日程需要允许读取系统日历。")
-                        .foregroundColor(.red)
-                        .multilineTextAlignment(.center)
-                        .padding()
-                    Button("Open Calendar Settings") {
-                        if let settingsURL = URL(
-                            string:
-                                "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars"
-                        ) {
-                            NSWorkspace.shared.open(settingsURL)
-                        }
-                    }
+                    .buttonStyle(.bordered)
+                } label: {
+                    Text("提醒事项到期时提示")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Section("日历显示") {
+                Defaults.Toggle(key: .hideCompletedReminders) { Text("Hide completed reminders") }
+                Defaults.Toggle(key: .hideAllDayEvents) { Text("Hide all-day events") }
+                Defaults.Toggle(key: .autoScrollToNextEvent) { Text("Auto-scroll to next event") }
+                Defaults.Toggle(key: .showFullEventTitles) { Text("Always show full event titles") }
+            }
+            Section("Calendars") {
+                if calendarManager.calendarAuthorizationStatus == .fullAccess {
+                    ForEach(calendarManager.eventCalendars, id: \.id, content: sourceToggle)
                 } else {
-                    List {
-                        ForEach(calendarManager.eventCalendars, id: \.id) { calendar in
-                            Toggle(
-                                isOn: Binding(
-                                    get: { calendarManager.getCalendarSelected(calendar) },
-                                    set: { isSelected in
-                                        Task {
-                                            await calendarManager.setCalendarSelected(
-                                                calendar, isSelected: isSelected)
-                                        }
-                                    }
-                                )
-                            ) {
-                                Text(calendar.title)
-                            }
-                            .accentColor(lighterColor(from: calendar.color))
-                        }
+                    Text("查看日程需要允许读取系统日历。").foregroundStyle(.secondary)
+                    HStack {
+                        Button("连接系统日历") { Task { await calendarManager.checkCalendarAuthorization() } }
+                            .buttonStyle(.borderedProminent)
+                        Button("Open Calendar Settings") { openPrivacySettings("Privacy_Calendars") }
+                            .buttonStyle(.bordered)
                     }
                 }
             }
-            Section(header: Text("Reminders")) {
-                if calendarManager.reminderAuthorizationStatus != .fullAccess {
-                    Button("连接提醒事项") {
-                        Task { await calendarManager.checkReminderAuthorization() }
-                    }
-                    Text("可选：允许读取所选提醒事项列表。")
-                        .foregroundColor(.red)
-                        .multilineTextAlignment(.center)
-                        .padding()
-                    Button("Open Reminder Settings") {
-                        if let settingsURL = URL(
-                            string:
-                                "x-apple.systempreferences:com.apple.preference.security?Privacy_Reminders"
-                        ) {
-                            NSWorkspace.shared.open(settingsURL)
-                        }
-                    }
+            Section("Reminders") {
+                if calendarManager.reminderAuthorizationStatus == .fullAccess {
+                    ForEach(calendarManager.reminderLists, id: \.id, content: sourceToggle)
                 } else {
-                    List {
-                        ForEach(calendarManager.reminderLists, id: \.id) { calendar in
-                            Toggle(
-                                isOn: Binding(
-                                    get: { calendarManager.getCalendarSelected(calendar) },
-                                    set: { isSelected in
-                                        Task {
-                                            await calendarManager.setCalendarSelected(
-                                                calendar, isSelected: isSelected)
-                                        }
-                                    }
-                                )
-                            ) {
-                                Text(calendar.title)
-                            }
-                            .accentColor(lighterColor(from: calendar.color))
-                        }
+                    Text("可选：允许读取所选提醒事项列表。").foregroundStyle(.secondary)
+                    HStack {
+                        Button("连接提醒事项") { Task { await calendarManager.checkReminderAuthorization() } }
+                            .buttonStyle(.borderedProminent)
+                        Button("Open Reminder Settings") { openPrivacySettings("Privacy_Reminders") }
+                            .buttonStyle(.bordered)
                     }
                 }
             }
         }
-        .accentColor(.effectiveAccent)
         .navigationTitle("Calendar")
-        .onAppear {
-            Task {
-                await calendarManager.reloadCalendarAndReminderLists()
+        .task { await calendarManager.reloadCalendarAndReminderLists() }
+    }
+
+    private func leadToggle(_ title: LocalizedStringKey, lead: AgendaAlertLead) -> some View {
+        Toggle(title, isOn: Binding(
+            get: { alertLeadMinutes.contains(lead.rawValue) },
+            set: { enabled in
+                if enabled { alertLeadMinutes = (alertLeadMinutes + [lead.rawValue]).sorted() }
+                else { alertLeadMinutes.removeAll { $0 == lead.rawValue } }
+            }
+        ))
+    }
+
+    private func sourceToggle(_ source: CalendarModel) -> some View {
+        Toggle(isOn: Binding(
+            get: { calendarManager.getCalendarSelected(source) },
+            set: { selected in Task { await calendarManager.setCalendarSelected(source, isSelected: selected) } }
+        )) {
+            Label {
+                Text(verbatim: source.title)
+            } icon: {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 8))
+                    .foregroundStyle(Color(nsColor: source.color))
             }
         }
     }
-}
 
-func lighterColor(from nsColor: NSColor, amount: CGFloat = 0.14) -> Color {
-    let srgb = nsColor.usingColorSpace(.sRGB) ?? nsColor
-    var (r, g, b, a): (CGFloat, CGFloat, CGFloat, CGFloat) = (0,0,0,0)
-    srgb.getRed(&r, green: &g, blue: &b, alpha: &a)
-
-    func lighten(_ c: CGFloat) -> CGFloat {
-        let increased = c + (1.0 - c) * amount
-        return min(max(increased, 0), 1)
+    private func openPrivacySettings(_ anchor: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
+            NSWorkspace.shared.open(url)
+        }
     }
-
-    let nr = lighten(r)
-    let ng = lighten(g)
-    let nb = lighten(b)
-
-    return Color(red: Double(nr), green: Double(ng), blue: Double(nb), opacity: Double(a))
 }
 
 struct About: View {
@@ -941,10 +936,17 @@ struct About: View {
                     CheckForUpdatesView(updater: updaterController.updater)
                 }
 
+                Button("重新查看高光使用引导") {
+                    NotchSpotlightGuideController.shared.start(force: true)
+                }
+
+                Button("重新启动 Notch Harbor") { ApplicationRelauncher.restart() }
+
                 Section {
                     DisclosureGroup("开源许可与致谢") {
                         Text("基于 The Bored Team 的 Boring Notch · GPL-3.0")
                             .foregroundStyle(.secondary)
+                        Link("Notch Harbor 项目主页 (GitHub)", destination: projectPage)
                         Link("上游源码", destination: upstreamProjectPage)
                         Link("支持上游项目", destination: sponsorPage)
                         if let license = Bundle.main.url(forResource: "LICENSE", withExtension: nil),
@@ -1211,94 +1213,229 @@ struct Shelf: View {
 //}
 
 private struct HarborNotchPreview: View {
+    @ObservedObject var liveModel: BoringViewModel
+    @StateObject private var model = BoringViewModel(isSettingsPreview: true)
+    @ObservedObject private var music = MusicManager.shared
+    @StateObject private var musicSignal = MusicSpectrumSignal()
+    @AppStorage(MusicSpectrumSignal.enabledKey) private var musicLightEnabled = true
     @Default(.siriGlassEnabled) private var glassEnabled
     @Default(.siriGlassIntensity) private var lightIntensity
+    @Default(.siriGlassTransparency) private var transparency
     @Default(.enableShadow) private var enableShadow
+    @Default(.boringShelf) private var shelfEnabled
+    @Default(.openNotchOnHover) private var openOnHover
+    @Default(.minimumHoverDuration) private var hoverDuration
+    @Default(.enableGestures) private var gesturesEnabled
     @Default(.desktopRefractionEnabled) private var desktopRefractionEnabled
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Namespace private var artwork
     @State private var expanded = true
+    @State private var page: NotchPage = .music
+    @State private var hovering = false
+    @State private var blocksHoverUntilExit = false
+
+    private struct DisplayGeometry: Equatable {
+        var screenUUID: String?
+        var closedSize: CGSize
+        var systemCompanion: Bool
+        var islandWidth: CGFloat
+    }
+
+    private var display: DisplayGeometry {
+        .init(screenUUID: liveModel.screenUUID, closedSize: liveModel.closedNotchSize,
+              systemCompanion: liveModel.usesSystemIslandTrigger, islandWidth: liveModel.systemIslandWidth)
+    }
+
+    private var usesGlass: Bool { glassEnabled && !reduceTransparency }
+    private var inkScheme: ColorScheme { usesGlass || !glassEnabled ? .dark : colorScheme }
+    private var shellHeight: CGFloat { expanded ? model.expandedNotchSize.height : model.effectiveClosedNotchHeight }
+    private var shellWidth: CGFloat { expanded ? model.expandedPanelWidth : model.closedNotchSize.width }
+    private var musicLightActive: Bool {
+        musicLightEnabled && expanded && usesGlass && !reduceMotion && lightIntensity > 0 && music.isPlaying
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack {
-                Text("Live notch preview").font(.subheadline.weight(.semibold))
-                Spacer(minLength: 8)
-                Picker("Live notch preview", selection: $expanded) {
-                    Text("Collapsed").tag(false)
-                    Text("Expanded").tag(true)
+                Label("Live notch preview", systemImage: "cursorarrow.rays")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Button {
+                    setExpanded(!expanded)
+                } label: {
+                    Label(expanded ? "Collapsed" : "Expanded",
+                          systemImage: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 12, weight: .medium))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(.primary.opacity(0.075), in: Capsule())
                 }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 148)
+                .buttonStyle(HarborSettingsPressStyle())
+                .accessibilityIdentifier("harbor-preview-expand")
             }
-
-            GeometryReader { geometry in
-                let shape = NotchShape.panel(expanded: expanded)
-                let usesGlass = glassEnabled && !reduceTransparency
-                let hardwareWidth = min(110, geometry.size.width * 0.36)
+            GeometryReader { proxy in
+                let scale = min(1, max(0.1, (proxy.size.width - 24) / model.expandedPanelWidth))
                 ZStack(alignment: .top) {
-                    LinearGradient(colors: [Color(red: 0.20, green: 0.26, blue: 0.46),
-                                            Color(red: 0.47, green: 0.40, blue: 0.57),
-                                            Color(red: 0.54, green: 0.69, blue: 0.75)],
-                                   startPoint: .topLeading, endPoint: .bottomTrailing)
-                    NotchGlassBackground(
-                        shape: shape,
-                        isExpanded: expanded,
-                        reduceTransparency: reduceTransparency,
-                        headerHeight: 23,
-                        hardwareWidth: hardwareWidth,
-                        usesSharedGlassShell: usesGlass,
-                        glassEnabled: glassEnabled,
-                        lightIntensity: lightIntensity,
-                        usesDarkGlassAppearance: colorScheme == .dark
-                    )
-                    .environment(\.colorScheme, .dark)
-                    .frame(width: expanded ? min(294, geometry.size.width - 24) : hardwareWidth,
-                           height: expanded ? 82 : 24)
-                    .shadow(color: .black.opacity(enableShadow && !(usesGlass && NotchOpticalSupport.isAvailable) ? 0.18 : 0),
-                            radius: 6, y: 3)
-                    .overlay(alignment: .top) {
-                        if expanded {
-                            HStack(spacing: 10) {
-                                Image(systemName: "music.note").font(.system(size: 15, weight: .medium))
-                                Capsule().fill(.white.opacity(0.26)).frame(width: 52, height: 3)
-                                Image(systemName: "play.fill").font(.system(size: 10, weight: .semibold))
-                                    .padding(7)
-                                    .background {
-                                        NotchControlSurface(shape: Circle(), emphasized: true)
-                                            .environment(\.usesSharedGlassShell, usesGlass)
-                                    }
-                            }
-                            .foregroundStyle(.white)
-                            .padding(.top, 37)
-                            .transition(.opacity)
-                        }
-                    }
-                    .animation(reduceMotion ? nil : .smooth(duration: 0.27), value: expanded)
-
-                    RoundedRectangle(cornerRadius: 11)
-                        .fill(.black)
-                        .frame(width: hardwareWidth, height: 21)
+                    previewBackdrop
+                    panel
+                        .scaleEffect(scale, anchor: .top)
+                        .frame(width: proxy.size.width, alignment: .top)
+                        .padding(.top, 12)
                 }
             }
-            .frame(height: 94)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .accessibilityHidden(true)
-            if desktopRefractionEnabled {
-                Text("Desktop refraction is shown on the actual notch.")
-                    .font(.caption).foregroundStyle(.secondary)
+            .frame(height: max(163, shellHeight + 23))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16).strokeBorder(.primary.opacity(0.11))
+                    .allowsHitTesting(false)
             }
         }
-        .padding(10)
-        .background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 15))
-        .overlay { RoundedRectangle(cornerRadius: 15).strokeBorder(.primary.opacity(0.08)) }
+        .environmentObject(model)
+        .onChange(of: display, initial: true) { _, metrics in
+            model.screenUUID = metrics.screenUUID
+            model.closedNotchSize = metrics.closedSize
+            model.usesSystemIslandTrigger = metrics.systemCompanion
+            model.systemIslandWidth = metrics.islandWidth
+            model.setSettingsPreviewExpanded(expanded)
+        }
+        .onChange(of: page) { _, _ in
+            model.selectedAgentID = nil
+            model.agentListExtraHeight = 0
+            model.setSettingsPreviewExpanded(expanded)
+        }
+        .onChange(of: shelfEnabled) { _, enabled in
+            if !enabled && page == .shelf { page = .music }
+        }
+        .task(id: hovering && !expanded && openOnHover && !blocksHoverUntilExit) {
+            guard hovering, !expanded, openOnHover, !blocksHoverUntilExit else { return }
+            try? await Task.sleep(for: .seconds(max(0, hoverDuration)))
+            if !Task.isCancelled, hovering, !expanded, !blocksHoverUntilExit { setExpanded(true) }
+        }
+        .onChange(of: musicLightActive, initial: true) { _, active in musicSignal.setActive(active) }
+        .onDisappear { musicSignal.setActive(false) }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("harbor-live-notch-preview")
+    }
+
+    private var previewBackdrop: some View {
+        ZStack {
+            LinearGradient(colors: [Color(white: 0.29), Color(white: 0.83)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+            Canvas { context, size in
+                for offset in stride(from: -size.height, to: size.width, by: 23) {
+                    var line = Path()
+                    line.move(to: CGPoint(x: offset, y: 0))
+                    line.addLine(to: CGPoint(x: offset + size.height, y: size.height))
+                    context.stroke(line, with: .color(.white.opacity(0.16)), lineWidth: 1)
+                }
+            }
+            .accessibilityHidden(true)
+        }
+    }
+
+    private var panel: some View {
+        let shape = NotchShape.panel(expanded: expanded)
+        let hardware = model.expandedHeaderSize
+        return ZStack(alignment: .top) {
+            NotchGlassBackground(
+                shape: shape, isExpanded: expanded, reduceTransparency: reduceTransparency,
+                headerHeight: hardware.height, hardwareWidth: hardware.width,
+                hoverAmount: hovering && !expanded ? 1 : 0,
+                usesSharedGlassShell: usesGlass,
+                tint: page == .music && music.isPlaying ? Color(nsColor: music.avgColor) : nil,
+                glassEnabled: glassEnabled, lightIntensity: lightIntensity,
+                musicSignal: musicLightActive && musicSignal.audible ? musicSignal : nil,
+                desktopRefractionEnabled: desktopRefractionEnabled,
+                keepsAgentConversationContrast: page == .agent && model.agentDetailExpanded,
+                usesDarkGlassAppearance: colorScheme == .dark, transparency: transparency,
+                previewCaptureSize: CGSize(width: model.expandedPanelWidth, height: max(1, shellHeight))
+            )
+            .environment(\.colorScheme, inkScheme)
+            .shadow(color: .black.opacity(enableShadow && !(usesGlass && NotchOpticalSupport.isAvailable) ? 0.18 : 0),
+                    radius: 8, y: 3)
+
+            if expanded {
+                VStack(spacing: BoringViewModel.expandedPageTopInset) {
+                    BoringHeader(cameraClearanceWidth: (model.usesSystemIslandTrigger
+                                    ? model.systemIslandClearanceWidth : hardware.width) + 4,
+                                 headerHeight: hardware.height, previewPage: $page)
+                        .environment(\.colorScheme, inkScheme)
+                        .zIndex(2)
+                    NotchPageContent(page: page, albumArtNamespace: artwork,
+                                     viewportHeight: model.expandedPageSize.height, previewColorScheme: colorScheme,
+                                     selectedID: Binding(get: { model.selectedAgentID }, set: selectAgent),
+                                     agentHeightChanged: updateAgentHeight,
+                                     refreshWeather: { NotificationCenter.default.post(name: .notchPreviewRefreshWeather, object: nil) },
+                                     onClipboardCopy: {})
+                        .id(page)
+                        .frame(width: model.expandedPageSize.width, height: model.expandedPageSize.height, alignment: .top)
+                        .clipped()
+                        .transition(.opacity)
+                }
+                .frame(width: model.expandedPageSize.width)
+                .environment(\.colorScheme, inkScheme)
+                .environment(\.usesSharedGlassShell, usesGlass)
+                .animation(reduceMotion ? nil : .smooth(duration: 0.21), value: page)
+                .transition(reduceMotion ? .opacity : .modifier(active: NotchContentReveal(progress: 0),
+                                                                identity: NotchContentReveal(progress: 1)))
+            }
+
+            Button { setExpanded(!expanded) } label: {
+                UnevenRoundedRectangle(bottomLeadingRadius: 10, bottomTrailingRadius: 10)
+                    .fill(.black)
+                    .frame(width: hardware.width, height: hardware.height)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(expanded ? "Collapsed" : "Expanded")
+            .accessibilityIdentifier("harbor-preview-notch")
+        }
+        .frame(width: shellWidth, height: max(1, shellHeight), alignment: .top)
+        .notchPageSwipe(isEnabled: { expanded && gesturesEnabled && !model.isMusicScrubbing }, acceptsPoint: { point, bounds in
+            shape.path(in: bounds).contains(point)
+        }, action: { step in
+            guard let next = page.neighbor(step: step, shelfEnabled: shelfEnabled) else { return false }
+            page = next
+            return true
+        })
+        .onHover { inside in
+            if !inside { blocksHoverUntilExit = false }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) { hovering = inside }
+        }
+    }
+
+    private func setExpanded(_ opening: Bool) {
+        if !opening && hovering { blocksHoverUntilExit = true }
+        withAnimation(reduceMotion ? nil : NotchPanelMotion.presentation()) {
+            expanded = opening
+            model.setSettingsPreviewExpanded(opening)
+        }
+    }
+
+    private func selectAgent(_ id: String?) {
+        guard expanded, page == .agent else { return }
+        withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
+            model.selectedAgentID = id
+            model.notchSize = model.expandedNotchSize
+        }
+    }
+
+    private func updateAgentHeight(_ height: CGFloat) {
+        guard expanded, page == .agent else { return }
+        let required = model.expandedHeaderSize.height + BoringViewModel.expandedPageTopInset
+            + BoringViewModel.expandedBottomInset + AgentSessionListMetrics.height(for: AgentSessionListMetrics.compactCount) + height
+        let extra = height > 0 ? max(height, required - BoringViewModel.regularPanelHeight) : 0
+        guard model.agentListExtraHeight != extra else { return }
+        withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
+            model.agentListExtraHeight = extra
+            model.notchSize = model.expandedNotchSize
+        }
     }
 }
 
 struct Appearance: View {
-    var accent = Color.effectiveAccent
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Default(.appAppearance) private var appearance
     @Default(.mirrorShape) var mirrorShape
@@ -1306,6 +1443,9 @@ struct Appearance: View {
     @Default(.sliderColor) var sliderColor
     @Default(.siriGlassEnabled) var siriGlassEnabled
     @Default(.siriGlassIntensity) var siriGlassIntensity
+    @Default(.siriGlassTransparency) private var transparency
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Namespace private var themeSelection
     @Default(.desktopRefractionEnabled) private var desktopRefractionEnabled
     @State private var requestingRefractionAccess = false
     @State private var refractionNeedsPermission = false
@@ -1316,17 +1456,39 @@ struct Appearance: View {
     }
 
     private var themeOptions: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 3) {
             ForEach(HarborAppearance.allCases, id: \.self) { mode in
-                Button { appearance = mode } label: {
-                    appearanceTile(mode)
+                Button {
+                    withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.85)) {
+                        SettingsWindowController.shared.switchAppearance(to: mode, animated: !reduceMotion)
+                    }
+                } label: {
+                    let symbol = switch mode {
+                    case .system: "display"
+                    case .light: "sun.max"
+                    case .dark: "moon"
+                    }
+                    Label(appearanceTitle(mode), systemImage: symbol)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, minHeight: 34)
+                        .background {
+                            if appearance == mode {
+                                Capsule()
+                                    .fill(Color(nsColor: .controlBackgroundColor))
+                                    .shadow(color: .black.opacity(0.15), radius: 3, y: 1)
+                                    .matchedGeometryEffect(id: "theme", in: themeSelection)
+                            }
+                        }
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(appearanceTitle(mode))
+                .buttonStyle(HarborSettingsPressStyle())
                 .accessibilityAddTraits(appearance == mode ? .isSelected : [])
                 .accessibilityIdentifier("harbor-appearance-\(mode.rawValue)")
             }
         }
+        .padding(3)
+        .background(.primary.opacity(0.065), in: Capsule())
     }
 
     private func appearanceTitle(_ mode: HarborAppearance) -> LocalizedStringKey {
@@ -1334,44 +1496,6 @@ struct Appearance: View {
         case .system: "Follow System"
         case .light: "Light"
         case .dark: "Dark"
-        }
-    }
-
-    private func appearanceTile(_ mode: HarborAppearance) -> some View {
-        let selected = appearance == mode
-        let shape = RoundedRectangle(cornerRadius: 9)
-        return VStack(spacing: 5) {
-            HStack(spacing: 0) {
-                if mode != .dark { appearanceSwatch(dark: false) }
-                if mode != .light { appearanceSwatch(dark: true) }
-            }
-            .frame(height: 26)
-            .clipShape(RoundedRectangle(cornerRadius: 5))
-            .accessibilityHidden(true)
-            Text(appearanceTitle(mode))
-                .font(.caption.weight(selected ? .semibold : .medium))
-                .lineLimit(1)
-        }
-        .padding(5)
-        .frame(maxWidth: .infinity)
-        .background(selected ? accent.opacity(0.14) : .clear, in: shape)
-        .overlay { shape.strokeBorder(selected ? accent.opacity(0.65) : .primary.opacity(0.10)) }
-        .contentShape(shape)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: selected)
-    }
-
-    private func appearanceSwatch(dark: Bool) -> some View {
-        ZStack(alignment: .top) {
-            LinearGradient(colors: dark ? [Color(white: 0.24), Color(white: 0.10)]
-                                        : [Color(white: 0.82), Color(white: 0.97)],
-                           startPoint: .top, endPoint: .bottom)
-            UnevenRoundedRectangle(bottomLeadingRadius: 4, bottomTrailingRadius: 4)
-                .fill(dark ? Color(white: 0.07) : Color(white: 0.25))
-                .frame(width: 20, height: 5)
-            Capsule()
-                .fill(dark ? .white.opacity(0.20) : .black.opacity(0.20))
-                .frame(width: 30, height: 2)
-                .padding(.top, 13)
         }
     }
 
@@ -1396,6 +1520,18 @@ struct Appearance: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Slider(value: $transparency, in: 0...1, step: 0.01) {
+                    HStack {
+                        Label("Glass transparency", systemImage: "circle.lefthalf.filled")
+                        Spacer()
+                        Text(transparency, format: .percent.precision(.fractionLength(0)))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityIdentifier("harbor-glass-transparency")
+                .disabled(!siriGlassEnabled || reduceTransparency)
+
                 Slider(value: $siriGlassIntensity, in: 0...1, step: 0.05) {
                     HStack {
                         Text("光效强度")
@@ -1475,7 +1611,7 @@ struct Appearance: View {
                 }
             }
         }
-        .accentColor(.effectiveAccent)
+        .tint(.primary)
         .navigationTitle("Appearance")
     }
 
@@ -1814,13 +1950,22 @@ func warningBadge(_ text: LocalizedStringKey, _ description: LocalizedStringKey)
 }
 
 private struct AgentSuggestionSettings: View {
+    @AppStorage(AgentCompletionHaloSettings.durationKey) private var completionHaloDuration = AgentCompletionHaloSettings.defaultDuration
     @AppStorage(AgentVoiceEngine.preferenceKey) private var voiceEngine = AgentVoiceEngine.onDevice
     @AppStorage(AgentReplyMotionSettings.enabledKey) private var headReplies = false
     @AppStorage(AgentReplyMotionSettings.testedKey) private var headRepliesTested = false
-    @AppStorage(AgentSuggestionAPI.enabledKey) private var useAPI = false
+    @AppStorage(AgentQuickReplySource.preferenceKey) private var quickReplySource = AgentQuickReplySource.current
+    @AppStorage(AgentQuickReplySource.customRepliesKey) private var customReplyData = Data()
     @AppStorage(AgentSuggestionAPI.endpointKey) private var savedEndpoint = ""
     @AppStorage(AgentSuggestionAPI.modelKey) private var savedModel = ""
     @AppStorage(AgentSuggestionAPI.autoGenerateKey) private var autoGenerate = false
+    private struct CustomReplyDraft: Identifiable {
+        let id = UUID()
+        var title = ""
+        var body = ""
+    }
+
+    @State private var customReplies: [CustomReplyDraft] = []
     @State private var endpoint = ""
     @State private var model = ""
     @State private var newKey = ""
@@ -1829,12 +1974,31 @@ private struct AgentSuggestionSettings: View {
 
     var body: some View {
         Form {
-            Section("快捷回复建议") {
-                Picker("建议来源", selection: $useAPI) {
-                    Text("本机 Agent").tag(false)
-                    Text("兼容 API").tag(true)
+            Section("任务完成提醒") {
+                HStack(spacing: 12) {
+                    Slider(value: $completionHaloDuration, in: AgentCompletionHaloSettings.durationRange, step: 1) {
+                        Label("完成流光时长", systemImage: "sparkle")
+                    }
+                    Group {
+                        if completionHaloDuration == 0 { Text("关闭流光") }
+                        else { Text("\(Int(completionHaloDuration)) 秒") }
+                    }
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                        .accessibilityHidden(true)
                 }
-                if useAPI {
+                Text("完成弹窗收起后显示流光。调到 0 可关闭。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("快捷回复建议") {
+                Picker("快捷回复来源", selection: $quickReplySource) {
+                    Text("默认快捷回复").tag(AgentQuickReplySource.standard)
+                    Text("兼容 API").tag(AgentQuickReplySource.api)
+                    Text("自定义快捷回复").tag(AgentQuickReplySource.custom)
+                }
+                if quickReplySource == .api {
                     TextField("API 地址", text: $endpoint, prompt: Text(verbatim: "https://api.openai.com/v1"))
                     TextField("模型名称", text: $model)
                     SecureField("API 密钥", text: $newKey, prompt: Text(LocalizedStringKey(hasKey ? "已保存，留空保留" : "输入密钥")))
@@ -1852,9 +2016,14 @@ private struct AgentSuggestionSettings: View {
                     Text("生成建议时会把当前会话的最近 6 条可见消息发送给所选 API。密钥存储在钥匙串中。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Text("弹窗等待 API 最多 4 秒，随后使用默认快捷回复。关闭自动生成时，可在会话详情手动生成。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     if let status {
                         Text(LocalizedStringKey(status)).font(.caption).foregroundStyle(.secondary)
                     }
+                } else if quickReplySource == .custom {
+                    customReplyEditor
                 }
             }
             Section("Agent 语音回复") {
@@ -1904,7 +2073,56 @@ private struct AgentSuggestionSettings: View {
             endpoint = savedEndpoint
             model = savedModel
             hasKey = AgentSuggestionAPI.key() != nil
+            customReplies = AgentQuickReplySource.customReplies(from: customReplyData).map {
+                CustomReplyDraft(title: $0.title, body: $0.body)
+            }
         }
+    }
+
+    @ViewBuilder
+    private var customReplyEditor: some View {
+        ForEach($customReplies) { $reply in
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    TextField("短标题（选填）", text: $reply.title)
+                    Button(role: .destructive) {
+                        let id = reply.id
+                        customReplies.removeAll { $0.id == id }
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("移除此回复")
+                }
+                TextField("发送给 Agent 的完整回复", text: $reply.body, axis: .vertical)
+                    .lineLimit(2...4)
+            }
+        }
+        HStack {
+            Button {
+                customReplies.append(CustomReplyDraft())
+            } label: {
+                Label("添加快捷回复", systemImage: "plus")
+            }
+            .disabled(customReplies.count >= AgentQuickReplySource.maximumChoices)
+            Spacer()
+            Button("保存快捷回复") {
+                let options = normalizedCustomReplies
+                guard let encoded = try? JSONEncoder().encode(options) else { return }
+                customReplyData = encoded
+                customReplies = options.map { CustomReplyDraft(title: $0.title, body: $0.body) }
+            }
+            .disabled(normalizedCustomReplies == AgentQuickReplySource.customReplies(from: customReplyData))
+        }
+        Text("最多添加三条。留空的回复不会显示。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private var normalizedCustomReplies: [AgentReplyOption] {
+        AgentQuickReplySource.normalizedCustomReplies(customReplies.map {
+            AgentReplyOption(title: $0.title, body: $0.body)
+        })
     }
 
     private func save() {

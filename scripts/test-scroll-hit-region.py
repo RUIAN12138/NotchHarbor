@@ -7,7 +7,9 @@ root = Path(__file__).resolve().parents[1]
 source = (root / 'boringNotch/extensions/PanGesture.swift').read_text()
 region = source[source.index('enum NotchScrollHitRegion {'):source.index('\nprivate struct ScrollMonitor:')]
 swipe = source[source.index('struct NotchPageSwipe {'):source.index('\nprivate struct NotchPageSwipeMonitor:')]
-harness = 'import AppKit\n' + region + '\n' + swipe + '''
+activity = (root / 'boringNotch/components/Notch/UnifiedActivities.swift').read_text()
+edges = activity.split('// === AGENT_TRANSCRIPT_EDGES_BEGIN ===', 1)[1].split('private struct AgentTranscriptEdgeFade:', 1)[0]
+harness = 'import AppKit\n' + region + '\n' + swipe + edges + '''
 let app = NSApplication.shared
 app.setActivationPolicy(.prohibited)
 let detached = NSView(frame: CGRect(x: 0, y: 0, width: 500, height: 32))
@@ -38,6 +40,33 @@ strip.removeFromSuperview()
 assert(!NotchScrollHitRegion.contains(eventWindow: window, locationInWindow: CGPoint(x: 269, y: 437), in: strip))
 window.close()
 other.close()
+var nested = NotchScrollOwnership()
+assert(!nested.update(phase: .began, momentum: [], inside: false))
+assert(!nested.update(phase: .changed, momentum: [], inside: true))
+assert(!nested.update(phase: .ended, momentum: [], inside: true))
+assert(!nested.update(phase: [], momentum: .changed, inside: true))
+assert(nested.update(phase: .began, momentum: [], inside: true))
+assert(nested.update(phase: .changed, momentum: [], inside: false))
+assert(nested.update(phase: .ended, momentum: [], inside: false))
+assert(nested.update(phase: [], momentum: .changed, inside: false))
+assert(nested.update(phase: [], momentum: .ended, inside: false))
+assert(!nested.update(phase: [], momentum: .changed, inside: true))
+assert(nested.update(phase: [], momentum: [], inside: true))
+assert(!nested.update(phase: [], momentum: [], inside: false))
+assert(nested.update(phase: .began, momentum: [], inside: true))
+assert(nested.update(phase: .cancelled, momentum: [], inside: false))
+assert(!nested.update(phase: .changed, momentum: [], inside: true))
+print("PASS: nested scrollers retain ownership through boundary crossing and momentum")
+assert(AgentTranscriptEdges.visible(offset: -4, contentHeight: 50, viewportHeight: 100,
+                                    topInset: 4, bottomInset: 8) == .init(top: false, bottom: false))
+assert(AgentTranscriptEdges.visible(offset: -4, contentHeight: 300, viewportHeight: 100,
+                                    topInset: 4, bottomInset: 8) == .init(top: false, bottom: true))
+assert(AgentTranscriptEdges.visible(offset: 72, contentHeight: 300, viewportHeight: 100,
+                                    topInset: 4, bottomInset: 8) == .init(top: true, bottom: true))
+assert(AgentTranscriptEdges.visible(offset: 208, contentHeight: 300, viewportHeight: 100,
+                                    topInset: 4, bottomInset: 8) == .init(top: true, bottom: false))
+print("PASS: transcript fades only the overflowing edge; fully visible lines keep their contrast")
+
 var gesture = NotchPageSwipe()
 assert(gesture.update(phase: .began, momentum: [], fingerX: 0, deltaY: 0, canStart: true) == .forward)
 assert(gesture.update(phase: .changed, momentum: [], fingerX: -40, deltaY: 1, canStart: true) == .switchPage(1))

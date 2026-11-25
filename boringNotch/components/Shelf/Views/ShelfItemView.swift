@@ -13,11 +13,9 @@ import QuickLook
 
 struct ShelfItemView: View {
     let item: ShelfItem
-    @EnvironmentObject var vm: BoringViewModel
     @ObservedObject var selection = ShelfSelectionModel.shared
     @StateObject private var viewModel: ShelfItemViewModel
     @EnvironmentObject private var quickLookService: QuickLookService
-    @State private var showStack = false
     @State private var cachedPreviewImage: NSImage?
     @State private var debouncedDropTarget = false
 
@@ -33,8 +31,12 @@ struct ShelfItemView: View {
         ZStack {
             if !shouldHideDuringDrag {
                 VStack(alignment: .center, spacing: 2) {
-                    iconView
-                    textView
+                    if viewModel.isRenaming {
+                        renameEditor
+                    } else {
+                        iconView
+                        textView
+                    }
                 }
                 .frame(width: 105)
                 .padding(.vertical, 4)
@@ -44,18 +46,20 @@ struct ShelfItemView: View {
                 .animation(.easeInOut(duration: 0.1), value: debouncedDropTarget)
                 .animation(.easeInOut(duration: 0.1), value: isSelected)
 
-                DraggableClickHandler(
-                    item: item,
-                    viewModel: viewModel,
-                    cachedPreviewImage: $cachedPreviewImage,
-                    dragPreviewContent: {
-                        DragPreviewView(thumbnail: viewModel.thumbnail ?? item.icon, displayName: item.displayName)
-                    },
-                    onRightClick: viewModel.handleRightClick,
-                    onClick: { event, nsview in
-                        viewModel.handleClick(event: event, view: nsview)
-                    }
-                )
+                if !viewModel.isRenaming {
+                    DraggableClickHandler(
+                        item: item,
+                        viewModel: viewModel,
+                        cachedPreviewImage: $cachedPreviewImage,
+                        dragPreviewContent: {
+                            DragPreviewView(thumbnail: viewModel.thumbnail ?? item.icon, displayName: item.displayName)
+                        },
+                        onRightClick: viewModel.handleRightClick,
+                        onClick: { event, nsview in
+                            viewModel.handleClick(event: event, view: nsview)
+                        }
+                    )
+                }
             } else {
                 Color.clear
                     .frame(width: 105)
@@ -64,7 +68,6 @@ struct ShelfItemView: View {
             }
         }
         .onChange(of: viewModel.isDropTargeted) { _, targeted in
-            vm.dragDetectorTargeting = targeted
             // Debounce drop target state changes
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(50))
@@ -83,6 +86,9 @@ struct ShelfItemView: View {
                 quickLookService.show(urls: urls, selectFirst: true)
             }
         }
+        .onChange(of: item) { _, _ in
+            Task { cachedPreviewImage = await renderDragPreview() }
+        }
         .onChange(of: viewModel.thumbnail) { _, _ in
             // Invalidate cached preview when thumbnail changes
             Task {
@@ -93,6 +99,35 @@ struct ShelfItemView: View {
     }
 
     // MARK: - View Components
+
+    private var renameEditor: some View {
+        VStack(spacing: 3) {
+            Group {
+                if viewModel.renameNeedsFolderAccess {
+                    Button("授权文件夹") { viewModel.requestRenameFolderAccess() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                } else if let error = viewModel.renameError {
+                    Text(error)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .help(error)
+                } else {
+                    Image(systemName: "pencil")
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(height: 29)
+
+            ShelfRenameField(name: viewModel.draftTitle, submit: viewModel.commitRename,
+                             cancel: viewModel.cancelRename)
+                .frame(height: 22)
+                .padding(.horizontal, 2)
+        }
+        .frame(height: 68)
+    }
 
     private var iconView: some View {
         Image(nsImage: viewModel.thumbnail ?? item.icon)
@@ -166,6 +201,89 @@ struct ShelfItemView: View {
     }
 
     
+}
+
+private struct ShelfRenameField: NSViewRepresentable {
+    let name: String
+    let submit: (String) -> Void
+    let cancel: () -> Void
+
+    final class Input: NSTextField {
+        weak var editingPanel: BoringNotchSkyLightWindow?
+
+        override var needsPanelToBecomeKey: Bool { true }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else { return }
+            DispatchQueue.main.async { [weak self] in self?.beginEditing(selectBasename: true) }
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            beginEditing(selectBasename: false)
+            super.mouseDown(with: event)
+        }
+
+        private func beginEditing(selectBasename: Bool) {
+            guard let panel = window as? BoringNotchSkyLightWindow,
+                  panel.beginShelfRenameEditing(self) else { return }
+            editingPanel = panel
+            guard selectBasename, let editor = currentEditor() else { return }
+            let fileExtension = (stringValue as NSString).pathExtension
+            let basename = fileExtension.isEmpty ? stringValue : (stringValue as NSString).deletingPathExtension
+            editor.selectedRange = NSRange(location: 0, length: basename.utf16.count)
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var field: ShelfRenameField
+        init(_ field: ShelfRenameField) { self.field = field }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
+            guard !textView.hasMarkedText() else { return false }
+            if command == #selector(NSResponder.insertNewline(_:)) {
+                field.submit(textView.string)
+                return true
+            }
+            if command == #selector(NSResponder.cancelOperation(_:)) {
+                field.cancel()
+                return true
+            }
+            return false
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            guard let input = notification.object as? Input else { return }
+            DispatchQueue.main.async { [weak input] in
+                guard let input, input.currentEditor() == nil else { return }
+                input.editingPanel?.endPanelTextEditing(input)
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> Input {
+        let input = Input()
+        input.delegate = context.coordinator
+        input.stringValue = name
+        input.font = .systemFont(ofSize: 12)
+        input.usesSingleLineMode = true
+        input.setAccessibilityLabel(String(localized: "文件名"))
+        input.setAccessibilityIdentifier("shelf-rename-input")
+        input.toolTip = String(localized: "按回车保存，按 Escape 取消")
+        return input
+    }
+
+    func updateNSView(_ input: Input, context: Context) {
+        context.coordinator.field = self
+    }
+
+    static func dismantleNSView(_ input: Input, coordinator: Coordinator) {
+        let panel = input.editingPanel
+        DispatchQueue.main.async { [weak panel] in panel?.endPanelTextEditing(input) }
+    }
 }
 
 // MARK: - Draggable Click Handler with NSDraggingSource

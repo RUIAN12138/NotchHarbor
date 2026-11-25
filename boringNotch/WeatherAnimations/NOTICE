@@ -1,6 +1,16 @@
-Meteocons animated weather icons by Bas Milius, MIT.
-https://github.com/basmilius/meteocons
+useAnimations weather icons (MIT).
+https://github.com/useAnimations/react-useanimations
+https://useanimations.com/categories/weather
 
-Unmodified line-style Lottie JSON from @meteocons/lottie 0.1.0 (npm).
-https://registry.npmjs.org/@meteocons/lottie/-/lottie-0.1.0.tgz
-See the accompanying LICENSE for the full license.
+Downloaded from https://useanimations.com/icons/<name>.json.
+The packaged copies add missing layer and shape names for native Lottie
+palette overrides. Paths, keyframes and source timing are unchanged.
+See LICENSE for the full license.
+
+SHA-256 of upstream downloads:
+cloud-lightning.json: 8159927843b11b264565215a41fceb016ee7f786984fd76b4042d75d10c63880
+cloud-rain.json: 08183cc33ea3f219fd018f05e8a303592541758e83a3c32f82ce7d0c72bb9735
+cloud-snow.json: e2be87d05be68715a2935f371be7d197dbd5f22cbc461d252acbd5b6080d0921
+sun.json: 5ad464eb5790118f4c2998eab4d33b871cac095947a5ea40c18b5dbe2ddebda1
+thermometer.json: 0f739ed2e59423a856f19c72a263b73e0e50393b05099014a95681a9b5a8ccfe
+wind.json: bb2cfa083fec387909345bfc0dde885ea3d389819403fb7f54f5e6be1e081678

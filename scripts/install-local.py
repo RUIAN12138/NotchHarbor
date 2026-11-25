@@ -39,11 +39,14 @@ def requirement(app):
     return next(line for line in output.splitlines() if line.startswith('designated =>'))
 
 def running_pids(app, executable):
-    prefix = str(app/'Contents/MacOS'/executable)
+    prefix = os.fsencode(app/'Contents/MacOS'/executable)
     matches = []
-    for line in subprocess.check_output(['ps','-axo','pid=,command='],text=True).splitlines():
-        pid, command = line.strip().split(maxsplit=1)
-        if command == prefix or command.startswith(prefix + ' '):
+    for line in subprocess.check_output(['ps','-axo','pid=,command=']).splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2:
+            continue
+        pid, command = fields
+        if command == prefix or command.startswith(prefix + b' '):
             matches.append(int(pid))
     return matches
 
@@ -94,12 +97,17 @@ with tempfile.TemporaryDirectory(dir='/Applications', prefix='.notch-harbor-') a
         candidate.rename(new)
         plist.write_bytes(plistlib.dumps(updated))
         run(lsregister, '-f', str(new), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Launch the replacement as a user open. Register the login job after
-        # the visible launch, so its RunAtLoad does not own the first open.
-        run('/usr/bin/open', str(new))
-        pid = int(subprocess.check_output([str(checker), str(new), '--window'], text=True))
+        # Check ordinary startup, then the login job and a repeated open.
+        for _ in range(4):
+            launch = subprocess.run(['/usr/bin/open', str(new)], capture_output=True)
+            if launch.returncode == 0:
+                break
+            time.sleep(1)
+        launch.check_returncode()
+        pid = int(subprocess.check_output([str(checker), str(new), '--quiet-launch'], text=True))
         bootstrap()
-        reopened = int(subprocess.check_output([str(checker), str(new), '--window'], text=True))
+        run('/usr/bin/open', str(new))
+        reopened = int(subprocess.check_output([str(checker), str(new), '--quiet-launch'], text=True))
         assert reopened == pid
         assert running_pids(new, executable) == [pid]
         run('codesign', '--verify', '--deep', '--strict', str(new))

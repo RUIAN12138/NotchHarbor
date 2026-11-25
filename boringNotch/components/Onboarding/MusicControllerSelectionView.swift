@@ -5,15 +5,19 @@
 //  Created by Alexander on 2025-06-23.
 //
 
-import SwiftUI
 import Defaults
-
+import SwiftUI
 
 struct MusicControllerSelectionView: View {
+    @Default(.settingsLanguage) private var settingsLanguage
     let onContinue: () -> Void
 
     @Default(.mediaController) var mediaController
-    
+
+    private var isEnglish: Bool {
+        settingsLanguage.lowercased().hasPrefix("en")
+    }
+
     private var availableMediaControllers: [MediaControllerType] {
         if MusicManager.shared.isNowPlayingDeprecated {
             return MediaControllerType.allCases.filter { $0 != .nowPlaying }
@@ -21,28 +25,33 @@ struct MusicControllerSelectionView: View {
             return MediaControllerType.allCases
         }
     }
-    
+
     @State private var selectedMediaController: MediaControllerType = Defaults[.mediaController]
-    
+
     var body: some View {
-        VStack(spacing: 20) {
-            Text("Choose a Music Source")
-                .font(.title)
+        VStack(spacing: 18) {
+            Text(isEnglish ? "Choose a Music Source" : "选择音乐播放源")
+                .font(.title2)
                 .fontWeight(.bold)
                 .padding(.top, 24)
 
-            Text("Select the music source you want to use. You can change this later in the app settings.")
-                .multilineTextAlignment(.center)
-                .font(.body)
-                .foregroundColor(.secondary)
-                .padding(.horizontal)
+            Text(
+                isEnglish
+                    ? "Select the media source for artwork and live lyrics. You can change this anytime in Settings."
+                    : "选择用于同步专辑封面与 Folia 逐词歌词的播放源，后续可随时在设置中切换。"
+            )
+            .multilineTextAlignment(.center)
+            .font(.body)
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 20)
 
             ScrollView {
                 VStack(spacing: 12) {
                     ForEach(availableMediaControllers) { controller in
                         ControllerOptionView(
                             controller: controller,
-                            isSelected: self.selectedMediaController == controller
+                            isSelected: self.selectedMediaController == controller,
+                            isEnglish: isEnglish
                         )
                         .onTapGesture {
                             self.selectedMediaController = controller
@@ -51,12 +60,9 @@ struct MusicControllerSelectionView: View {
                 }
                 .padding()
             }
-            //Disable scroll if there are 4 or fewer to avoid unnecessary scroll behavior
             .scrollDisabled(availableMediaControllers.count <= 4)
 
-//            Spacer()
-
-            Button("Continue", action: {
+            Button(isEnglish ? "Continue" : "下一步", action: {
                 self.mediaController = self.selectedMediaController
                 NotificationCenter.default.post(
                     name: Notification.Name.mediaControllerChanged,
@@ -64,9 +70,9 @@ struct MusicControllerSelectionView: View {
                 )
                 onContinue()
             })
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .padding(.bottom, 24)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .padding(.bottom, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
@@ -79,6 +85,7 @@ struct MusicControllerSelectionView: View {
 struct ControllerOptionView: View {
     let controller: MediaControllerType
     let isSelected: Bool
+    var isEnglish: Bool = false
 
     var body: some View {
         HStack(spacing: 16) {
@@ -92,17 +99,17 @@ struct ControllerOptionView: View {
                     .font(.headline)
                     .fontWeight(.semibold)
 
-                Text(controller.description)
+                Text(controller.localizedSummary(english: isEnglish))
                     .font(.subheadline)
                     .foregroundColor(.secondary)
-                
+
                 if controller == .youtubeMusic, let url = URL(string: "https://github.com/pear-devs/pear-desktop") {
-                    Link("View on GitHub: pear-devs/pear-desktop", destination: url)
+                    Link("GitHub: pear-devs/pear-desktop", destination: url)
                         .font(.subheadline)
                         .padding(.top, 2)
                 }
             }
-            
+
             Spacer()
         }
         .padding()
@@ -118,18 +125,29 @@ struct ControllerOptionView: View {
     }
 }
 
-
 extension MediaControllerType {
     var description: String {
+        localizedSummary(english: false)
+    }
+
+    func localizedSummary(english: Bool) -> String {
         switch self {
         case .nowPlaying:
-            return "Works with most media apps, including browsers, to detect what's playing. Note: This may be removed in a future macOS version."
+            return english
+                ? "Works automatically with system media apps, NetEase Music, QQ Music, Spotify, Apple Music, and browsers."
+                : "自动识别系统正在播放的媒体（支持 Apple Music、网易云音乐、QQ 音乐、Spotify 及浏览器）。"
         case .spotify:
-            return "Connects directly to the Spotify app."
+            return english
+                ? "Connects directly to the Spotify desktop app."
+                : "直接连接 Spotify 桌面客户端。"
         case .appleMusic:
-            return "Connects directly to the Apple Music app."
+            return english
+                ? "Connects directly to the macOS Music app."
+                : "直接连接 macOS 原生「音乐」应用。"
         case .youtubeMusic:
-            return "Requires a third-party client with API plugin enabled."
+            return english
+                ? "Requires pear-desktop client with API plugin enabled."
+                : "需配合启用了 API 插件的第三方客户端使用。"
         }
     }
 }

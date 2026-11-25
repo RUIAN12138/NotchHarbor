@@ -62,6 +62,26 @@ import Foundation
   precondition(foundLegacy?.lastPathComponent == legacy.lastPathComponent)
   let legacyPage = try AgentConversationHistory.page(file: legacy, source: .gemini, before: nil)
   precondition(legacyPage.messages.map(\.text) == ["legacy text"])
+  let brain = root.appendingPathComponent(identity.uuidString.lowercased())
+      .appendingPathComponent(".system_generated/logs")
+  try FileManager.default.createDirectory(at: brain, withIntermediateDirectories: true)
+  let transcript = brain.appendingPathComponent("transcript.jsonl")
+  try writeRows([
+      ["type": "USER_INPUT", "source": "USER_EXPLICIT", "status": "DONE", "content": "<USER_REQUEST>\nquestion\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal clock\n</ADDITIONAL_METADATA>"],
+      ["type": "PLANNER_RESPONSE", "source": "MODEL", "status": "DONE", "content": "tool narration", "tool_calls": [["name": "read"]]],
+      ["type": "PLANNER_RESPONSE", "source": "MODEL", "status": "DONE", "thinking": "hidden thought"],
+      ["type": "PLANNER_RESPONSE", "source": "MODEL", "status": "DONE", "content": "answer", "thinking": "hidden thought"],
+      ["type": "GENERIC", "source": "MODEL", "status": "DONE", "content": "Created At: 2026-11-21T18:15:14+08:00\nCompleted At: 2026-11-21T18:15:18+08:00\nCreated At: 2026-11-21T18:15:14+08:00"],
+      ["type": "GENERIC", "source": "MODEL", "status": "DONE", "content": "An older-format reply"],
+      ["type": "USER_INPUT", "source": "USER_EXPLICIT", "status": "DONE", "content": "<USER_REQUEST>\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal clock\n</ADDITIONAL_METADATA>"],
+      ["type": "GENERIC", "source": "MODEL", "status": "RUNNING", "content": "draft"]
+  ], transcript)
+  let antigravity = try AgentConversationHistory.find(in: root, source: .antigravity, id: identity)
+  precondition(antigravity == transcript.resolvingSymlinksInPath())
+  let antigravityPage = try AgentConversationHistory.page(file: transcript, source: .antigravity, before: nil)
+  precondition(antigravityPage.messages.map(\.text) == ["question", "answer", "An older-format reply"])
+  precondition(antigravityPage.messages.map(\.role) == ["user", "assistant", "assistant"])
+  print("PASS: Antigravity user question and text reply; tool calls and thinking skipped")
   print("PASS: Gemini full UUID lookup, JSONL checkpoint and append, patches, paging, thought filtering, legacy JSON")
   print("PASS: six visible messages, older pagination, no duplicates, 2 MB tool tail does not hide conversation")
  }

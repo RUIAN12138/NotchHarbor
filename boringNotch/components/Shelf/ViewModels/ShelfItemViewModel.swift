@@ -19,6 +19,9 @@ final class ShelfItemViewModel: ObservableObject {
     @Published var isDropTargeted: Bool = false
     @Published var isRenaming: Bool = false
     @Published var draftTitle: String = ""
+    @Published private(set) var renameError: String?
+    @Published private(set) var renameNeedsFolderAccess = false
+    private var renameFolderPicker: NSOpenPanel?
     private var sharingLifecycle: SharingLifecycleDelegate?
     private var quickShareLifecycle: SharingLifecycleDelegate?
     private var sharingAccessingURLs: [URL] = []
@@ -28,7 +31,6 @@ final class ShelfItemViewModel: ObservableObject {
 
     init(item: ShelfItem) {
         self.item = item
-        self.draftTitle = item.displayName
         Task { await loadThumbnail() }
     }
 
@@ -119,6 +121,64 @@ final class ShelfItemViewModel: ObservableObject {
     func handleDoubleClick() {
     let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
         for it in selected { ShelfActionService.open(it) }
+    }
+
+    func beginRename() {
+        guard let file = item.fileURL else { return }
+        draftTitle = file.lastPathComponent
+        renameError = nil
+        renameNeedsFolderAccess = false
+        isRenaming = true
+    }
+
+    func commitRename(_ name: String) {
+        draftTitle = name
+        do {
+            item = try ShelfStateViewModel.shared.renameFile(id: item.id, to: name)
+            cancelRename()
+        } catch {
+            let error = error as NSError
+            renameNeedsFolderAccess = error.domain == NSCocoaErrorDomain
+                && error.code == CocoaError.fileWriteNoPermission.rawValue
+            if renameNeedsFolderAccess {
+                renameError = String(localized: "需要文件所在文件夹的访问权限")
+            } else if error.domain == NSCocoaErrorDomain, error.code == CocoaError.fileWriteFileExists.rawValue {
+                renameError = String(localized: "文件夹里已有同名文件")
+            } else {
+                renameError = error.localizedDescription
+            }
+        }
+    }
+
+    func requestRenameFolderAccess() {
+        guard renameFolderPicker == nil, let folder = item.fileURL?.deletingLastPathComponent() else { return }
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.canCreateDirectories = false
+        picker.directoryURL = folder
+        picker.message = String(localized: "请选择此文件所在的文件夹，授权本次重命名")
+        picker.prompt = String(localized: "授权文件夹")
+        renameFolderPicker = picker
+        SharingStateManager.shared.beginInteraction()
+        picker.begin { [weak self] result in
+            defer { SharingStateManager.shared.endInteraction() }
+            guard let self else { return }
+            self.renameFolderPicker = nil
+            guard result == .OK, let granted = picker.url else { return }
+            guard granted.resolvingSymlinksInPath().standardizedFileURL.path ==
+                    folder.resolvingSymlinksInPath().standardizedFileURL.path else {
+                self.renameError = String(localized: "请选择文件所在的文件夹")
+                return
+            }
+            granted.accessSecurityScopedResource { _ in self.commitRename(self.draftTitle) }
+        }
+    }
+
+    func cancelRename() {
+        isRenaming = false
+        renameError = nil
+        renameNeedsFolderAccess = false
     }
 
     func shareItem(from view: NSView?, usingAirDrop: Bool = false) {
@@ -379,7 +439,9 @@ final class ShelfItemViewModel: ObservableObject {
             menu.addItem(compressItem)
         }
 
-        if selectedItems.count == 1, case .file(_) = item.kind { addMenuItem(title: "Rename") }
+        if selectedItems.count == 1, case .file = item.kind {
+            addMenuItem(title: String(localized: "重命名…"))
+        }
 
         // Always show "Copy" for all item types
         addMenuItem(title: "Copy")
@@ -504,9 +566,8 @@ final class ShelfItemViewModel: ObservableObject {
             case "AirDrop…":
                 viewModel.shareItem(from: view, usingAirDrop: true)
 
-            case "Rename":
-                let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
-                if selected.count == 1, let single = selected.first { showRenameDialog(for: single) }
+            case String(localized: "重命名…"):
+                viewModel.beginRename()
 
             case "Show in Finder":
                 let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
@@ -772,44 +833,6 @@ final class ShelfItemViewModel: ObservableObject {
                 // Keep binder/delegate alive until panel finishes
                 _ = binder
                 _ = chooserDelegate
-            }
-        }
-        
-        @MainActor
-        private func showRenameDialog(for item: ShelfItem) {
-            guard case let .file(bookmarkData) = item.kind else { return }
-            Task {
-                let bookmark = Bookmark(data: bookmarkData)
-                if let fileURL = bookmark.resolveURL() {
-                    // Start security-scoped access and keep it active until rename completes.
-                    let didStart = fileURL.startAccessingSecurityScopedResource()
-
-                    let savePanel = NSSavePanel()
-                    savePanel.title = "Rename File"
-                    savePanel.prompt = "Rename"
-                    savePanel.nameFieldStringValue = fileURL.lastPathComponent
-                    savePanel.directoryURL = fileURL.deletingLastPathComponent()
-                    savePanel.begin { response in
-                        if response == .OK, let newURL = savePanel.url {
-                            Task {
-                                do {
-                                    NSLog("🔐 Rename: moving from \(fileURL.path) to \(newURL.path) (securityScope=\(didStart))")
-
-                                    try FileManager.default.moveItem(at: fileURL, to: newURL)
-
-                                    if let newBookmark = try? Bookmark(url: newURL) {
-                                        ShelfStateViewModel.shared.updateBookmark(for: item, bookmark: newBookmark.data)
-                                    }
-                                } catch {
-                                    print("❌ Failed to rename file: \(error.localizedDescription)")
-                                }
-                                if didStart { fileURL.stopAccessingSecurityScopedResource() }
-                            }
-                        } else {
-                            if didStart { fileURL.stopAccessingSecurityScopedResource() }
-                        }
-                    }
-                }
             }
         }
         

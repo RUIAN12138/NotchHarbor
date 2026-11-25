@@ -3,7 +3,7 @@ import Darwin
 
 // Visible-message formats follow Agent Notch's ConversationParser (Apache-2.0).
 enum AgentConversationSource: String, Hashable, Sendable {
-    case codex, claude, gemini, antigravity
+    case codex, claude, gemini, antigravity, doubao
 
     var directory: String {
         switch self {
@@ -11,6 +11,7 @@ enum AgentConversationSource: String, Hashable, Sendable {
         case .claude: ".claude/projects"
         case .gemini: ".gemini/tmp"
         case .antigravity: ".gemini/antigravity/brain"
+        case .doubao: ""
         }
     }
     var appName: String {
@@ -19,13 +20,13 @@ enum AgentConversationSource: String, Hashable, Sendable {
         case .claude: "Claude"
         case .gemini: "Gemini CLI"
         case .antigravity: "Antigravity"
+        case .doubao: "豆包 CLI"
         }
     }
 
-    var supportsQuickReplies: Bool { self == .codex || self == .claude }
 
     var defaultDirectory: URL? {
-        guard let account = getpwuid(getuid()), let home = account.pointee.pw_dir else { return nil }
+        guard self != .doubao, let account = getpwuid(getuid()), let home = account.pointee.pw_dir else { return nil }
         return URL(fileURLWithPath: String(cString: home))
             .appending(path: directory, directoryHint: .isDirectory)
     }
@@ -82,6 +83,14 @@ enum AgentConversationHistory {
 
     static func find(in root: URL, source: AgentConversationSource, id: UUID) throws -> URL? {
         let resolved = root.resolvingSymlinksInPath().standardizedFileURL
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: resolved.path)
+            guard attributes[.type] as? FileAttributeType == .typeDirectory else { throw AccessError.noAccess }
+        } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
+            return nil
+        } catch {
+            throw AccessError.noAccess
+        }
         if source == .antigravity {
             let file = resolved.appendingPathComponent(id.uuidString.lowercased())
                 .appendingPathComponent(".system_generated/logs/transcript.jsonl")
@@ -300,22 +309,47 @@ enum AgentConversationHistory {
             role = type
             if let body = message["content"] as? String { text = body }
             else { text = plainText(message["content"] as? [[String: Any]] ?? []) }
+        case .doubao:
+            return nil
         case .gemini:
             return geminiMessage(row, offset: offset)
         case .antigravity:
             guard let body = row["content"] as? String, row["status"] as? String == "DONE" else { return nil }
             switch (type, row["source"] as? String) {
-            case ("USER_INPUT", "USER_EXPLICIT"): role = "user"
-            case ("GENERIC", "MODEL"): role = "assistant"
+            case ("USER_INPUT", "USER_EXPLICIT"):
+                role = "user"
+                text = antigravityUserText(body)
+            case ("GENERIC", "MODEL"):
+                // In desktop transcripts this type also stores tool execution receipts.
+                guard body.range(of: #"^\s*Created At:\s*\d{4}-\d{2}-\d{2}T[^\r\n]+\r?\n\s*Completed At:\s*\d{4}-\d{2}-\d{2}T"#,
+                                 options: .regularExpression) == nil else { return nil }
+                role = "assistant"
+                text = body
+            case ("PLANNER_RESPONSE", "MODEL"):
+                // Text-only replies also use this record type. Tool turns and
+                // the separate thinking field do not belong in the transcript.
+                guard row["tool_calls"] == nil || (row["tool_calls"] as? [Any])?.isEmpty == true else { return nil }
+                role = "assistant"
+                text = body
             default: return nil
             }
-            text = body
         }
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !clean.hasPrefix("<codex_internal_context"),
               !clean.hasPrefix("<environment_context"), !clean.hasPrefix("<command-name>"),
               !clean.hasPrefix("<local-command"), !clean.hasPrefix("Caveat:") else { return nil }
         return AgentConversationMessage(id: offset, role: role, text: clean)
+    }
+
+    private static func antigravityUserText(_ body: String) -> String {
+        let clean = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let opening = "<USER_REQUEST>"
+        guard clean.hasPrefix(opening) else { return clean }
+        let request = clean.dropFirst(opening.count)
+        let closing = request.range(of: #"</USER_REQUEST>\s*(?:<ADDITIONAL_METADATA>|<USER_SETTINGS_CHANGE>|$)"#,
+                                    options: .regularExpression)
+        let end = closing?.lowerBound ?? request.range(of: "<ADDITIONAL_METADATA>")?.lowerBound
+        return String(request[..<(end ?? request.endIndex)])
     }
 
     private static func visiblePhase(_ value: Any?) -> Bool {

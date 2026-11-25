@@ -96,6 +96,40 @@ final class ShelfStateViewModel: ObservableObject {
         }
     }
 
+    func renameFile(id: ShelfItem.ID, to name: String) throws -> ShelfItem {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              name != ".", name != "..",
+              !name.contains("/"), !name.contains(":"), !name.contains("\0") else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              case .file(let data) = items[index].kind,
+              let source = Bookmark(data: data).resolveURL() else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        guard source.lastPathComponent != name else { return items[index] }
+        let destination = source.deletingLastPathComponent().appendingPathComponent(name)
+        try source.accessSecurityScopedResource { source in
+            try FileManager.default.moveItem(at: source, to: destination)
+            do {
+                let data = try Bookmark(url: destination).data
+                pendingBookmarkUpdates.removeValue(forKey: id)
+                items[index].kind = .file(bookmark: data)
+            } catch {
+                // An open bookmark can still track the same file after a rename.
+                let moved = Bookmark(data: data).resolve()
+                if moved.url?.standardizedFileURL.path == destination.standardizedFileURL.path {
+                    pendingBookmarkUpdates.removeValue(forKey: id)
+                    items[index].kind = .file(bookmark: moved.refreshedData ?? data)
+                } else {
+                    try FileManager.default.moveItem(at: destination, to: source)
+                    throw error
+                }
+            }
+        }
+        return items[index]
+    }
+
     private func scheduleDeferredBookmarkUpdate(for item: ShelfItem, bookmark: Data) {
         pendingBookmarkUpdates[item.id] = bookmark
         

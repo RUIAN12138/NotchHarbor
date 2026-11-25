@@ -7,6 +7,7 @@
 import AppKit
 import Combine
 import Defaults
+import OSLog
 import SwiftUI
 
 let defaultImage: NSImage = .init(
@@ -24,6 +25,7 @@ class MusicManager: ObservableObject {
     private var lyricsRequestID = UUID()
     private var lyricsTrackKey: String?
     private var lyricsAttemptAt = Date.distantPast
+    private let lyricsLogger = Logger(subsystem: "app.notchharbor", category: "Lyrics")
 
     // Helper to check if macOS has removed support for NowPlayingController
     @Published public private(set) var isNowPlayingDeprecated: Bool = false
@@ -368,14 +370,15 @@ class MusicManager: ObservableObject {
     }
 
     @MainActor
-    private func fetchLyricsIfAvailable(bundleIdentifier: String?, title: String, artist: String, album: String, duration: TimeInterval) {
+    private func fetchLyricsIfAvailable(bundleIdentifier: String?, title: String, artist: String, album: String,
+                                        duration: TimeInterval, retry: Bool = false) {
         let seconds = duration.isFinite ? min(864_000, max(0, duration)) : 0
         let key = [bundleIdentifier ?? "", title, artist, album, String(Int(seconds))].joined(separator: "\u{1F}")
         guard Defaults[.enableLyrics], isSong, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             resetLyrics()
             return
         }
-        if key == lyricsTrackKey && (isFetchingLyrics || !syncedLyrics.isEmpty || Date().timeIntervalSince(lyricsAttemptAt) < 30) { return }
+        if key == lyricsTrackKey && (isFetchingLyrics || !syncedLyrics.isEmpty || (!retry && Date().timeIntervalSince(lyricsAttemptAt) < 30)) { return }
         lyricsTask?.cancel()
         let requestID = UUID()
         lyricsRequestID = requestID
@@ -431,11 +434,19 @@ class MusicManager: ObservableObject {
                 self.sourceTimedLyrics = self.parseLRC(lrc)
                 if !self.syncedLyrics.isEmpty {
                     self.isFetchingLyrics = false
+                    self.lyricsLogger.info("Loaded \(self.syncedLyrics.count, privacy: .public) timed lines from NetEase")
                     return
                 }
             }
             guard self.lyricsRequestID == requestID, !Task.isCancelled else { return }
             await self.fetchLyricsFromWeb(title: title, artist: artist, duration: duration, requestID: requestID)
+            guard !retry, self.lyricsRequestID == requestID, self.syncedLyrics.isEmpty else { return }
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, self.lyricsRequestID == requestID, self.syncedLyrics.isEmpty, self.isPlaying else {
+                return
+            }
+            self.fetchLyricsIfAvailable(bundleIdentifier: bundleIdentifier, title: title, artist: artist,
+                                       album: album, duration: duration, retry: true)
         }
     }
 
@@ -448,7 +459,8 @@ class MusicManager: ObservableObject {
             address.path = path
             address.queryItems = query
             guard let url = address.url else { throw URLError(.badURL) }
-            let (data, response) = try await URLSession.shared.data(for: URLRequest(url: url, timeoutInterval: 7))
+            let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+            let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                   data.count <= 2_000_000,
                   let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -456,23 +468,29 @@ class MusicManager: ObservableObject {
             }
             return json
         }
-        do {
-            let result = try await get("/api/search/get", [
-                .init(name: "s", value: title + " " + artist), .init(name: "type", value: "1"),
+        let queries = [
+            (path: "/api/search/get", term: title + " " + artist),
+            (path: "/api/cloudsearch/pc", term: title)
+        ]
+        var attempted = Set<Int>()
+        for query in queries {
+            guard !Task.isCancelled else { return nil }
+            let result = try? await get(query.path, [
+                .init(name: "s", value: query.term), .init(name: "type", value: "1"),
                 .init(name: "limit", value: "12")
             ])
-            let songs = (result["result"] as? [String: Any])?["songs"] as? [[String: Any]] ?? []
+            let songs = (result?["result"] as? [String: Any])?["songs"] as? [[String: Any]] ?? []
             let ids = LyricsRecordSelection.netEaseIDs(songs, title: title, artist: artist, album: album, duration: duration)
-            for id in ids.prefix(3) {
-                try Task.checkCancellation()
+            for id in ids.prefix(3) where attempted.insert(id).inserted {
+                guard !Task.isCancelled else { return nil }
                 guard let lyric = try? await get("/api/song/lyric", [
                     .init(name: "id", value: String(id)), .init(name: "lv", value: "1")
                 ]), let lrc = (lyric["lrc"] as? [String: Any])?["lyric"] as? String,
                       MusicLyricText.parse(lrc).contains(where: { !$0.text.isEmpty }) else { continue }
                 return lrc
             }
-            return nil
-        } catch { return nil }
+        }
+        return nil
     }
 
     @MainActor
@@ -496,6 +514,7 @@ class MusicManager: ObservableObject {
             let plain = (record["plainLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let synced = (record["syncedLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let timed = parseLRC(synced)
+            if !timed.isEmpty { lyricsLogger.info("Loaded \(timed.count, privacy: .public) timed lines from LRCLIB") }
             if !timed.isEmpty || currentLyrics.isEmpty {
                 currentLyrics = MusicLyricText.simplified(plain.isEmpty ? synced : plain)
             }
@@ -699,18 +718,18 @@ class MusicManager: ObservableObject {
     }
 
     func forceUpdate() {
-        // Request immediate update from the active controller
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
-            if let controller = preferredController ?? activeController, controller.isActive() {
+            async let systemRefresh: Void? = systemController?.updatePlaybackInfo()
+            if let controller = preferredController, controller.isActive() {
                 if let youtubeController = controller as? YouTubeMusicController {
                     await youtubeController.pollPlaybackState()
                 } else {
                     await controller.updatePlaybackInfo()
                 }
-                // Sync volume after update
-                await self.syncVolumeFromActiveApp()
             }
+            _ = await systemRefresh
+            await self.syncVolumeFromActiveApp()
         }
     }
     
@@ -816,14 +835,18 @@ enum LyricsRecordSelection {
         let matching = songs.prefix(12).enumerated().compactMap { index, song -> (id: Int, delta: Double, milliseconds: Double, albumMatch: Bool, index: Int)? in
             guard let id = song["id"] as? Int, id > 0,
                   let name = song["name"] as? String, normalized(name) == titleKey,
-                  let artists = song["artists"] as? [[String: Any]],
-                  normalized(artists.compactMap { $0["name"] as? String }.joined()) == artistKey,
-                  let milliseconds = (song["duration"] as? NSNumber)?.doubleValue,
+                  let artists = (song["artists"] ?? song["ar"]) as? [[String: Any]],
+                  let milliseconds = ((song["duration"] ?? song["dt"]) as? NSNumber)?.doubleValue,
                   milliseconds.isFinite, milliseconds > 0 else { return nil }
             let delta = knownDuration ? abs(milliseconds / 1000 - duration) : 0
             guard !knownDuration || delta <= max(5, duration * 0.025) else { return nil }
-            let albumName = (song["album"] as? [String: Any])?["name"] as? String ?? ""
-            return (id, delta, milliseconds, !albumKey.isEmpty && normalized(albumName) == albumKey, index)
+            let albumName = ((song["album"] ?? song["al"]) as? [String: Any])?["name"] as? String ?? ""
+            let albumMatch = !albumKey.isEmpty && normalized(albumName) == albumKey
+            let credits = artists.compactMap { ($0["name"] as? String).map(normalized) }.filter { !$0.isEmpty }
+            guard credits.joined() == artistKey || (knownDuration && delta <= 1 && albumMatch && credits.contains(artistKey)) else {
+                return nil
+            }
+            return (id, delta, milliseconds, albumMatch, index)
         }
         let preferred = matching.filter(\.albumMatch)
         let ordered = (preferred.isEmpty ? matching : preferred).sorted {

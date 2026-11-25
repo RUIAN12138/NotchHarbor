@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Darwin
 import ApplicationServices
 import IOKit
 import CoreGraphics
@@ -15,6 +16,37 @@ class BoringNotchXPCHelper: NSObject, BoringNotchXPCHelperProtocol {
         AgentMessagingService.shared.perform(request, reply: reply)
     }
     
+    @objc func appMemoryRanking(with reply: @escaping (Data) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            struct Usage: Encodable {
+                let path: String
+                let bytes: UInt64
+            }
+            let limit = proc_listallpids(nil, 0)
+            guard limit > 0 else { reply(Data()); return }
+            var pids = [pid_t](repeating: 0, count: Int(limit) + 128)
+            let count = pids.withUnsafeMutableBytes { proc_listallpids($0.baseAddress, Int32($0.count)) }
+            var totals: [String: UInt64] = [:]
+            var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+            for pid in pids.prefix(max(0, Int(count))) where pid > 0 {
+                guard proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count)) > 0,
+                      let path = String(validatingCString: pathBuffer),
+                      let bundleEnd = path.range(of: ".app/")?.upperBound else { continue }
+                var usage = rusage_info_v4()
+                let status = withUnsafeMutablePointer(to: &usage) { pointer in
+                    pointer.withMemoryRebound(to: Optional<UnsafeMutableRawPointer>.self, capacity: 1) {
+                        proc_pid_rusage(pid, RUSAGE_INFO_V4, $0)
+                    }
+                }
+                guard status == 0, usage.ri_phys_footprint > 0 else { continue }
+                totals[String(path[..<path.index(before: bundleEnd)]), default: 0] += usage.ri_phys_footprint
+            }
+            let rows = totals.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }.prefix(4)
+                .map { Usage(path: $0.key, bytes: $0.value) }
+            reply((try? JSONEncoder().encode(rows)) ?? Data())
+        }
+    }
+
     @objc func isAccessibilityAuthorized(with reply: @escaping (Bool) -> Void) {
         reply(AXIsProcessTrusted())
     }

@@ -2,6 +2,8 @@
                         BSD 3-Clause License
         applies to:
         - MediaRemoteAdapter, Copyright (c) 2025, Jonas van den Berg and contributors
+          Source release for the bundled framework and Perl launcher:
+          https://github.com/ungive/mediaremote-adapter/tree/v0.8.0
 -----------------------------------------------------------------------------
 
 Redistribution and use in source and binary forms, with or without
@@ -447,6 +449,22 @@ under-the-line arc, adapted): MIT, see THIRD_PARTY/SiriGlass/LICENSE and NOTICE.
 Maccy clipboard conventions (ignored pasteboard markers, changeCount checks and
 multi-item file write-back, adapted): MIT, see THIRD_PARTY/Maccy/LICENSE and NOTICE.md.
 
-Meteocons line-style weather animations by Bas Milius, MIT.
-Source and version: boringNotch/WeatherAnimations/NOTICE
+useAnimations weather artwork, MIT.
+Source and checksums: boringNotch/WeatherAnimations/NOTICE
 Full license: boringNotch/WeatherAnimations/LICENSE
+
+Folia Monet lyric rail (chthollyphile/folia-major), AGPL-3.0.
+Source and pinned revision: THIRD_PARTY/Folia/NOTICE.md
+Full license: THIRD_PARTY/Folia/LICENSE
+
+Lucide icons (lucide-icons/lucide), ISC / Feather MIT.
+Source and pinned revision: THIRD_PARTY/Lucide/NOTICE.md
+Full license: THIRD_PARTY/Lucide/LICENSE
+
+PowerFlow SMC telemetry reader (dylansantwani/powerflow), MIT.
+Source and pinned revision: THIRD_PARTY/PowerFlow/NOTICE.md
+Full license: THIRD_PARTY/PowerFlow/LICENSE
+
+Agent Notch session presentation & rate-limit parser (derived from Vibe Notch / Claude Island), Apache-2.0.
+Source and modifications: THIRD_PARTY/AgentNotch/NOTICE.md
+Full license: THIRD_PARTY/AgentNotch/LICENSE

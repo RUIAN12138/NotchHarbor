@@ -47,6 +47,11 @@ assert(editionIDs(editions) == [10, 20])
 assert(editionIDs(editions, album: "典藏版") == [20, 10])
 assert(editionIDs(editions + [edition(40, "另一版", 214231)]).isEmpty)
 assert(editionIDs(editions, duration: .nan).isEmpty)
+let cloudEdition: [String: Any] = ["id": 60, "name": "果实", "ar": [["name": "陈粒"], ["name": "嘉宾"]],
+                                    "al": ["name": "原版"], "dt": 214_157]
+assert(editionIDs([cloudEdition], album: "原版") == [60])
+assert(editionIDs([cloudEdition], album: "非同一专辑").isEmpty)
+assert(editionIDs([cloudEdition], album: "原版", duration: 215.6).isEmpty)
 let timed: [(time:Double,text:String)] = [(5,"first"),(10,"repeat"),(10,"repeat"),(20,"last")]
 let prelude = MusicLyricTimeline.frame(lines:timed,plain:"",elapsed:0)
 assert(prelude.isPrelude && prelude.current.isEmpty && prelude.next == "first")

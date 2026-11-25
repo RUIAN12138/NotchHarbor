@@ -10,7 +10,6 @@ import ApplicationServices
 import Combine
 import Defaults
 import KeyboardShortcuts
-import LaunchAtLogin
 import Sparkle
 import SwiftUI
 
@@ -97,52 +96,170 @@ private enum SystemIslandAccessibility {
 @main
 struct DynamicNotchApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @Default(.menubarIcon) var showMenuBarIcon
-    @Environment(\.openWindow) var openWindow
 
-    let updaterController: SPUStandardUpdaterController?
+    @MainActor static let updaterController: SPUStandardUpdaterController? = {
+        guard let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
+              !feed.isEmpty else { return nil }
+        return SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    }()
 
     init() {
-        if let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String, !feed.isEmpty {
-            updaterController = SPUStandardUpdaterController(
-                startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
-        } else {
-            updaterController = nil
-        }
-
-        // Initialize the settings window controller with the updater controller
-        SettingsWindowController.shared.setUpdaterController(updaterController)
+        SettingsWindowController.shared.setUpdaterController(Self.updaterController)
     }
 
     var body: some Scene {
-        MenuBarExtra(isInserted: $showMenuBarIcon) {
-            AgentUsagePopover {
-                Button {
-                    SettingsWindowController.shared.showWindow()
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .accessibilityLabel("设置")
-                .keyboardShortcut(KeyEquivalent(","), modifiers: .command)
-                Menu {
-                    if let updaterController {
-                        CheckForUpdatesView(updater: updaterController.updater)
-                        Divider()
-                    }
-                    Button("重新启动 Notch Harbor") { ApplicationRelauncher.restart() }
-                    Button("退出 Notch Harbor", role: .destructive) { NSApplication.shared.terminate(self) }
-                        .keyboardShortcut(KeyEquivalent("Q"), modifiers: .command)
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .accessibilityLabel("更多操作")
+        Settings { EmptyView() }
+    }
+}
+
+/// A single AppKit popover owns both the window surface and its current size.
+@MainActor
+private final class HarborStatusPopover: NSObject, NSPopoverDelegate {
+    private let popover = NSPopover()
+    private var statusItem: NSStatusItem?
+    private var itemVisibility: NSKeyValueObservation?
+    private var localClickMonitor: Any?
+    private var globalClickMonitor: Any?
+    private var presentationID: UUID?
+    private var pendingSize: CGSize?
+    private let memoryMonitor = MenuMemoryMonitor.shared
+    private var observers = Set<AnyCancellable>()
+
+    override init() {
+        super.init()
+        popover.behavior = .applicationDefined
+        popover.animates = false
+        popover.delegate = self
+
+        Defaults.publisher(.menubarIcon).map(\.newValue).removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] enabled in self?.setEnabled(enabled) }
+            .store(in: &observers)
+        UnifiedActivities.shared.objectWillChange
+            .merge(with: AgentAPIUsageLedger.shared.objectWillChange,
+                   NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).map { _ in () })
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateLabel() }
+            .store(in: &observers)
+        memoryMonitor.$points
+            .map { $0.last?.pressure }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard UserDefaults.standard.string(forKey: HarborMenuMetric.key) == HarborMenuMetric.memory.rawValue else { return }
+                self?.updateLabel()
             }
-        } label: {
-            AgentUsageStatusLabel()
+            .store(in: &observers)
+        setEnabled(Defaults[.menubarIcon])
+    }
+
+    private func setEnabled(_ enabled: Bool) {
+        if enabled {
+            guard statusItem == nil else { return }
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            item.behavior = .removalAllowed
+            item.button?.target = self
+            item.button?.action = #selector(toggle)
+            item.button?.sendAction(on: .leftMouseUp)
+            statusItem = item
+            itemVisibility = item.observe(\.isVisible, options: [.new]) { [weak self] _, change in
+                guard change.newValue == false else { return }
+                Task { @MainActor in
+                    guard self?.statusItem?.isVisible == false else { return }
+                    Defaults[.menubarIcon] = false
+                }
+            }
+            updateLabel()
+        } else if let statusItem {
+            popover.performClose(nil)
+            itemVisibility = nil
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
         }
-        .menuBarExtraStyle(.window)
+    }
+
+    private func updateLabel() {
+        guard let button = statusItem?.button else { return }
+        let preferences = UserDefaults.standard
+        if preferences.string(forKey: HarborMenuMetric.key) == HarborMenuMetric.memory.rawValue {
+            HarborMenuMetric.applyMemory(to: button, snapshot: memoryMonitor.points.last)
+            return
+        }
+
+        let activity = UnifiedActivities.shared
+        let selection = AgentUsageSelection.resolve(
+            activity.agentUsage, preferred: preferences.string(forKey: AgentUsageSelection.key) ?? "",
+            active: activity.runningAgent?.source, apiEnabled: preferences.bool(forKey: AgentSuggestionAPI.enabledKey),
+            today: AgentAPIUsageLedger.shared.today
+        )
+        AgentUsageStatusLabel.apply(to: button, selection: selection)
+    }
+
+    @objc private func toggle() {
+        if popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        guard let button = statusItem?.button else { return }
+        let id = UUID()
+        presentationID = id
+        let content = AgentUsagePopover(readMemoryApps: { await XPCHelperClient.shared.appMemoryRanking() }) { [weak self] in
+            self?.popover.performClose(nil)
+            SettingsWindowController.shared.showWindow()
+        }
+        .onGeometryChange(for: CGSize.self, of: \.size) { [weak self] size in
+            self?.queueResize(size, presentation: id)
+        }
+        let host = NSHostingController(rootView: content)
+        host.sizingOptions = []
+        popover.contentViewController = host
+        popover.contentSize = host.sizeThatFits(in: CGSize(width: 276, height: 800))
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    private func queueResize(_ size: CGSize, presentation id: UUID) {
+        guard presentationID == id, size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0 else { return }
+        let wasQueued = pendingSize != nil
+        pendingSize = CGSize(width: ceil(size.width), height: ceil(size.height))
+        guard !wasQueued else { return }
+        // Geometry reports can arrive during AppKit's layout pass. Commit one
+        // size after that pass; resizing here would invalidate the same pass.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.presentationID == id, let target = self.pendingSize else { return }
+            self.pendingSize = nil
+            guard self.popover.isShown, self.popover.contentSize != target else { return }
+            self.popover.contentSize = target
+        }
+    }
+
+    func popoverDidShow(_ notification: Notification) {
+        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: clicks) { [weak self] event in
+            guard let self, self.popover.isShown,
+                  event.window !== self.popover.contentViewController?.view.window,
+                  !self.isOverStatusButton(NSEvent.mouseLocation) else { return event }
+            self.popover.performClose(nil)
+            return event
+        }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: clicks) { [weak self] _ in
+            guard let self, self.popover.isShown, !self.isOverStatusButton(NSEvent.mouseLocation) else { return }
+            self.popover.performClose(nil)
+        }
+    }
+
+    private func isOverStatusButton(_ point: NSPoint) -> Bool {
+        guard let button = statusItem?.button, let window = button.window else { return false }
+        return window.convertToScreen(button.convert(button.bounds, to: nil)).contains(point)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        presentationID = nil
+        pendingSize = nil
+        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        localClickMonitor = nil
+        globalClickMonitor = nil
     }
 }
 
@@ -160,6 +277,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var nativeIslandVacancy = SystemIslandVacancy()
     private weak var sampledNativeNotchWindow: NSWindow?
     private weak var suppressedNotchWindow: NSWindow?
+    private var harborStatusPopover: HarborStatusPopover?
     var statusItem: NSStatusItem?
     var windows: [String: NSWindow] = [:] // UUID -> NSWindow
     var viewModels: [String: BoringViewModel] = [:] // UUID -> BoringViewModel
@@ -186,7 +304,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if coordinator.firstLaunch { showOnboardingWindow() }
-        else { SettingsWindowController.shared.showWindow() }
         return false
     }
 
@@ -385,7 +502,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(viewModel)
         )
         hostingView.notchViewModel = viewModel
-        window.contentView = hostingView
+        // The window model owns the panel size. Hosting constraints can
+        // otherwise feed animated AppKit child sizes back into the same pass.
+        hostingView.sizingOptions = []
+        let container = NSView(frame: window.contentView?.bounds ?? NSRect(origin: .zero, size: rect.size))
+        hostingView.frame = container.bounds
+        hostingView.autoresizingMask = [.width, .height]
+        container.addSubview(hostingView)
+        window.contentView = container
 
         window.enableShelfFileDrops(for: viewModel)
         window.orderFrontRegardless()
@@ -435,13 +559,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
-        let loginLaunch = managedLogin || LaunchAtLogin.wasLaunchedAtLogin
+        SettingsWindowController.shared.previewModel = { [weak self] in
+            guard let self else { return nil }
+            if Defaults[.showOnAllDisplays], let uuid = NSScreen.main?.displayUUID, let model = self.viewModels[uuid] {
+                return model
+            }
+            return self.window.flatMap { ($0 as? BoringNotchSkyLightWindow)?.shelfViewModel }
+                ?? self.viewModels.values.first ?? self.vm
+        }
+        harborStatusPopover = HarborStatusPopover()
         appearanceCancellable = Defaults.publisher(.appAppearance)
             .map(\.newValue)
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { mode in NSApp.appearance = mode.name.flatMap { NSAppearance(named: $0) } }
-        Task { @MainActor in _ = CalendarManager.shared }
+        Task { @MainActor in
+            AgentInteraction.shared.startCompletionMonitoring()
+            _ = CalendarManager.shared
+        }
         let previewRain = CommandLine.arguments.contains("--preview-rain-alert")
         if previewRain || CommandLine.arguments.contains("--preview-compact-alert") {
             Task { @MainActor [weak self] in
@@ -602,7 +737,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupDragDetectors()
 
-        if coordinator.firstLaunch {
+        NotchSpotlightGuideController.shared.onRequestOpenNotch = { [weak self] in
+            guard let self else { return }
+            self.closeNotchTask?.cancel()
+            self.closeNotchTask = nil
+            self.coordinator.firstLaunch = false
+            var targetVM = self.vm
+            if Defaults[.showOnAllDisplays] {
+                let mouse = NSEvent.mouseLocation
+                if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main,
+                   let uuid = screen.displayUUID,
+                   let screenVM = self.viewModels[uuid] {
+                    targetVM = screenVM
+                }
+            }
+            if let win = (Defaults[.showOnAllDisplays] ? targetVM.screenUUID.flatMap { self.windows[$0] } : self.window) {
+                win.orderFrontRegardless()
+            }
+            withAnimation(targetVM.animation) {
+                targetVM.open()
+            }
+        }
+
+        if CommandLine.arguments.contains("--spotlight-guide") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(650))
+                NotchSpotlightGuideController.shared.start(force: true)
+            }
+        } else if coordinator.firstLaunch {
             DispatchQueue.main.async {
                 self.showOnboardingWindow()
             }
@@ -613,8 +775,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.showOnboardingWindow(step: .musicPermission)
             }
-        } else if !loginLaunch {
-            SettingsWindowController.shared.showWindow()
         }
         previousScreens = NSScreen.screens
 
@@ -880,11 +1040,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             window.contentView = NSHostingView(
                 rootView: OnboardingView(
                     step: step,
-                    onFinish: {
+                    onFinish: { [weak self] in
                         window.orderOut(nil)
-//                        NSApp.setActivationPolicy(.accessory)
                         window.close()
                         NSApp.deactivate()
+                        self?.coordinator.firstLaunch = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                            NotchSpotlightGuideController.shared.start(force: true)
+                        }
+                    },
+                    onSkipGuide: { [weak self] in
+                        NotchSpotlightGuideController.shared.hasCompleted = true
+                        window.orderOut(nil)
+                        window.close()
+                        NSApp.deactivate()
+                        self?.coordinator.firstLaunch = false
                     },
                     onOpenSettings: {
                         window.close()

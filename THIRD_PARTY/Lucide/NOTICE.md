@@ -1,1 +1,3 @@
 Navigation icons from [Lucide](https://github.com/lucide-icons/lucide/tree/55782beff3a0133df79c417eb68f96e8f19e2404/icons). The SVGs retain the source geometry with a fixed stroke color for template tinting. Icons: list-music, folder-open, clipboard-list, terminal, timer, calendar-days. See LICENSE for the ISC and Feather MIT license terms.
+
+Menu bar icons: plug-zap, battery-charging, laptop, activity from the same revision.

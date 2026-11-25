@@ -22,6 +22,12 @@ const bundle = await build({
                     ['clamp(0.72 - (distance - 1) * 0.18, 0.36, 0.72)',
                      'clamp(0.88 - (distance - 1) * 0.18, 0.36, 0.88)'],
                     ['isWaiting ? 0.46 : 0.36', 'isWaiting ? 0.98 : 0.36'],
+                    ['const layout = getOrMeasureMonetLineLayout(layoutCache, entry, measureInputs);',
+                     String.raw`if (/^(?:作[词詞曲]|[编編]曲|[词詞曲]|[製制]作人?)[\s]*[:：]/u.test(entry.line.fullText.trim())) {
+            tone.scale *= 0.72;
+            tone.opacity *= 0.88;
+        }
+        const layout = getOrMeasureMonetLineLayout(layoutCache, entry, measureInputs);`],
                     ['const focusCenterY = railHeight * 0.46;', 'const focusCenterY = Math.max(railHeight * 0.40, measuredEntries[anchorIndex].scaledHeight / 2 + 2);'],
                     ['Math.max(MONET_ACTIVE_GAP_PX, lyricFontPx * MONET_ACTIVE_GAP_RATIO)',
                      'Math.min(10, Math.max(MONET_ACTIVE_GAP_PX, lyricFontPx * MONET_ACTIVE_GAP_RATIO))'],

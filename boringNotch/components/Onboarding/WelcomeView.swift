@@ -5,11 +5,18 @@
 //  Created by Richard Kunkli on 2024. 09. 26..
 //
 
+import Defaults
 import SwiftUI
 import SwiftUIIntrospect
 
 struct WelcomeView: View {
+    @Default(.settingsLanguage) private var settingsLanguage
     var onGetStarted: (() -> Void)? = nil
+
+    private var isEnglish: Bool {
+        settingsLanguage.lowercased().hasPrefix("en")
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             ZStack {
@@ -29,39 +36,24 @@ struct WelcomeView: View {
                     Text("Notch Harbor")
                         .font(.system(.largeTitle, design: .default))
                         .fontWeight(.semibold)
-                    Text("Welcome")
-                        .font(.title)
+                    Text(isEnglish ? "Turn your MacBook notch into a workspace hub" : "把整座工作台，收进屏幕顶端")
+                        .font(.headline)
                         .foregroundStyle(.secondary)
-                        .padding(.bottom, 30)
-                    if false {
-                        Text("PRO")
-                            .font(.system(size: 18, design: .rounded))
-                            .fontWeight(.bold)
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 3)
-                            .background(
-                                Capsule()
-                                    .fill(LinearGradient(colors: [.white.opacity(0.7), .white.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    .strokeBorder(LinearGradient(stops: [.init(color: .white.opacity(0.7), location: 0.3), .init(color: .clear, location: 0.6)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    .blendMode(.overlay)
-                            )
-                            .padding(.bottom, 30)
-                    }
-
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 28)
+                        .padding(.bottom, 28)
 
                     Button {
                         onGetStarted?()
                     } label: {
-                        Text("Get started")
-                            .padding(.horizontal, 20)
+                        Text(isEnglish ? "Get Started" : "开始配置")
+                            .padding(.horizontal, 22)
                             .padding(.vertical, 6)
                     }
                     .buttonStyle(BorderedProminentButtonStyle())
                 }
                 .padding(.top)
             }
-            
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .ignoresSafeArea()

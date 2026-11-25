@@ -8,10 +8,36 @@
 import AppKit
 import Combine
 import Foundation
+import OSLog
 
 final class NowPlayingController: ObservableObject, MediaControllerProtocol {
-    // Stub for now to conform with ControllerProtocol
-    func updatePlaybackInfo() async {}
+    private static let commandLog = Logger(subsystem: "app.notchharbor", category: "MediaCommands")
+    @MainActor
+    func updatePlaybackInfo() async {
+        guard !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false }
+
+        let revision = playbackRevision
+        let snapshotProcess = adapterProcess("get")
+        let reader = JSONLinesPipeHandler()
+        snapshotProcess.standardOutput = await reader.getPipe()
+        snapshotProcess.standardError = FileHandle.nullDevice
+        guard (try? snapshotProcess.run()) != nil else { return }
+        await reader.readJSONLines(as: NowPlayingPayload.self) { [weak self] payload in
+            await self?.applySnapshot(payload, revision: revision)
+        }
+        await reader.close()
+    }
+
+    @MainActor private var refreshing = false
+    @MainActor private var playbackRevision = 0
+
+    @MainActor
+    private func applySnapshot(_ payload: NowPlayingPayload, revision: Int) async {
+        guard playbackRevision == revision else { return }
+        await handleAdapterUpdate(NowPlayingUpdate(payload: payload, diff: false))
+    }
 
     // MARK: - Properties
     @Published private(set) var playbackState = PlaybackState(bundleIdentifier: "", title: "", artist: "", album: "")
@@ -96,8 +122,12 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
     func previousTrack() async { await command("send", "5") }
 
     func seek(to time: Double) async {
-        guard time.isFinite, time >= 0, time <= Double(Int64.max / 1_000_000) else { return }
-        await command("seek", String(Int64((time * 1_000_000).rounded())))
+        guard time.isFinite, time >= 0,
+              let microseconds = Int64(exactly: (time * 1_000_000).rounded()) else { return }
+        await command("seek", String(microseconds))
+        try? await Task.sleep(for: .milliseconds(180))
+        guard !Task.isCancelled else { return }
+        await updatePlaybackInfo()
     }
 
     func isActive() -> Bool { true }
@@ -116,9 +146,17 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            process.terminationHandler = { _ in done.resume() }
+            process.terminationHandler = { process in
+                if process.terminationStatus != 0 {
+                    Self.commandLog.error("Media command \(function, privacy: .public) exited with status \(process.terminationStatus)")
+                }
+                done.resume()
+            }
             do { try process.run() }
-            catch { done.resume() }
+            catch {
+                Self.commandLog.error("Could not start media command \(function, privacy: .public)")
+                done.resume()
+            }
         }
     }
 
@@ -171,7 +209,9 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
     }
 
     // MARK: - Update Methods
+    @MainActor
     private func handleAdapterUpdate(_ update: NowPlayingUpdate) async {
+        playbackRevision += 1
         let payload = update.payload
         let diff = update.diff ?? false
 
@@ -210,7 +250,9 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
             newPlaybackState.artwork = playbackState.artwork
         }
 
-        newPlaybackState.isPlaying = payload.playing ?? (diff ? playbackState.isPlaying : false)
+        newPlaybackState.isPlaying = payload.playing
+            ?? (payload.playbackRate.flatMap { $0.isFinite ? $0 > 0 : nil })
+            ?? (canInherit && playbackState.isPlaying)
         let resumed = newPlaybackState.isPlaying && !playbackState.isPlaying
         let fallbackRate = newPlaybackState.isPlaying ? (playbackState.playbackRate > 0 ? playbackState.playbackRate : 1) : 0
         let reportedRate = payload.playbackRate ?? (diff && !resumed && payload.playing == nil ? playbackState.playbackRate : fallbackRate)
@@ -282,7 +324,7 @@ struct NowPlayingPayload: Codable {
 actor JSONLinesPipeHandler {
     private let pipe: Pipe
     private let fileHandle: FileHandle
-    private var buffer = ""
+    private var buffer = Data()
     
     init() {
         self.pipe = Pipe()
@@ -308,27 +350,23 @@ actor JSONLinesPipeHandler {
             let data = try await readData()
             guard !data.isEmpty else { break }
             
-            if let chunk = String(data: data, encoding: .utf8) {
-                buffer.append(chunk)
-                
-                while let range = buffer.range(of: "\n") {
-                    let line = String(buffer[..<range.lowerBound])
-                    buffer = String(buffer[range.upperBound...])
-                    
-                    if !line.isEmpty {
-                        await processJSONLine(line, as: type, onLine: onLine)
-                    }
-                }
+            buffer.append(data)
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let line = Data(buffer[..<newline])
+                buffer.removeSubrange(...newline)
+                if !line.isEmpty { await processJSONLine(line, as: type, onLine: onLine) }
             }
         }
-    }
-    
-    private func processJSONLine<T: Decodable>(_ line: String, as type: T.Type, onLine: @escaping (T) async -> Void) async {
-        guard let data = line.data(using: .utf8) else {
-            return
+        if !buffer.isEmpty {
+            let line = buffer
+            buffer.removeAll()
+            await processJSONLine(line, as: type, onLine: onLine)
         }
+    }
+
+    private func processJSONLine<T: Decodable>(_ line: Data, as type: T.Type, onLine: @escaping (T) async -> Void) async {
         do {
-            let decodedObject = try JSONDecoder().decode(T.self, from: data)
+            let decodedObject = try JSONDecoder().decode(T.self, from: line)
             await onLine(decodedObject)
         } catch {
             // Ignore lines that can't be decoded

@@ -13,12 +13,14 @@ final class AgentMessagingService {
         func finish(_ value: AgentInteractionResult) { reply((try? JSONEncoder().encode(value)) ?? Data()) }
         guard data.count < 100_000,
               let request = try? JSONDecoder().decode(AgentInteractionRequest.self, from: data),
-              ["codex", "claude"].contains(request.source),
-              ["suggest", "send"].contains(request.operation), request.text.count <= 8000,
+              ["codex", "claude", "gemini", "doubao", "antigravity"].contains(request.source),
+              !["gemini", "antigravity"].contains(request.source) || request.operation == "send",
+              (request.source == "doubao" ? ["list", "history", "send"] : ["suggest", "send"]).contains(request.operation),
+              request.text.count <= 8000,
               request.context.count <= 24000 else {
             finish(.init(error: "消息格式不正确")); return
         }
-        let key = request.source + request.sessionID.uuidString + request.operation
+        let key = request.source + (request.operation == "list" ? "" : request.sessionID.uuidString) + request.operation
         lock.lock()
         let inserted = active.insert(key).inserted
         lock.unlock()
@@ -31,7 +33,7 @@ final class AgentMessagingService {
                 self.logger.notice("\(request.source, privacy: .public) \(request.operation, privacy: .public): \(outcome, privacy: .public)")
                 finish(result)
             } catch {
-                let message = (error as? Failure)?.message ?? "Agent 连接失败，请检查原应用"
+                let message = (error as? Failure)?.message ?? (error as? AntigravityACP.Failure)?.message ?? "Agent 连接失败，请检查原应用"
                 self.logger.error("\(request.source, privacy: .public) \(request.operation, privacy: .public): \(message, privacy: .public)")
                 finish(.init(error: message))
             }
@@ -47,10 +49,27 @@ final class AgentMessagingService {
         let desktopCodex = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
         let standaloneCodex = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", home.path + "/.local/bin/codex"]
         let codexPaths = desktop ? [desktopCodex] + standaloneCodex : standaloneCodex + [desktopCodex]
-        let paths = source == "codex" ? codexPaths
-            : [home.path + "/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        let paths: [String]
+        let name: String
+        switch source {
+        case "codex":
+            paths = codexPaths
+            name = "Codex"
+        case "doubao":
+            paths = ["/opt/homebrew/bin/doubao", "/usr/local/bin/doubao", home.path + "/.local/bin/doubao"]
+            name = "豆包 CLI"
+        case "gemini":
+            paths = ["/opt/homebrew/bin/gemini", "/usr/local/bin/gemini", home.path + "/.local/bin/gemini"]
+            name = "Gemini CLI"
+        case "antigravity":
+            paths = ["/opt/homebrew/bin/agy", "/usr/local/bin/agy", home.path + "/.local/bin/agy"]
+            name = "Antigravity CLI"
+        default:
+            paths = [home.path + "/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+            name = "Claude"
+        }
         guard let path = paths.first(where: FileManager.default.isExecutableFile(atPath:)) else {
-            throw Failure(message: "未找到 \(source == "codex" ? "Codex" : "Claude") 命令行程序")
+            throw Failure(message: "未找到 \(name) 命令行程序")
         }
         return URL(fileURLWithPath: path)
     }
@@ -98,6 +117,69 @@ final class AgentMessagingService {
         throw Failure(message: "找不到此会话的工作目录，请在原应用中打开一次")
     }
 
+    static func geminiDirectory(in root: URL, sessionID: UUID, hookDirectory: String?) -> URL? {
+        let manager = FileManager.default
+        let identity = sessionID.uuidString.lowercased()
+        guard let projects = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey],
+                                                               options: .skipsHiddenFiles) else { return nil }
+        for project in projects {
+            let chats = project.appendingPathComponent("chats", isDirectory: true)
+            guard let files = try? manager.contentsOfDirectory(at: chats, includingPropertiesForKeys: [.isSymbolicLinkKey],
+                                                                options: .skipsHiddenFiles) else { continue }
+            for file in files {
+                let stem = file.deletingPathExtension().lastPathComponent.lowercased()
+                guard stem.hasPrefix("session-"),
+                      stem.hasSuffix("-" + identity) || stem.hasSuffix("-" + identity.prefix(8)),
+                      ["json", "jsonl"].contains(file.pathExtension),
+                      (try? file.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true,
+                      let log = try? FileHandle(forReadingFrom: file) else { continue }
+                let prefix = (try? log.read(upToCount: 65536)) ?? Data()
+                try? log.close()
+                let verified: Bool
+                if file.pathExtension == "jsonl", let line = prefix.split(separator: 10).first,
+                   let metadata = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any] {
+                    verified = (metadata["sessionId"] as? String).flatMap(UUID.init(uuidString:)) == sessionID
+                } else {
+                    // Older Gemini JSON records place sessionId at the start.
+                    let header = String(decoding: prefix, as: UTF8.self)
+                    let pattern = #"(?m)^\s*\{?\s*"sessionId"\s*:\s*"([0-9a-fA-F-]{36})""#
+                    let range = header.range(of: pattern, options: .regularExpression)
+                    verified = range.map { header[$0].lowercased().contains(identity) } ?? false
+                }
+                guard verified else { continue }
+                let marker = project.appendingPathComponent(".project_root")
+                let path = (try? String(contentsOf: marker, encoding: .utf8))
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                if let path = (path?.hasPrefix("/") == true ? path : hookDirectory), path.hasPrefix("/") {
+                    var isDirectory: ObjCBool = false
+                    if manager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+                        return URL(fileURLWithPath: path, isDirectory: true)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    static func geminiReply(in output: String, sessionID: UUID) -> String? {
+        var confirmed = false
+        var succeeded = false
+        var text = ""
+        for line in output.split(separator: "\n") {
+            guard let row = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
+            switch row["type"] as? String {
+            case "init":
+                guard (row["session_id"] as? String).flatMap(UUID.init(uuidString:)) == sessionID else { return nil }
+                confirmed = true
+            case "message" where row["role"] as? String == "assistant":
+                if let content = row["content"] as? String { text += content }
+            case "result": succeeded = row["status"] as? String == "success"
+            default: break
+            }
+        }
+        return confirmed && succeeded ? text : nil
+    }
+
     private func canContinueCodex(_ log: URL, hook: [String: Any]?, normallyBusy: Bool) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: log) else { return !normallyBusy }
         defer { try? handle.close() }
@@ -129,12 +211,21 @@ final class AgentMessagingService {
     }
 
     private func execute(_ request: AgentInteractionRequest) throws -> AgentInteractionResult {
+        if request.source == "doubao" { return try executeDoubao(request) }
         if request.operation == "send" {
             guard !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw Failure(message: "回复不能为空") }
             let status = state(request)
             let phase = status?["status"] as? String ?? ""
             let normallyBusy = ["processing", "running_tool", "compacting", "waiting_for_approval", "waiting_for_input"].contains(phase)
                 && !["Stop", "StopFailure", "SessionEnd", "SessionExpired"].contains(status?["event"] as? String ?? "")
+            if request.source == "antigravity" {
+                let stamp = status?["observed_at"] as? Double ?? 0
+                let age = Date().timeIntervalSince1970 - stamp
+                let attention = phase == "waiting_for_approval" || phase == "waiting_for_input"
+                if normallyBusy, age >= -5, age < (attention ? 1200 : 300) { return .init(busy: true) }
+                return try AntigravityACP(binary: executable("antigravity"), directory: home,
+                                          environment: agentEnvironment).send(request.text, to: request.sessionID)
+            }
             if request.source != "codex", normallyBusy { return .init(busy: true) }
             if request.source == "codex" {
                 let id = request.sessionID.uuidString.lowercased()
@@ -148,6 +239,21 @@ final class AgentMessagingService {
                     logger.notice("codex desktop: owner acknowledged delivery")
                     return .init(delivered: true)
                 }
+            }
+            if request.source == "gemini" {
+                let root = home.appendingPathComponent(".gemini/tmp", isDirectory: true)
+                guard let directory = Self.geminiDirectory(in: root, sessionID: request.sessionID,
+                                                          hookDirectory: status?["cwd"] as? String) else {
+                    throw Failure(message: "找不到此 Gemini CLI 会话或项目，请在原终端核对")
+                }
+                let binary = try executable("gemini")
+                let args = ["--resume", request.sessionID.uuidString.lowercased(),
+                            "--output-format", "stream-json", "--approval-mode", "default"]
+                let output = try run(binary, args: args, input: request.text, cwd: directory, timeout: 600, codex: false)
+                guard let response = Self.geminiReply(in: output, sessionID: request.sessionID) else {
+                    throw Failure(message: "Gemini CLI 未确认此会话的回复，请在原终端核对")
+                }
+                return .init(text: response, delivered: true)
             }
             let location = try conversationLocation(request)
             if request.source == "codex", !canContinueCodex(location.log, hook: status, normallyBusy: normallyBusy) {
@@ -315,6 +421,40 @@ final class AgentMessagingService {
         return .init(error: "消息已提交，请在原会话查看后续进度", delivered: true)
     }
 
+    private func executeDoubao(_ request: AgentInteractionRequest) throws -> AgentInteractionResult {
+        let binary = try executable("doubao")
+        if request.operation == "list" {
+            let output = try run(binary, args: ["--list", "--limit", "8", "--json"],
+                                 input: nil, cwd: home, timeout: 12, codex: false)
+            return .init(text: output)
+        }
+        let uuid = request.sessionID.uuidString.lowercased()
+        guard uuid.hasPrefix("00000000-0000-d0ba-"),
+              let numericID = UInt64(uuid.dropFirst(19).filter { $0 != "-" }, radix: 16), numericID > 0 else {
+            throw Failure(message: "豆包会话标识无效")
+        }
+        let sessionID = String(numericID)
+        if request.operation == "history" {
+            let output = try run(binary, args: ["--export", sessionID],
+                                 input: nil, cwd: home, timeout: 18, codex: false)
+            return .init(text: output)
+        }
+        guard !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw Failure(message: "回复不能为空")
+        }
+        let output = try run(binary, args: ["--resume", sessionID, "-p", "-",
+                             "--permission-mode", "ask_always", "--output-format", "json"],
+                             input: request.text, cwd: URL(fileURLWithPath: NSTemporaryDirectory()),
+                             timeout: 180, codex: false)
+        guard let row = (try? JSONSerialization.jsonObject(with: Data(output.utf8))) as? [String: Any],
+              row["type"] as? String == "result", row["is_error"] as? Bool == false,
+              row["session_id"] as? String == sessionID else {
+            throw Failure(message: "豆包 CLI 未确认原会话收到消息，请先核对会话")
+        }
+        let result = row["result"] as? [String: Any]
+        return .init(text: (result?["content"] as? String).map { String($0.suffix(8000)) }, delivered: true)
+    }
+
     private var agentEnvironment: [String: String] {
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
@@ -322,14 +462,14 @@ final class AgentMessagingService {
         return environment
     }
 
-    private func run(_ binary: URL, args: [String], input: String, cwd: URL, timeout: TimeInterval, codex: Bool, expectedThread: UUID? = nil) throws -> String {
+    private func run(_ binary: URL, args: [String], input: String?, cwd: URL, timeout: TimeInterval, codex: Bool, expectedThread: UUID? = nil) throws -> String {
         let process = Process()
         process.executableURL = binary
         process.arguments = args
         process.currentDirectoryURL = cwd
         process.environment = agentEnvironment
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
-        process.standardInput = stdin; process.standardOutput = stdout; process.standardError = stderr
+        process.standardInput = input == nil ? FileHandle.nullDevice : stdin; process.standardOutput = stdout; process.standardError = stderr
         let lock = NSLock()
         let readers = DispatchGroup()
         readers.enter()
@@ -370,7 +510,7 @@ final class AgentMessagingService {
         _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         // A command that fails during startup can close stdin before reading.
         // Its exit status and diagnostics still explain the failure.
-        let inputWritten = (try? stdin.fileHandleForWriting.write(contentsOf: Data((input + "\n").utf8))) != nil
+        let inputWritten = input.map { (try? stdin.fileHandleForWriting.write(contentsOf: Data(($0 + "\n").utf8))) != nil } ?? true
         try? stdin.fileHandleForWriting.close()
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }

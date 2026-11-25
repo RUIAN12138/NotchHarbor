@@ -104,32 +104,29 @@ class BoringViewCoordinator: ObservableObject {
     
     @objc func sneakPeekEvent(_ notification: Notification) {
         let decoder = JSONDecoder()
-        if let decodedData = try? decoder.decode(
-            SharedSneakPeek.self, from: notification.userInfo?.first?.value as! Data)
-        {
-            let contentType =
-                decodedData.type == "brightness"
-                ? SneakContentType.brightness
-                : decodedData.type == "volume"
-                    ? SneakContentType.volume
-                    : decodedData.type == "backlight"
-                        ? SneakContentType.backlight
-                        : decodedData.type == "mic"
-                            ? SneakContentType.mic : SneakContentType.brightness
-
-            let formatter = NumberFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.numberStyle = .decimal
-            let value = CGFloat((formatter.number(from: decodedData.value) ?? 0.0).floatValue)
-            let icon = decodedData.icon
-
-            print("Decoded: \(decodedData), Parsed value: \(value)")
-
-            toggleSneakPeek(status: decodedData.show, type: contentType, value: value, icon: icon)
-
-        } else {
-            print("Failed to decode JSON data")
+        guard let rawData = notification.userInfo?.first?.value as? Data,
+              let decodedData = try? decoder.decode(SharedSneakPeek.self, from: rawData)
+        else {
+            return
         }
+
+        let contentType =
+            decodedData.type == "brightness"
+            ? SneakContentType.brightness
+            : decodedData.type == "volume"
+                ? SneakContentType.volume
+                : decodedData.type == "backlight"
+                    ? SneakContentType.backlight
+                    : decodedData.type == "mic"
+                        ? SneakContentType.mic : SneakContentType.brightness
+
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        let value = CGFloat((formatter.number(from: decodedData.value) ?? 0.0).floatValue)
+        let icon = decodedData.icon
+
+        toggleSneakPeek(status: decodedData.show, type: contentType, value: value, icon: icon)
     }
 
     func toggleSneakPeek(

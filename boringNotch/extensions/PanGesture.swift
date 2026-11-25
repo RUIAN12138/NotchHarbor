@@ -20,7 +20,7 @@ enum PanDirection {
 
 extension View {
     func panGesture(direction: PanDirection, threshold: CGFloat = 4, startsWithMomentum: Bool = true,
-                    isEnabled: @escaping () -> Bool = { true },
+                    requiresEligibleStart: Bool = false, isEnabled: @escaping () -> Bool = { true },
                     action: @escaping (CGFloat, NSEvent.Phase) -> Void) -> some View {
         self
             .simultaneousGesture(
@@ -35,7 +35,8 @@ extension View {
                     .onEnded { _ in action(0, .ended) }
             )
             .background(ScrollMonitor(direction: direction, threshold: threshold,
-                                      startsWithMomentum: startsWithMomentum, isEnabled: isEnabled, action: action))
+                                      startsWithMomentum: startsWithMomentum, requiresEligibleStart: requiresEligibleStart,
+                                      isEnabled: isEnabled, action: action))
     }
 }
 
@@ -47,10 +48,30 @@ enum NotchScrollHitRegion {
     }
 }
 
+/// A phased trackpad stroke and its inertia belong to the region where it began.
+struct NotchScrollOwnership {
+    private var owned = false
+
+    mutating func update(phase: NSEvent.Phase, momentum: NSEvent.Phase, inside: Bool) -> Bool {
+        if !momentum.isEmpty {
+            let result = owned
+            if momentum.contains(.ended) || momentum.contains(.cancelled) { owned = false }
+            return result
+        }
+        if phase.isEmpty { return inside }
+        if phase.contains(.mayBegin) { owned = false }
+        if phase.contains(.began) { owned = inside }
+        let result = owned
+        if phase.contains(.cancelled) { owned = false }
+        return result
+    }
+}
+
 private struct ScrollMonitor: NSViewRepresentable {
     let direction: PanDirection
     let threshold: CGFloat
     let startsWithMomentum: Bool
+    let requiresEligibleStart: Bool
     let isEnabled: () -> Bool
     let action: (CGFloat, NSEvent.Phase) -> Void
 
@@ -67,13 +88,16 @@ private struct ScrollMonitor: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { 
         Coordinator(direction: direction, threshold: threshold,
-                    startsWithMomentum: startsWithMomentum, isEnabled: isEnabled, action: action)
+                    startsWithMomentum: startsWithMomentum, requiresEligibleStart: requiresEligibleStart,
+                    isEnabled: isEnabled, action: action)
     }
 
     @MainActor final class Coordinator: NSObject {
         private let direction: PanDirection
         private let threshold: CGFloat
         private let startsWithMomentum: Bool
+        private let requiresEligibleStart: Bool
+        private var ownership = NotchScrollOwnership()
         var action: (CGFloat, NSEvent.Phase) -> Void
         var isEnabled: () -> Bool
         private var monitor: Any?
@@ -82,11 +106,12 @@ private struct ScrollMonitor: NSViewRepresentable {
         private var endTask: Task<Void, Never>?
         private let noiseThreshold: CGFloat = 0.2
 
-        init(direction: PanDirection, threshold: CGFloat, startsWithMomentum: Bool,
+        init(direction: PanDirection, threshold: CGFloat, startsWithMomentum: Bool, requiresEligibleStart: Bool,
              isEnabled: @escaping () -> Bool, action: @escaping (CGFloat, NSEvent.Phase) -> Void) {
             self.direction = direction
             self.threshold = threshold
             self.startsWithMomentum = startsWithMomentum
+            self.requiresEligibleStart = requiresEligibleStart
             self.action = action
             self.isEnabled = isEnabled
         }
@@ -111,10 +136,14 @@ private struct ScrollMonitor: NSViewRepresentable {
         func installMonitor(on view: NSView) {
             removeMonitor()
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self, weak view] event in
-                guard let self else { return event }
-                guard let view,
-                      NotchScrollHitRegion.contains(eventWindow: event.window, locationInWindow: event.locationInWindow, in: view),
-                      self.isEnabled() else {
+                guard let self, let view else { return event }
+                let inside = NotchScrollHitRegion.contains(eventWindow: event.window,
+                                                         locationInWindow: event.locationInWindow, in: view)
+                    && self.isEnabled()
+                let owned = self.requiresEligibleStart
+                    ? self.ownership.update(phase: event.phase, momentum: event.momentumPhase, inside: inside)
+                    : inside
+                guard owned, inside else {
                     self.cancelGesture()
                     return event
                 }
@@ -177,6 +206,59 @@ private struct ScrollMonitor: NSViewRepresentable {
             }
             // Schedule a timeout to end the gesture if no further scroll events arrive.
             scheduleEndTimeout()
+        }
+    }
+}
+
+/// Install inside the preview's document so its native scroll view can be
+/// identified without depending on the view hierarchy used by the outer list.
+struct AgentPreviewScrollBoundary: NSViewRepresentable {
+    func makeNSView(context: Context) -> BoundaryView { BoundaryView() }
+    func updateNSView(_ view: BoundaryView, context: Context) {}
+    static func dismantleNSView(_ view: BoundaryView, coordinator: ()) { view.stop() }
+
+    final class BoundaryView: NSView {
+        private var monitor: Any?
+        private var ownership = NotchScrollOwnership()
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            stop()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self else { return event }
+                return self.route(event)
+            }
+        }
+
+        func stop() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+            ownership = NotchScrollOwnership()
+        }
+
+        private func route(_ event: NSEvent) -> NSEvent? {
+            guard let scrollView = enclosingScrollView, let window, event.window === window else { return event }
+            let clip = scrollView.contentView
+            let location = clip.convert(event.locationInWindow, from: nil)
+            let inside = clip.visibleRect.contains(location)
+            guard ownership.update(phase: event.phase, momentum: event.momentumPhase, inside: inside) else { return event }
+
+            // Clamp within the preview so an overscroll never bubbles to the list.
+            let scale = event.hasPreciseScrollingDeltas ? 1.0 : 8.0
+            let delta = event.scrollingDeltaY * scale * (clip.isFlipped ? -1 : 1)
+            if delta != 0, !event.phase.contains(.cancelled) {
+                var target = clip.bounds
+                target.origin.y += delta
+                let constrained = clip.constrainBoundsRect(target).origin
+                if constrained != clip.bounds.origin {
+                    clip.scroll(to: constrained)
+                    scrollView.reflectScrolledClipView(clip)
+                }
+            }
+            return nil
         }
     }
 }

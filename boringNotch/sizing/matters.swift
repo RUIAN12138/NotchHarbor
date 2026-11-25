@@ -98,6 +98,18 @@ enum SystemIslandHoverGeometry {
     }
 }
 
+struct ShelfDropLayout {
+    let size: CGSize
+    static let tileInset: CGFloat = 5
+
+    var shareSize: CGFloat { min(104, size.height, size.width * 0.30) }
+    var shelfLeading: CGFloat { min(size.width, shareSize + 5) }
+
+    var shelf: CGRect {
+        CGRect(x: shelfLeading, y: 0, width: max(0, size.width - shelfLeading - 4), height: size.height)
+    }
+}
+
 /// Accessibility may briefly return an empty island while its compact contents are being mounted.
 struct SystemIslandVacancy {
     private var emptySince: TimeInterval?

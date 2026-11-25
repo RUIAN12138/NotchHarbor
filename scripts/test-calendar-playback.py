@@ -32,6 +32,20 @@ func occurrence(_ calendarID: String, _ start: Date) -> String {
 }
 assert(occurrence("local", today) != occurrence("shared", today))
 assert(occurrence("shared", today) != occurrence("shared", today.addingTimeInterval(3600)))
+let alarmStart = date(2026, 11, 17, 11)
+assert(AgendaAlertLead.tenMinutes.triggerTime(for: alarmStart).timeIntervalSince(alarmStart) == -600)
+assert(AgendaAlertLead.halfHour.triggerTime(for: alarmStart).timeIntervalSince(alarmStart) == -1800)
+assert(AgendaAlertLead.atTime.triggerTime(for: alarmStart) == alarmStart)
+assert(AgendaAlertLead.oneDay.triggerTime(for: alarmStart, calendar: calendar) == date(2026, 11, 16, 11))
+let upcomingAfterMidnight = date(2026, 11, 18, 0)
+let nearMidnight = date(2026, 11, 16, 23)
+assert(AgendaAlertLead.queryWindow(now: nearMidnight, calendar: calendar).contains(upcomingAfterMidnight))
+assert(AgendaAlertLead.isTimely(nearMidnight, now: nearMidnight.addingTimeInterval(120)))
+assert(!AgendaAlertLead.isTimely(nearMidnight, now: nearMidnight.addingTimeInterval(121)))
+func delivery(_ lead: AgendaAlertLead) -> String {
+    lead.deliveryID(calendarID: "test", eventID: "recurring", start: alarmStart)
+}
+assert(Set(AgendaAlertLead.allCases.map(delivery)).count == 4)
 let now=Date(timeIntervalSince1970:1000)
 func estimate(_ elapsed:Double=10,_ anchor:Date=Date(timeIntervalSince1970:990),_ rate:Double=1,_ playing:Bool=true,_ duration:Double=100) -> Double {
  PlaybackPositionClock.position(elapsed:elapsed,anchor:anchor,rate:rate,playing:playing,duration:duration,now:now)

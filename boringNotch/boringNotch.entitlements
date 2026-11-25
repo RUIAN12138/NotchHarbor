@@ -24,6 +24,8 @@
 	<array>
 		<string>/.codex/sessions/</string>
 		<string>/.claude/projects/</string>
+		<string>/.gemini/tmp/</string>
+		<string>/.gemini/antigravity/brain/</string>
 	</array>
 	<key>com.apple.security.network.client</key>
 	<true/>

@@ -263,11 +263,25 @@ final class AgentReplyMotionStream: ObservableObject {
     }
 }
 
+struct AgentPopupSummary: View {
+    let markdown: String
+
+    var body: some View {
+        Text(AgentMarkdownFormatting.inline(markdown))
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+}
+
 struct AgentReplyChoiceCard: View {
     static let practiceHeight: CGFloat = 172
     let title: String
+    var summary: String? = nil
     let options: [AgentReplyOption]
     let isPractice: Bool
+    var openSummary: (() -> Void)? = nil
     let acceptsHeadMotion: Bool
     var motionCommand: AgentReplyMotionCommand? = nil
     let submit: (Int) -> Bool
@@ -277,7 +291,8 @@ struct AgentReplyChoiceCard: View {
     @AppStorage(AgentReplyMotionSettings.testedKey) private var motionTested = false
     @StateObject private var motion = AgentReplyMotionStream()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var selected = 1
+    @State private var selection: Int?
+    private var selected: Int { selection ?? options.count / 2 }
     @State private var practice = AgentReplyMotionPractice()
     @State private var rejected = false
     @State private var submitted = false
@@ -303,6 +318,18 @@ struct AgentReplyChoiceCard: View {
 
             if isPractice {
                 practicePanel
+            } else if let summary {
+                if let openSummary {
+                    Button(action: openSummary) {
+                        AgentPopupSummary(markdown: summary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityHint("打开对应会话")
+                } else {
+                    AgentPopupSummary(markdown: summary)
+                }
+                choices
             } else {
                 choices
             }
@@ -321,7 +348,14 @@ struct AgentReplyChoiceCard: View {
         }
     }
 
+    @ViewBuilder
     private var choices: some View {
+        if !options.isEmpty {
+            choiceTrack
+        }
+    }
+
+    private var choiceTrack: some View {
         GeometryReader { geometry in
                 let spacing: CGFloat = 3
                 let width = max(0, (geometry.size.width - spacing * CGFloat(options.count - 1)) / CGFloat(options.count))
@@ -396,7 +430,7 @@ struct AgentReplyChoiceCard: View {
         Button {
             select(index)
         } label: {
-            Text(options[index].title)
+            Text(AgentMarkdownFormatting.inline(options[index].title))
                 .font(.system(size: 11, weight: .medium))
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
@@ -449,8 +483,8 @@ struct AgentReplyChoiceCard: View {
     }
 
     private func select(_ index: Int) {
-        guard !submitted else { return }
-        selected = index
+        guard !submitted, options.indices.contains(index) else { return }
+        selection = index
         rejected = false
     }
 

@@ -5,8 +5,9 @@
 //  Created by Alexander on 2025-06-23.
 //
 
-import SwiftUI
 import AVFoundation
+import Defaults
+import SwiftUI
 
 enum OnboardingStep {
     case welcome
@@ -21,16 +22,22 @@ enum OnboardingStep {
 @MainActor private let calendarService = CalendarService()
 
 struct OnboardingView: View {
+    @Default(.settingsLanguage) private var settingsLanguage
     @State var step: OnboardingStep = .welcome
     let onFinish: () -> Void
+    var onSkipGuide: (() -> Void)? = nil
     let onOpenSettings: () -> Void
+
+    private var isEnglish: Bool {
+        settingsLanguage.lowercased().hasPrefix("en")
+    }
 
     var body: some View {
         ZStack {
             switch step {
             case .welcome:
                 WelcomeView {
-                    withAnimation(.easeInOut(duration: 0.6)) {
+                    withAnimation(.easeInOut(duration: 0.45)) {
                         step = .cameraPermission
                     }
                 }
@@ -39,19 +46,23 @@ struct OnboardingView: View {
             case .cameraPermission:
                 PermissionRequestView(
                     icon: Image(systemName: "camera.fill"),
-                    title: "Enable Camera Access",
-                    description: "Notch Harbor includes a mirror feature that lets you quickly check your appearance using your camera, right from the notch. Camera access is required only to show this live preview. You can turn the mirror feature on or off at any time in the app.",
-                    privacyNote: "Your camera is never used without your consent, and nothing is recorded or stored.",
+                    title: isEnglish ? "Enable Camera Access" : "开启摄像头权限",
+                    description: isEnglish
+                        ? "Notch Harbor includes an optional in-notch mirror preview and head-gesture reply control. You can turn camera features on or off anytime."
+                        : "Notch Harbor 支持可选的岛内随身镜预览与点头/摇头快捷回复功能。仅在您主动启用相关功能时使用实时画面。",
+                    privacyNote: isEnglish
+                        ? "Your camera is never used without your consent, and nothing is recorded or stored."
+                        : "未经您开启绝不调用摄像头，所有画面均在本地实时处理，绝不录制或上传。",
                     onAllow: {
                         Task {
                             await requestCameraPermission()
-                            withAnimation(.easeInOut(duration: 0.6)) {
+                            withAnimation(.easeInOut(duration: 0.45)) {
                                 step = .calendarPermission
                             }
                         }
                     },
                     onSkip: {
-                        withAnimation(.easeInOut(duration: 0.6)) {
+                        withAnimation(.easeInOut(duration: 0.45)) {
                             step = .calendarPermission
                         }
                     }
@@ -61,73 +72,85 @@ struct OnboardingView: View {
             case .calendarPermission:
                 PermissionRequestView(
                     icon: Image(systemName: "calendar"),
-                    title: "Enable Calendar Access",
-                    description: "Notch Harbor can show all your upcoming events in one place. Access to your calendar is needed to display your schedule.",
-                    privacyNote: "Your calendar data is only used to show your events and is never shared.",
+                    title: isEnglish ? "Enable Calendar Access" : "开启日历权限",
+                    description: isEnglish
+                        ? "Notch Harbor displays upcoming meetings and your 7-day schedule right inside the notch."
+                        : "授权日历后，您可以在顶部刘海七日滚轮中直接查看近期会议与日程安排。",
+                    privacyNote: isEnglish
+                        ? "Your calendar data is only read locally and is never shared."
+                        : "日程数据仅在本地用于界面展示，绝不会外传。",
                     onAllow: {
                         Task {
-                                await requestCalendarPermission()
-                                withAnimation(.easeInOut(duration: 0.6)) {
-                                    step = .remindersPermission
-                                }
+                            await requestCalendarPermission()
+                            withAnimation(.easeInOut(duration: 0.45)) {
+                                step = .remindersPermission
+                            }
                         }
                     },
                     onSkip: {
-                            withAnimation(.easeInOut(duration: 0.6)) {
-                                step = .remindersPermission
-                            }
+                        withAnimation(.easeInOut(duration: 0.45)) {
+                            step = .remindersPermission
+                        }
                     }
                 )
                 .transition(.opacity)
 
-                case .remindersPermission:
-                    PermissionRequestView(
-                        icon: Image(systemName: "checklist"),
-                        title: "Enable Reminders Access",
-                        description: "Notch Harbor can show your scheduled reminders alongside your calendar events. Access to Reminders is needed to display your reminders.",
-                        privacyNote: "Your reminders data is only used to show your reminders and is never shared.",
-                        onAllow: {
-                            Task {
-                                await requestRemindersPermission()
-                                withAnimation(.easeInOut(duration: 0.6)) {
-                                    step = .accessibilityPermission
-                                }
-                            }
-                        },
-                        onSkip: {
-                            withAnimation(.easeInOut(duration: 0.6)) {
+            case .remindersPermission:
+                PermissionRequestView(
+                    icon: Image(systemName: "checklist"),
+                    title: isEnglish ? "Enable Reminders Access" : "开启提醒事项权限",
+                    description: isEnglish
+                        ? "Show scheduled reminders alongside your calendar events inside the notch."
+                        : "将待办提醒与日历事件同屏聚合展示，抬眼即可核对今日事项。",
+                    privacyNote: isEnglish
+                        ? "Your reminders data stays strictly on your Mac."
+                        : "提醒事项仅在本机读取展示，绝不上传或共享。",
+                    onAllow: {
+                        Task {
+                            await requestRemindersPermission()
+                            withAnimation(.easeInOut(duration: 0.45)) {
                                 step = .accessibilityPermission
                             }
                         }
-                    )
-                    .transition(.opacity)
-                
+                    },
+                    onSkip: {
+                        withAnimation(.easeInOut(duration: 0.45)) {
+                            step = .accessibilityPermission
+                        }
+                    }
+                )
+                .transition(.opacity)
+
             case .accessibilityPermission:
                 PermissionRequestView(
                     icon: Image(systemName: "hand.raised.fill"),
-                    title: "Enable Accessibility Access",
-                    description: "Accessibility access is required to replace system notifications with the Notch Harbor HUD. This allows the app to intercept media and brightness events to display custom HUD overlays.",
-                    privacyNote: "Accessibility access is used only to improve media and brightness notifications. No data is collected or shared.",
+                    title: isEnglish ? "Enable Accessibility Access" : "开启辅助功能权限",
+                    description: isEnglish
+                        ? "Used to intercept media, volume, and brightness keys for the custom in-notch HUD and System Island coordination."
+                        : "用于接管音量、亮度与媒体键岛内 HUD 提示，并与系统灵动岛平滑避让协同。",
+                    privacyNote: isEnglish
+                        ? "Used strictly for HUD key events and window geometry. No keystrokes or personal data are collected."
+                        : "仅用于 HUD 按键反馈与窗口几何检测，绝不记录任何键盘输入或隐私数据。",
                     onAllow: {
                         Task {
                             await requestAccessibilityPermission()
-                            withAnimation(.easeInOut(duration: 0.6)) {
+                            withAnimation(.easeInOut(duration: 0.45)) {
                                 step = .musicPermission
                             }
                         }
                     },
                     onSkip: {
-                        withAnimation(.easeInOut(duration: 0.6)) {
+                        withAnimation(.easeInOut(duration: 0.45)) {
                             step = .musicPermission
                         }
                     }
                 )
                 .transition(.opacity)
-                
+
             case .musicPermission:
                 MusicControllerSelectionView(
                     onContinue: {
-                        withAnimation(.easeInOut(duration: 0.6)) {
+                        withAnimation(.easeInOut(duration: 0.45)) {
                             step = .finished
                         }
                     }
@@ -135,13 +158,15 @@ struct OnboardingView: View {
                 .transition(.opacity)
 
             case .finished:
-                OnboardingFinishView(onFinish: onFinish, onOpenSettings: onOpenSettings)
+                OnboardingFinishView(
+                    onFinish: onFinish,
+                    onSkipGuide: onSkipGuide,
+                    onOpenSettings: onOpenSettings
+                )
             }
         }
         .frame(width: 400, height: 600)
     }
-
-    // MARK: - Permission Request Logic
 
     func requestCameraPermission() async {
         await AVCaptureDevice.requestAccess(for: .video)
@@ -154,7 +179,7 @@ struct OnboardingView: View {
     func requestRemindersPermission() async {
         _ = try? await calendarService.requestAccess(to: .reminder)
     }
-    
+
     func requestAccessibilityPermission() async {
         await XPCHelperClient.shared.ensureAccessibilityAuthorization(promptIfNeeded: true)
     }

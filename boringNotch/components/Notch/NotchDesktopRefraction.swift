@@ -12,13 +12,17 @@ import SwiftUI
 struct NotchDesktopRefraction: NSViewRepresentable {
     var shape: NotchShape
     var intensity: Double
+    var previewCaptureSize: CGSize? = nil
 
     func makeNSView(context: Context) -> RefractionHost {
-        RefractionHost()
+        let host = RefractionHost()
+        host.previewCaptureSize = previewCaptureSize
+        return host
     }
 
     func updateNSView(_ host: RefractionHost, context: Context) {
         let level = Float(intensity.isFinite ? min(1, max(0, intensity)) : 1)
+        host.previewCaptureSize = previewCaptureSize
         guard host.shape.animatableData != shape.animatableData || host.intensity != level else { return }
         host.shape = shape
         host.intensity = level
@@ -76,14 +80,20 @@ final class RefractionHost: NSView {
     private static let log = Logger(subsystem: "theboringteam.boringnotch", category: "DesktopRefraction")
     var shape = NotchShape()
     var intensity: Float = 1
+    var previewCaptureSize: CGSize? {
+        didSet {
+            if previewCaptureSize != oldValue { needsLayout = true }
+        }
+    }
 
     private struct Location: Equatable {
         let windowNumber: Int
         let displayID: CGDirectDisplayID
         let windowRect: CGRect
+        let samplingRect: CGRect
         let backingScale: CGFloat
 
-        init?(window: NSWindow) {
+        init?(window: NSWindow, previewRegion: CGRect?) {
             guard let screen = window.screen,
                   let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
                   let main = NSScreen.screens.first(where: {
@@ -93,9 +103,27 @@ final class RefractionHost: NSView {
             self.windowNumber = window.windowNumber
             displayID = id.uint32Value
             backingScale = window.backingScaleFactor
-            windowRect = CGRect(x: window.frame.minX, y: main.frame.maxY - window.frame.maxY,
-                                width: window.frame.width, height: window.frame.height)
+            let rect = CGRect(x: window.frame.minX, y: main.frame.maxY - window.frame.maxY,
+                              width: window.frame.width, height: window.frame.height)
+            windowRect = rect
+            samplingRect = previewRegion.map { region in
+                RefractionHost.rectForCapture(region, window: window, windowRect: rect).integral
+            } ?? rect
         }
+    }
+
+    private static func rectForCapture(_ rect: CGRect, window: NSWindow, windowRect: CGRect) -> CGRect {
+        let screenRect = window.convertToScreen(rect)
+        let desktopTop = windowRect.minY + window.frame.maxY
+        return CGRect(x: screenRect.minX, y: desktopTop - screenRect.maxY,
+                      width: screenRect.width, height: screenRect.height)
+    }
+
+    private var previewRegion: CGRect? {
+        guard let size = previewCaptureSize, bounds.width > 0, bounds.height > 0 else { return nil }
+        let rect = convert(bounds, to: nil)
+        return CGRect(x: (rect.midX - size.width / 2).rounded(), y: rect.maxY.rounded() - size.height,
+                      width: size.width, height: size.height)
     }
 
     private let surface: MTKView
@@ -181,12 +209,10 @@ final class RefractionHost: NSView {
 
     override func layout() {
         super.layout()
-        guard surface.frame != bounds else { return }
-        surface.frame = bounds
-        // The desktop input is filtered glass. A point-sized drawable avoids
-        // shading four Retina pixels for every point of this backdrop.
-        surface.drawableSize = bounds.size
-        invalidateSurface()
+        // AppKit autoresizes the child. Only request a draw after layout,
+        // and leave drawable updates to that draw pass.
+        if previewCaptureSize != nil { updateCapture() }
+        if surface.drawableSize != bounds.size { invalidateSurface() }
     }
 
     @objc private func didLock() { screenLocked = true; updateCapture() }
@@ -216,7 +242,8 @@ final class RefractionHost: NSView {
     private func updateCapture() {
         guard !screenLocked, !displayAsleep, let window, window.isVisible,
               window.occlusionState.contains(.visible), !window.isMiniaturized,
-              let location = Location(window: window) else {
+              previewCaptureSize == nil || previewRegion != nil,
+              let location = Location(window: window, previewRegion: previewRegion) else {
             disconnect()
             return
         }
@@ -246,7 +273,7 @@ final class RefractionHost: NSView {
                 ? SCContentFilter(display: display, excludingWindows: windows)
                 : SCContentFilter(display: display, excludingApplications: applications, exceptingWindows: [])
             if #available(macOS 14.2, *) { filter.includeMenuBar = true }
-            let glassRect = location.windowRect.intersection(display.frame)
+            let glassRect = location.samplingRect.intersection(display.frame)
             guard let plan = NotchCaptureGeometry.plan(
                 glassRect: glassRect, display: .init(id: display.displayID, frame: display.frame,
                                                      pixelsPerPoint: min(1, CGFloat(filter.pointPixelScale))),
@@ -309,9 +336,10 @@ final class RefractionHost: NSView {
         guard dirty, !inFlight, let captureRect, let frame = latestFrame, let location, let window,
               let queue, let pipeline, bounds.width > 0, bounds.height > 0 else { return }
         let windowRect = convert(bounds, to: nil)
-        let local = CGRect(x: location.windowRect.minX + windowRect.minX,
-                           y: location.windowRect.minY + window.contentRect(forFrameRect: window.frame).height - windowRect.maxY,
-                           width: windowRect.width, height: windowRect.height)
+        let local = Self.rectForCapture(windowRect, window: window, windowRect: location.windowRect)
+        // The desktop input uses a point-sized drawable. Updating it on
+        // the deferred draw path avoids changing the layer during layout.
+        if surface.drawableSize != bounds.size { surface.drawableSize = bounds.size }
         guard let descriptor = surface.currentRenderPassDescriptor, let drawable = surface.currentDrawable,
               let command = queue.makeCommandBuffer(), let encoder = command.makeRenderCommandEncoder(descriptor: descriptor)
         else { return }

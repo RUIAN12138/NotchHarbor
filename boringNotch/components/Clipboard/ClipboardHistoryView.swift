@@ -67,7 +67,9 @@ struct ClipboardHistoryView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
 
-    @State private var filter: ClipboardFilter = .all
+    @State private var filter: ClipboardFilter
+    private let cardWidth: CGFloat = 168
+    private let cardSpacing: CGFloat = 8
     @State private var copiedEntryID: UUID?
     @State private var copyFeedbackTask: Task<Void, Never>?
     @State private var shelfBusyEntryID: UUID?
@@ -80,7 +82,9 @@ struct ClipboardHistoryView: View {
     @MainActor
     init(store: ClipboardHistoryStore? = nil, viewportHeight: CGFloat? = nil, previewColorScheme: ColorScheme? = nil,
          onCopied: @escaping () -> Void = {}) {
-        self.store = store ?? .shared
+        let history = store ?? .shared
+        self.store = history
+        self._filter = State(initialValue: ClipboardFilter(rawValue: history.carouselFilter) ?? .all)
         self.viewportHeight = viewportHeight
         self.previewColorScheme = previewColorScheme
         self.onCopied = onCopied
@@ -107,9 +111,10 @@ struct ClipboardHistoryView: View {
     }
 
     var body: some View {
+        let items = visibleItems
         VStack(spacing: 4) {
             header
-            content
+            content(items)
         }
         .frame(maxWidth: .infinity, alignment: .top)
         .fixedSize(horizontal: false, vertical: true)
@@ -124,7 +129,11 @@ struct ClipboardHistoryView: View {
             vm.clipboardPendingSelectionID = nil
             cancelHoverPreview()
         }
-        .onChange(of: visibleItems.map(\.id)) { _, ids in
+        .onChange(of: filter) { _, current in
+            store.carouselFilter = current.rawValue
+            cancelHoverPreview()
+        }
+        .onChange(of: items.map(\.id)) { _, ids in
             if let previewID, !ids.contains(previewID) { cancelHoverPreview() }
         }
         .onChange(of: vm.notchState) { _, state in
@@ -255,29 +264,31 @@ struct ClipboardHistoryView: View {
     // MARK: - Content
 
     @ViewBuilder
-    private var content: some View {
-        if visibleItems.isEmpty {
+    private func content(_ items: [ClipboardHistoryEntry]) -> some View {
+        if items.isEmpty {
             emptyState
         } else {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal) {
-                    LazyHStack(spacing: 8) {
-                        ForEach(visibleItems) { entry in
+                    LazyHStack(spacing: cardSpacing) {
+                        ForEach(items) { entry in
                             card(for: entry).id(entry.id)
                         }
                     }
                     .padding(.horizontal, 1)
-                    .background(ClipboardWheelScrollBridge(onScrollingChanged: cardScrollingChanged))
+                    .background(ClipboardWheelScrollBridge(
+                        savedOffset: { [category = filter.rawValue] in savedOffset(for: items, category: category) },
+                        onOffsetChanged: { [category = filter.rawValue] offset in
+                            rememberOffset(offset, in: items, category: category)
+                        },
+                        onScrollingChanged: cardScrollingChanged
+                    ))
                     .background { clearSelectionSurface }
                 }
                 .scrollIndicators(.never)
                 .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
                 .frame(height: 56)
                 .reservesHorizontalNotchScrolling()
-                .onChange(of: filter) { _, _ in
-                    cancelHoverPreview()
-                    if let first = visibleItems.first { proxy.scrollTo(first.id, anchor: .leading) }
-                }
                 .onChange(of: copiedEntryID) { _, id in
                     guard let id, previewID != id else { return }
                     withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
@@ -285,7 +296,22 @@ struct ClipboardHistoryView: View {
                     }
                 }
             }
+            .id(filter)
         }
+    }
+
+    private var cardStride: CGFloat { cardWidth + cardSpacing }
+
+    private func savedOffset(for items: [ClipboardHistoryEntry], category: String) -> CGFloat {
+        guard let saved = store.carouselPositions[category] else { return 0 }
+        guard let index = items.firstIndex(where: { $0.id == saved.entryID }) else { return saved.offset }
+        return CGFloat(index) * cardStride + saved.inset
+    }
+
+    private func rememberOffset(_ offset: CGFloat, in items: [ClipboardHistoryEntry], category: String) {
+        guard offset.isFinite, offset >= 0, !items.isEmpty else { return }
+        let index = Int(min(offset / cardStride, CGFloat(items.count - 1)))
+        store.carouselPositions[category] = (items[index].id, offset - CGFloat(index) * cardStride, offset)
     }
 
     private var emptyMessage: String {
@@ -352,7 +378,7 @@ struct ClipboardHistoryView: View {
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
-            .frame(width: 168, height: 56, alignment: .topLeading)
+            .frame(width: cardWidth, height: 56, alignment: .topLeading)
             .background {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(Color.primary.opacity(previewID == entry.id ? 0.11 : 0.052))
@@ -734,7 +760,7 @@ private struct ClipboardCardDragSource<Preview: View>: NSViewRepresentable {
             }
 
             let host = NSHostingController(rootView: preview)
-            host.sizingOptions = .preferredContentSize
+            host.sizingOptions = []
             let popover = NSPopover()
             // SwiftUI's automatically dismissed popover can consume the
             // initial press on the card. The hover timer already owns dismissal.
@@ -745,6 +771,7 @@ private struct ClipboardCardDragSource<Preview: View>: NSViewRepresentable {
             hoverPopover = popover
             DispatchQueue.main.async { [weak self, weak popover] in
                 guard let self, let popover, self.hoverPopover === popover, self.window != nil else { return }
+                popover.contentSize = host.sizeThatFits(in: CGSize(width: 368, height: 440))
                 popover.show(relativeTo: self.bounds, of: self, preferredEdge: .minY)
             }
         }
@@ -801,6 +828,13 @@ private struct ClipboardCardDragSource<Preview: View>: NSViewRepresentable {
             if operation.contains(.copy) { completeDrop?() }
             completeDrop = nil
         }
+    }
+}
+
+enum NotchPreviewPaper {
+    static func color(for scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color(red: 0.087, green: 0.102, blue: 0.132)
+            : Color(red: 0.973, green: 0.978, blue: 0.988)
     }
 }
 
@@ -885,9 +919,7 @@ private struct ClipboardExpandedPreview: View {
                     .accessibilityHidden(true)
             }
         }
-        .background(colorScheme == .dark
-                    ? Color(red: 0.087, green: 0.102, blue: 0.132)
-                    : Color(red: 0.973, green: 0.978, blue: 0.988))
+        .background(NotchPreviewPaper.color(for: colorScheme))
         .scaleEffect(reduceMotion || presented ? 1 : 0.95, anchor: .top)
         .offset(y: reduceMotion || presented ? 0 : -4)
         .onAppear {
@@ -1226,22 +1258,34 @@ enum ClipboardWheelNavigation {
 }
 
 private struct ClipboardWheelScrollBridge: NSViewRepresentable {
+    let savedOffset: () -> CGFloat
+    let onOffsetChanged: (CGFloat) -> Void
     let onScrollingChanged: (Bool) -> Void
 
     func makeNSView(context: Context) -> WheelView { WheelView() }
-    func updateNSView(_ nsView: WheelView, context: Context) { nsView.onScrollingChanged = onScrollingChanged }
+    func updateNSView(_ nsView: WheelView, context: Context) {
+        nsView.savedOffset = savedOffset
+        nsView.onOffsetChanged = onOffsetChanged
+        nsView.onScrollingChanged = onScrollingChanged
+        nsView.preparePositionTracking()
+    }
     static func dismantleNSView(_ nsView: WheelView, coordinator: ()) { nsView.stop() }
 
     final class WheelView: NSView {
+        var savedOffset: (() -> CGFloat)?
+        var onOffsetChanged: ((CGFloat) -> Void)?
         var onScrollingChanged: ((Bool) -> Void)?
         private var monitor: Any?
         private var idleTimer: Timer?
+        private weak var observedClip: NSClipView?
+        private var positionTrackingQueued = false
 
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             stop()
             guard window != nil else { return }
+            preparePositionTracking()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
                 guard let self,
                       NotchScrollHitRegion.contains(eventWindow: event.window, locationInWindow: event.locationInWindow, in: self),
@@ -1270,7 +1314,49 @@ private struct ClipboardWheelScrollBridge: NSViewRepresentable {
                 return nil
             }
         }
+        override func layout() {
+            super.layout()
+            preparePositionTracking()
+        }
+
+        func preparePositionTracking() {
+            guard window != nil, observedClip == nil, !positionTrackingQueued else { return }
+            positionTrackingQueued = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.positionTrackingQueued = false
+                guard self.window != nil, self.observedClip == nil,
+                      let scroll = self.enclosingScrollView, let document = scroll.documentView,
+                      let savedOffset = self.savedOffset else { return }
+                let clip = scroll.contentView
+                guard clip.bounds.width > 0, document.bounds.width > 0 else { return }
+                let start = document.bounds.minX
+                let available = max(0, document.bounds.width - clip.bounds.width)
+                let restoredX = start + min(max(savedOffset(), 0), available)
+                if restoredX != clip.bounds.minX {
+                    clip.scroll(to: NSPoint(x: restoredX, y: clip.bounds.minY))
+                    scroll.reflectScrolledClipView(clip)
+                }
+                self.observedClip = clip
+                clip.postsBoundsChangedNotifications = true
+                NotificationCenter.default.addObserver(self, selector: #selector(self.clipPositionChanged),
+                    name: NSView.boundsDidChangeNotification, object: clip)
+            }
+        }
+
+        @objc private func clipPositionChanged() {
+            guard window != nil, let clip = observedClip, let document = enclosingScrollView?.documentView,
+                  document.bounds.width > 0 else { return }
+            let available = max(0, document.bounds.width - clip.bounds.width)
+            let offset = min(available, max(0, clip.bounds.minX - document.bounds.minX))
+            onOffsetChanged?(offset)
+        }
+
         func stop() {
+            if let clip = observedClip {
+                NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: clip)
+            }
+            observedClip = nil
             if let monitor { NSEvent.removeMonitor(monitor) }
             monitor = nil
             finishScrolling()

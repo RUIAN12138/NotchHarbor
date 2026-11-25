@@ -59,6 +59,21 @@ assert(drop.contains(CGPoint(x: drop.maxX - 1, y: drop.maxY - 1)))
 assert(!drop.contains(CGPoint(x: drop.midX, y: drop.maxY + 1)))
 assert(!drop.contains(CGPoint(x: drop.midX, y: drop.minY - 1)))
 assert(SystemIslandHoverGeometry.shelfDropFrame(screen: dropScreen, width: 100, height: 30, topInset: 36).isNull)
+for size in [CGSize(width: 180, height: 72), CGSize(width: 510, height: 96), CGSize(width: 940, height: 160)] {
+    let layout = ShelfDropLayout(size: size)
+    let share = CGRect(x: 0, y: (size.height - layout.shareSize) / 2,
+                       width: layout.shareSize, height: layout.shareSize)
+    let shelf = layout.shelf
+    let tile = shelf.insetBy(dx: ShelfDropLayout.tileInset, dy: ShelfDropLayout.tileInset)
+    assert(shelf.contains(tile) && shelf.width > tile.width && shelf.height > tile.height)
+    assert(shelf.contains(CGPoint(x: shelf.minX + 1, y: shelf.midY)))
+    assert(shelf.contains(CGPoint(x: shelf.midX, y: 1)))
+    assert(!shelf.intersects(share) && !shelf.contains(CGPoint(x: share.midX, y: share.midY)))
+    assert(!shelf.contains(CGPoint(x: size.width + 1, y: shelf.midY)))
+    assert(!shelf.contains(CGPoint(x: shelf.midX, y: size.height + 1)))
+    assert(!shelf.contains(CGPoint(x: shelf.midX, y: -1)))
+}
+print("PASS: shelf drop target includes surrounding padding and stays outside share and panel exterior")
 assert(SystemIslandHoverGeometry.expandedWidth(island: 250, available: 1472) == 500)
 assert(SystemIslandHoverGeometry.expandedWidth(island: 420, available: 1472) == 840)
 assert(SystemIslandHoverGeometry.expandedWidth(island: 1200, available: 1472) == 1472)

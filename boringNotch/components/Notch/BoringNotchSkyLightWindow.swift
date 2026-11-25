@@ -56,7 +56,8 @@ class BoringNotchSkyLightWindow: NSPanel, NSWindowDelegate {
     private var localPointerMonitor: Any?
     private var pointerState: AnyCancellable?
     private var pressedInPanel = false
-    private weak var agentReplyInput: NSTextField?
+    private weak var panelTextInput: NSTextField?
+    private var editsShelfName = false
     weak var shelfViewModel: BoringViewModel?
 
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
@@ -111,11 +112,14 @@ class BoringNotchSkyLightWindow: NSPanel, NSWindowDelegate {
         delegate = self
         registerForDraggedTypes(ShelfFileDrag.types)
         let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
-                                            .leftMouseUp, .rightMouseUp, .otherMouseUp]
-        globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: events) { [weak self] _ in
+                                            .leftMouseUp, .rightMouseUp, .otherMouseUp,
+                                            .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: events) { [weak self] event in
+            self?.observeOutsideCompactAlertClick(event)
             self?.refreshMouseRouting()
         }
         localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: events) { [weak self] event in
+            self?.observeOutsideCompactAlertClick(event)
             self?.refreshMouseRouting()
             return event
         }
@@ -123,6 +127,17 @@ class BoringNotchSkyLightWindow: NSPanel, NSWindowDelegate {
             self?.refreshMouseRouting()
         }
         refreshMouseRouting()
+    }
+
+    private func observeOutsideCompactAlertClick(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            guard let model = shelfViewModel, model.compactAlertPresented,
+                  !model.acceptsWindowPointer(at: NSEvent.mouseLocation) else { return }
+            model.outsideCompactAlertClick.send()
+        default:
+            break
+        }
     }
 
     deinit {
@@ -142,8 +157,8 @@ class BoringNotchSkyLightWindow: NSPanel, NSWindowDelegate {
 
     func refreshMouseRouting() {
         guard let model = shelfViewModel else { return }
-        if let input = agentReplyInput, model.notchState != .open || model.systemIslandPresentationActive {
-            endAgentReplyEditing(input)
+        if let input = panelTextInput, model.notchState != .open || model.systemIslandPresentationActive {
+            endPanelTextEditing(input)
         }
         if NSEvent.pressedMouseButtons == 0 { pressedInPanel = false }
         let pressed = pressedInPanel && model.notchState == .open && !model.systemIslandPresentationActive
@@ -204,7 +219,7 @@ class BoringNotchSkyLightWindow: NSPanel, NSWindowDelegate {
     private func shelfFileDropOperation(_ sender: NSDraggingInfo, viewModel vm: BoringViewModel) -> NSDragOperation {
         guard Defaults[.boringShelf], !ShelfSelectionModel.shared.isDragging,
               ShelfFileDrag.containsFiles(sender.draggingPasteboard),
-              vm.shelfFileDropFrame(preparesExpansion: vm.externalFileDragActive && Defaults[.expandedDragDetection])
+              vm.shelfFileDropFrame()
                 .contains(convertPoint(toScreen: sender.draggingLocation)) else { return [] }
         return [.copy, .link, .generic].first { sender.draggingSourceOperationMask.contains($0) } ?? []
     }
@@ -268,7 +283,7 @@ class BoringNotchSkyLightWindow: NSPanel, NSWindowDelegate {
     }
     
     func enableSkyLight() {
-        if let input = agentReplyInput { endAgentReplyEditing(input) }
+        if let input = panelTextInput { endPanelTextEditing(input) }
         if !isSkyLightEnabled {
             SkyLightOperator.shared.delegateWindow(self)
             isSkyLightEnabled = true
@@ -285,37 +300,70 @@ class BoringNotchSkyLightWindow: NSPanel, NSWindowDelegate {
     private var observers: Set<AnyCancellable> = []
     
     func beginAgentReplyEditing(_ input: NSTextField) -> Bool {
-        guard shelfViewModel?.notchState == .open, !isSkyLightEnabled,
-              shelfViewModel?.systemIslandPresentationActive != true else { return false }
-        agentReplyInput = input
-        if !isKeyWindow { makeKey() }
-        guard isKeyWindow, makeFirstResponder(input) else {
-            endAgentReplyEditing(input)
-            return false
-        }
-        shelfViewModel?.isAgentReplyEditing = true
-        return true
+        beginPanelTextEditing(input, shelfName: false)
     }
 
     func endAgentReplyEditing(_ input: NSTextField) {
-        guard agentReplyInput === input else { return }
-        agentReplyInput = nil
-        if let editor = input.currentEditor(), firstResponder === editor {
-            makeFirstResponder(nil)
-        }
-        if isKeyWindow { resignKey() }
-        shelfViewModel?.isAgentReplyEditing = false
+        endPanelTextEditing(input)
     }
 
-    func windowDidResignKey(_ notification: Notification) {
-        let input = agentReplyInput
-        agentReplyInput = nil
+    func beginShelfRenameEditing(_ input: NSTextField) -> Bool {
+        beginPanelTextEditing(input, shelfName: true)
+    }
+
+    private func beginPanelTextEditing(_ input: NSTextField, shelfName: Bool) -> Bool {
+        guard shelfViewModel?.notchState == .open, !isSkyLightEnabled,
+              shelfViewModel?.systemIslandPresentationActive != true else { return false }
+        if let previous = panelTextInput, previous !== input { endPanelTextEditing(previous) }
+        panelTextInput = input
+        editsShelfName = shelfName
+        if !isKeyWindow {
+            makeKey()
+            // Only explicit input requests reach this fallback. The notch can
+            // be visible above another app without receiving keyboard events.
+            if !isKeyWindow {
+                NSApp.activate()
+                makeKeyAndOrderFront(nil)
+            }
+        }
+        guard isKeyWindow, (input.currentEditor().map { $0 === firstResponder } ?? false) || makeFirstResponder(input) else {
+            endPanelTextEditing(input)
+            return false
+        }
+        if shelfName {
+            shelfViewModel?.isShelfRenameEditing = true
+        } else {
+            shelfViewModel?.isAgentReplyEditing = true
+        }
+        return true
+    }
+
+    func endPanelTextEditing(_ input: NSTextField) {
+        guard panelTextInput === input else { return }
+        clearPanelTextEditing()
+        if isKeyWindow { resignKey() }
+    }
+
+    private func clearPanelTextEditing() {
+        let input = panelTextInput
+        panelTextInput = nil
         if let editor = input?.currentEditor(), firstResponder === editor {
             makeFirstResponder(nil)
         }
-        shelfViewModel?.isAgentReplyEditing = false
+        if editsShelfName {
+            shelfViewModel?.isShelfRenameEditing = false
+        } else {
+            shelfViewModel?.isAgentReplyEditing = false
+        }
     }
 
-    override var canBecomeKey: Bool { agentReplyInput != nil }
+    func windowDidResignKey(_ notification: Notification) {
+        clearPanelTextEditing()
+    }
+
+    override var canBecomeKey: Bool {
+        shelfViewModel?.notchState == .open && !isSkyLightEnabled
+            && shelfViewModel?.systemIslandPresentationActive != true
+    }
     override var canBecomeMain: Bool { false }
 }
