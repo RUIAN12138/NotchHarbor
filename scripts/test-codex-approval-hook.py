@@ -25,6 +25,14 @@ for extra in (dict(description="network-access https://example.com:443"),
     unsupported = dict(event, tool_input=dict(event["tool_input"], **extra))
     assert hook.make_request(unsupported, 1, os.getpid())["command"] is None
 
+patch_event = dict(event, tool_name="apply_patch", tool_input={
+    "command": "*** Begin Patch\n*** Add File: test.txt\n+fixture\n*** End Patch"
+})
+patch_review = hook.make_request(patch_event, 1, os.getpid())
+assert patch_review["tool"] == "文件变更" and patch_review["command"] == patch_event["tool_input"]["command"]
+assert hook.make_request(dict(patch_event, tool_input={"command": "partial patch"}), 1, os.getpid())["command"] is None
+assert hook.make_request(patch_event, 1, os.getpid(), "claude") is None
+
 with tempfile.TemporaryDirectory() as directory:
     codex_home = Path(directory)
     sessions = codex_home / "sessions"
@@ -83,6 +91,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     for choice in ("allow", "deny"):
         assert run(event, choice)["hookSpecificOutput"]["decision"]["behavior"] == choice
+        assert run(patch_event, choice)["hookSpecificOutput"]["decision"]["behavior"] == choice
     assert run(event, "native") is None
     for choice in ("allow", "deny"):
         assert run(event, choice, provider="claude")["hookSpecificOutput"]["decision"]["behavior"] == choice

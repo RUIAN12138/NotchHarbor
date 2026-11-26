@@ -21,22 +21,45 @@ class BoringNotchXPCHelper: NSObject, BoringNotchXPCHelperProtocol {
         let pending = CodexApprovalPacket.pending(in: folder)
         for request in pending { request.acknowledge(in: folder) }
         let desktop = CodexDesktopApprovals.shared.pending(home: FileManager.default.homeDirectoryForCurrentUser)
-        reply((try? JSONEncoder().encode(pending + CodexServerApprovals.shared.pending() + desktop)) ?? Data())
+        let online = CodexServerApprovals.shared.pending()
+        let panel = CodexDesktopApprovalPanel.shared.pending()
+        // Show the actionable panel first while retaining log-only approvals for other sessions.
+        reply((try? JSONEncoder().encode(pending + online + panel + desktop)) ?? Data())
     }
 
     @objc func submitCodexApproval(_ requestID: String, sessionID: String, choice: String,
-                                   with reply: @escaping (Bool) -> Void) {
+                                   with reply: @escaping (String) -> Void) {
         let folder = CodexApprovalPacket.directory
+        func finish(_ status: CodexApprovalSubmission) { reply(status.rawValue) }
         guard let id = UUID(uuidString: requestID), let session = UUID(uuidString: sessionID),
-              let decision = CodexApprovalPacket.Choice(rawValue: choice) else { reply(false); return }
-        if CodexServerApprovals.shared.choose(decision, id: id, sessionID: session) { reply(true); return }
+              let decision = CodexApprovalPacket.Choice(rawValue: choice) else { finish(.notSent); return }
+        let live = CodexServerApprovals.shared
+        if live.choose(decision, id: id, sessionID: session, onReceipt: { finish($0 ? .confirmed : .unconfirmed) }) {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .seconds(5)) {
+                live.expireReceipt(id)
+            }
+            return
+        }
         guard let request = CodexApprovalPacket.pending(in: folder).first(where: { $0.id == id && $0.sessionID == session })
-        else { reply(false); return }
+        else {
+            DispatchQueue.global(qos: .userInitiated).async {
+                finish(CodexDesktopApprovalPanel.shared.submit(decision, id: id, session: session,
+                    home: FileManager.default.homeDirectoryForCurrentUser))
+            }
+            return
+        }
         do {
             try request.submit(decision, in: folder)
-            reply(true)
+            DispatchQueue.global(qos: .utility).async {
+                let deadline = ContinuousClock.now + .seconds(3)
+                while ContinuousClock.now < deadline {
+                    if request.consumeReceipt(decision, in: folder) { finish(.confirmed); return }
+                    Thread.sleep(forTimeInterval: 0.08)
+                }
+                finish(.unconfirmed)
+            }
         } catch {
-            reply(false)
+            finish(.notSent)
         }
     }
 

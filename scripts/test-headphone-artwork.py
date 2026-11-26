@@ -9,7 +9,7 @@ tests = r'''
 @MainActor final class XPCHelperClient {
     static let shared = XPCHelperClient()
     func pendingCodexApprovals() async -> Data { Data() }
-    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool { false }
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> String { "notSent" }
 }
 
 func json(_ text: String) -> Data { Data(text.utf8) }

@@ -182,7 +182,7 @@ final class AgentInteraction: ObservableObject {
     private func call(_ request: AgentInteractionRequest, completion: @escaping (AgentInteractionResult) -> Void) {
         if let transport { transport(request, completion); return }
         if connection == nil {
-            let link = NSXPCConnection(serviceName: "theboringteam.boringnotch.BoringNotchXPCHelper")
+            let link = NSXPCConnection(serviceName: "com.notchharbor.app.AgentHelper")
             link.remoteObjectInterface = NSXPCInterface(with: BoringNotchXPCHelperProtocol.self)
             link.invalidationHandler = { [weak self] in Task { @MainActor in self?.connection = nil } }
             link.resume()
@@ -427,17 +427,17 @@ final class AgentInteraction: ObservableObject {
     func sendDraft(source: String, id: UUID) {
         let text = draft(for: id)
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        send(text, source: source, id: id, clearingDraft: true)
+        send(text, source: source, id: id, clearingDraft: true, immediate: true)
     }
 
-    func send(_ text: String, source: String, id: UUID, clearingDraft: Bool = false) {
+    func send(_ text: String, source: String, id: UUID, clearingDraft: Bool = false, immediate: Bool = false) {
         guard !state(id).sending else { return }
         if source == "doubao", session(id, source: source)?.agentAttentionKey != nil {
             keepUnsent(text, id: id)
         } else if source != "codex" && source != "doubao", let session = session(id, source: source),
                   !ready(session), !(source == "antigravity" && session.progress?.phase == "idle") {
             keepUnsent(text, id: id)
-        } else { submit(text, source: source, id: id, clearingDraft: clearingDraft) }
+        } else { submit(text, source: source, id: id, clearingDraft: clearingDraft, immediate: immediate) }
     }
     func dismissUnsent(_ id: UUID) { change(id) { $0.unsentReply = nil; $0.status = nil } }
     private func ready(_ item: IslandActivity) -> Bool {
@@ -454,11 +454,11 @@ final class AgentInteraction: ObservableObject {
             $0.status = "此会话需在原应用中实时引导。未发送。"
         }
     }
-    private func submit(_ text: String, source: String, id: UUID, clearingDraft: Bool) {
-        change(id) { $0.unsentReply = nil; $0.sending = true; $0.status = "正在发送并等待 Agent 回复…" }
-        call(.init(operation: "send", source: source, sessionID: id, text: text)) { [weak self] result in
+    private func submit(_ text: String, source: String, id: UUID, clearingDraft: Bool, immediate: Bool) {
+        change(id) { $0.unsentReply = nil; $0.sending = true; $0.status = String(localized: "正在发送…") }
+        call(.init(operation: "send", source: source, sessionID: id, text: text, immediate: immediate ? true : nil)) { [weak self] result in
             guard let self else { return }
-            if clearingDraft, !result.busy, result.error == nil || result.delivered == true,
+            if clearingDraft, !result.busy, result.queued != true, result.error == nil || result.delivered == true,
                self.draft(for: id) == text {
                 self.setDraft("", for: id)
             }

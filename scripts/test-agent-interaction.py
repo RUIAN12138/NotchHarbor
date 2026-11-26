@@ -10,7 +10,7 @@ checks = r'''
 @MainActor final class XPCHelperClient {
     static let shared = XPCHelperClient()
     func pendingCodexApprovals() async -> Data { Data() }
-    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool { false }
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> String { "notSent" }
 }
 
 extension UnifiedActivities {
@@ -334,7 +334,7 @@ extension UnifiedActivities {
     client.setDraft("只检查排版，不修改文件", for: id)
     client.setDraft("另一个会话的草稿", for: second)
     client.sendDraft(source: "codex", id: id)
-    precondition(sent.last?.text == "只检查排版，不修改文件" && sent.last?.sessionID == id)
+    precondition(sent.last?.text == "只检查排版，不修改文件" && sent.last?.sessionID == id && sent.last?.immediate == true)
     finish?(.init(error: "temporary failure"))
     precondition(client.draft(for: id) == "只检查排版，不修改文件")
     client.sendDraft(source: "codex", id: id)
@@ -345,7 +345,7 @@ extension UnifiedActivities {
     client.sendDraft(source: "codex", id: second)
     precondition(sent.last?.sessionID == second && sent.last?.text == "这是排队回复")
     finish?(.init(queued: true))
-    precondition(client.draft(for: second).isEmpty)
+    precondition(client.draft(for: second) == "这是排队回复")
     precondition(client.state(second).status == "已在 Codex 原会话排队")
     precondition(client.state(second).deliveredAt == nil)
 

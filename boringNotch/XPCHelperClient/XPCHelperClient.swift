@@ -5,7 +5,7 @@ import AsyncXPCConnection
 final class XPCHelperClient {
     nonisolated static let shared = XPCHelperClient()
     
-    private let serviceName = "theboringteam.boringnotch.BoringNotchXPCHelper"
+    private let serviceName = "com.notchharbor.app.AgentHelper"
     
     private var remoteService: RemoteXPCService<BoringNotchXPCHelperProtocol>?
     private var connection: NSXPCConnection?
@@ -85,12 +85,12 @@ final class XPCHelperClient {
     }
 
     @MainActor
-    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool {
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> String {
         (try? await ensureRemoteService().withContinuation { service, continuation in
             service.submitCodexApproval(id.uuidString, sessionID: sessionID.uuidString, choice: choice) {
                 continuation.resume(returning: $0)
             }
-        }) ?? false
+        }) ?? "unconfirmed"
     }
 
     // MARK: - Accessibility

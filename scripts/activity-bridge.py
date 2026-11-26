@@ -3,6 +3,8 @@
 No hooks, credentials, approval sockets or network access. Only bounded session
 titles, tool names and rate-limit metadata are emitted, with no transcript content.
 """
+from datetime import datetime
+import re
 import argparse
 import hashlib
 import json
@@ -135,7 +137,91 @@ def number_valid(value):
     return type(value) in (float, int) and math.isfinite(value)
 
 
-def collect(directory, now, codex_root=None):
+def doubao_tool_tasks(directory, now, source):
+    """Read conversation-bound tool invocations only. Background polling shares this log."""
+    operations = {
+        'shell:run_task': '执行命令', 'file_tool:read': '读取文件',
+        'file_tool:edit': '编辑文件', 'file_tool:write': '写入文件',
+        'file_tool:get_info': '检查文件', 'file:read_to_temp_url': '读取文件',
+    }
+    latest = {}
+    for path in sorted(directory.glob('agent_infra_*.log'), reverse=True)[:2]:
+        try:
+            if path.stat().st_mtime < now - 120:
+                continue
+            with path.open('rb') as stream:
+                stream.seek(max(0, path.stat().st_size - 262144))
+                lines = stream.read(262144).splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            match = re.search(rb'^\[([^]]+)\].*? agent_infra invoke, method=local_runtime:([^, ]+), sdk_call_id=(\{[^}]+\}), task_id=\d+', raw)
+            if not match:
+                continue
+            try:
+                action = operations.get(match[2].decode('ascii'))
+                session = json.loads(match[3]).get('conversation_id')
+                stamp = datetime.fromisoformat(match[1].decode('ascii')).timestamp()
+            except (ValueError, UnicodeError, AttributeError):
+                continue
+            if not action or not isinstance(session, str) or not re.fullmatch(r'[0-9]{1,20}', session):
+                continue
+            if -5 <= now - stamp < 120 and stamp > latest.get(session, (0,))[0]:
+                latest[session] = (stamp, action)
+    for session, (stamp, action) in latest.items():
+        if source == 'doubao' and not 0 < int(session) < 2**64:
+            continue
+        item = normalize(dict(source=source, agent_name='豆包桌面版', session_id=session,
+                              observed_at=stamp, status='running_tool'), now)
+        if item:
+            item['detail'] = action
+            item['progress']['lastTool'] = action
+            yield stamp, item
+
+
+def doubao_cli_events(directory, now):
+    yield from doubao_tool_tasks(directory / 'agent_infra', now, 'doubao')
+    events = {b'im_task_started', b'SSE_FULL_MSG_NOTIFY', b'SSE_STREAM_MSG_NOTIFY', b'im_task_finished'}
+    for path in sorted((directory / 'native').glob('doubao-????????.log'), reverse=True)[:2]:
+        try:
+            if path.stat().st_mtime < now - RECENT_SESSION_LIFETIME:
+                continue
+            with path.open('rb') as stream:
+                stream.seek(max(0, path.stat().st_size - 1048576))
+                lines = stream.read(1048576).splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            prefix, marker, payload = raw.partition(b'[cli-chat] ')
+            if not marker or not any(event in payload for event in events):
+                continue
+            try:
+                row = json.loads(payload)
+                event, meta = row['eventName'], row['meta']
+                if event.encode() not in events or meta.get('agent_type') != 'main':
+                    continue
+                session = meta.get('conversation_id')
+                if not isinstance(session, str) or not re.fullmatch(r'[0-9]{1,20}', session):
+                    continue
+                if meta.get('root_conversation_id', session) != session:
+                    continue
+                clock = re.match(rb'^\[\d+:\d+:(\d{4}/\d{6}\.\d+):', prefix)
+                if not clock:
+                    continue
+                stamp = datetime.strptime(path.stem[-8:-4] + clock[1].decode(), '%Y%m%d/%H%M%S.%f').timestamp()
+                finished = event == 'im_task_finished'
+                kind = ('StopFailure' if meta.get('has_error') else 'Stop') if finished else 'UserPromptSubmit'
+                item = normalize(dict(source='doubao', session_id=session, observed_at=stamp,
+                                      event=kind, status='processing'), now)
+                if item and item['conversationID']:
+                    if finished and meta.get('aborted'):
+                        item['title'] = '豆包 CLI · 已停止'
+                    yield stamp, item
+            except (KeyError, ValueError, AttributeError, TypeError, OverflowError):
+                continue
+
+
+def collect(directory, now, codex_root=None, doubao_logs=None, doubao_cli_logs=None):
     result = {}
     terminal = {}
     candidates = []
@@ -197,7 +283,19 @@ def collect(directory, now, codex_root=None):
                 item['progress']['observedAt'] = event_time
                 item['expires'] = stamp + CODEX_RUNNING_LIFETIME
                 result[key] = (event_time, item)
+    if doubao_cli_logs is not None:
+        for stamp, item in doubao_cli_events(doubao_cli_logs, now):
+            number = uuid.UUID(item['conversationID']).int & ((1 << 64) - 1)
+            key = ('doubao', str(number))
+            previous_stamp, previous = result.get(key, (0, None))
+            if stamp <= max(previous_stamp, terminal.get(key, 0)):
+                continue
+            if previous and previous['priority'] == 90 and previous['expires'] > now and item['progress']['phase'] not in ('finished', 'failed'):
+                continue
+            result[key] = (stamp, item)
     active = [(stamp, item) for stamp, item in result.values() if item is not None]
+    if doubao_logs is not None:
+        active.extend(doubao_tool_tasks(doubao_logs, now, 'doubao-desktop'))
     # Completed cards remain in local history. New running sessions get space
     # in the current snapshot even when many sessions finished together.
     def snapshot_order(row):
@@ -214,7 +312,9 @@ if __name__ == '__main__':
     parser.add_argument('--source', type=Path, default=Path.home()/'.multiagent-notch/session-state')
     args = parser.parse_args()
     helper = Path(__file__).with_name('activity-notify')
-    items = collect(args.source, time.time(), Path.home()/'.codex/sessions')
+    items = collect(args.source, time.time(), Path.home()/'.codex/sessions',
+                    Path.home()/'Library/Application Support/Doubao/sdk_storage/log/agent_infra',
+                    Path.home()/'Library/Application Support/doubao_cli/logs')
     enrich_session_titles(items, Path.home()/'.codex/session_index.jsonl')
     enrich_progress(items, Path.home()/'.codex/sessions', Path.home()/'.cache/boringnotch-agent-log-index.json')
     subprocess.run([str(helper)], input=json.dumps(items, ensure_ascii=False).encode(), check=True, timeout=5)

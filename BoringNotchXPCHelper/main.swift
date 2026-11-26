@@ -28,7 +28,7 @@ class ServiceDelegate: NSObject, NSXPCListenerDelegate {
               SecCodeCopySigningInformation(guestStatic, SecCSFlags(rawValue: kSecCSSigningInformation), &guestInfo) == errSecSuccess,
               SecCodeCopySigningInformation(ownStatic, SecCSFlags(rawValue: kSecCSSigningInformation), &ownInfo) == errSecSuccess,
               let peer = guestInfo as? [String: Any], let selfInfo = ownInfo as? [String: Any],
-              peer[kSecCodeInfoIdentifier as String] as? String == "theboringteam.boringnotch",
+              peer[kSecCodeInfoIdentifier as String] as? String == "com.notchharbor.app",
               let team = selfInfo[kSecCodeInfoTeamIdentifier as String] as? String,
               peer[kSecCodeInfoTeamIdentifier as String] as? String == team else { return false }
         

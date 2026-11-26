@@ -5,9 +5,47 @@ import OSLog
 final class AgentMessagingService {
     static let shared = AgentMessagingService()
     private let lock = NSLock()
-    private let logger = Logger(subsystem: "theboringteam.boringnotch", category: "AgentDelivery")
+    private let logger = Logger(subsystem: "com.notchharbor.app", category: "AgentDelivery")
     private var active = Set<String>()
+    private var codexTurns: [UUID: ActiveCodexTurn] = [:]
     private var home: URL { URL(fileURLWithPath: String(cString: getpwuid(getuid())!.pointee.pw_dir)) }
+
+    private final class ActiveCodexTurn {
+        struct Input {
+            let text: String
+            let finish: (AgentInteractionResult) -> Void
+        }
+
+        private let lock = NSLock()
+        private var next: Input?
+        private var accepting = true
+
+        func submit(_ input: Input) -> Bool {
+            lock.withLock {
+                guard accepting, next == nil else { return false }
+                next = input
+                accepting = false
+                return true
+            }
+        }
+
+        func take() -> Input? {
+            lock.withLock {
+                defer { next = nil }
+                return next
+            }
+        }
+
+        func resume() { lock.withLock { accepting = true } }
+
+        func close() -> Input? {
+            lock.withLock {
+                accepting = false
+                defer { next = nil }
+                return next
+            }
+        }
+    }
 
     func perform(_ data: Data, reply: @escaping (Data) -> Void) {
         func finish(_ value: AgentInteractionResult) { reply((try? JSONEncoder().encode(value)) ?? Data()) }
@@ -17,25 +55,38 @@ final class AgentMessagingService {
               !["gemini", "antigravity"].contains(request.source) || request.operation == "send",
               (request.source == "doubao" ? ["list", "history", "send"] : ["suggest", "send"]).contains(request.operation),
               request.text.count <= 8000,
+              request.operation != "send" || !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               request.context.count <= 24000 else {
             finish(.init(error: "消息格式不正确")); return
         }
         let key = request.source + (request.operation == "list" ? "" : request.sessionID.uuidString) + request.operation
         lock.lock()
+        if request.source == "codex", request.operation == "send", request.immediate == true,
+           let turn = codexTurns[request.sessionID] {
+            lock.unlock()
+            if !turn.submit(.init(text: request.text, finish: finish)) {
+                finish(.init(error: "上一条回复仍在确认，草稿已保留"))
+            }
+            return
+        }
         let inserted = active.insert(key).inserted
         lock.unlock()
         guard inserted else { finish(.init(error: "这个会话的请求仍在处理")); return }
         DispatchQueue.global(qos: .userInitiated).async {
             defer { self.lock.lock(); self.active.remove(key); self.lock.unlock() }
+            var acknowledged = false
             do {
-                let result = try self.execute(request)
-                let outcome = result.busy ? "busy" : result.error == nil ? "confirmed" : "submitted"
+                let result = try self.execute(request, onAccepted: {
+                    acknowledged = true
+                    finish(.init(delivered: true))
+                })
+                let outcome = result.busy ? "busy" : result.queued == true ? "queued" : result.error == nil ? "confirmed" : "failed"
                 self.logger.notice("\(request.source, privacy: .public) \(request.operation, privacy: .public): \(outcome, privacy: .public)")
-                finish(result)
+                if !acknowledged { finish(result) }
             } catch {
                 let message = (error as? Failure)?.message ?? (error as? AntigravityACP.Failure)?.message ?? "Agent 连接失败，请检查原应用"
                 self.logger.error("\(request.source, privacy: .public) \(request.operation, privacy: .public): \(message, privacy: .public)")
-                finish(.init(error: message))
+                if !acknowledged { finish(.init(error: message)) }
             }
         }
     }
@@ -210,7 +261,7 @@ final class AgentMessagingService {
         return !normallyBusy
     }
 
-    private func execute(_ request: AgentInteractionRequest) throws -> AgentInteractionResult {
+    private func execute(_ request: AgentInteractionRequest, onAccepted: @escaping () -> Void) throws -> AgentInteractionResult {
         if request.source == "doubao" { return try executeDoubao(request) }
         if request.operation == "send" {
             guard !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw Failure(message: "回复不能为空") }
@@ -257,6 +308,9 @@ final class AgentMessagingService {
             }
             let location = try conversationLocation(request)
             if request.source == "codex", location.desktop {
+                guard request.immediate != true else {
+                    throw Failure(message: "Codex 桌面实时连接不可用，回复未发送，草稿已保留")
+                }
                 // The CLI discovers the shared server and queues the exact desktop thread.
                 let binary = try executable("codex", desktop: true)
                 return try enqueueWithCodexCLI(binary, request: request, cwd: location.directory)
@@ -266,7 +320,8 @@ final class AgentMessagingService {
             }
             let binary = try executable(request.source, desktop: location.desktop)
             if request.source == "codex" {
-                return try sendViaCodexServer(binary, request: request, cwd: location.directory)
+                return try sendViaCodexServer(binary, request: request, cwd: location.directory,
+                                              onAccepted: request.immediate == true ? onAccepted : nil)
             }
             let args = ["--resume", request.sessionID.uuidString.lowercased(), "--print", "--output-format", "json"]
             let output = try run(binary, args: args, input: request.text, cwd: location.directory,
@@ -317,7 +372,7 @@ final class AgentMessagingService {
     /// Uses Codex's own queue for a desktop session. A terminal session can
     /// still be resumed when it is not held by another client.
     private func sendViaCodexServer(_ binary: URL, request: AgentInteractionRequest,
-                                    cwd: URL) throws -> AgentInteractionResult {
+                                    cwd: URL, onAccepted: (() -> Void)? = nil) throws -> AgentInteractionResult {
         let process = Process()
         process.executableURL = binary
         process.arguments = ["app-server", "--listen", "stdio://"]
@@ -345,7 +400,6 @@ final class AgentMessagingService {
         var pending = Data()
         func read(until deadline: ContinuousClock.Instant, pollApprovals: () throws -> Void = {}) throws -> [String: Any] {
             while ContinuousClock.now < deadline {
-                try pollApprovals()
                 while let end = pending.firstIndex(of: 10) {
                     let bytes = Data(pending[..<end])
                     pending.removeSubrange(...end)
@@ -354,8 +408,9 @@ final class AgentMessagingService {
                     }
                 }
                 var descriptor = pollfd(fd: reader.fileDescriptor, events: Int16(POLLIN), revents: 0)
-                let result = poll(&descriptor, 1, 200)
+                let result = poll(&descriptor, 1, 150)
                 if result < 0 && errno != EINTR { break }
+                if result == 0 { try pollApprovals() }
                 guard result > 0 else { continue }
                 let bytes = reader.availableData
                 if bytes.isEmpty { break }
@@ -372,7 +427,8 @@ final class AgentMessagingService {
             let deadline = ContinuousClock.now + .seconds(30)
             while true {
                 let row = try read(until: deadline)
-                if id == 3, row["method"] != nil, row["id"] != nil, earlyRequests.count < 12 {
+                if id == 3, let method = row["method"] as? String, earlyRequests.count < 40,
+                   row["id"] != nil || ["item/started", "item/completed", "item/fileChange/patchUpdated", "serverRequest/resolved"].contains(method) {
                     earlyRequests.append(row)
                 }
                 guard row["id"] as? Int == id, row["method"] == nil else { continue }
@@ -411,10 +467,51 @@ final class AgentMessagingService {
             throw Failure(message: "Codex 未确认提交，请先核对原会话")
         }
         logger.notice("codex app-server: submission acknowledged")
+        let liveTurn = ActiveCodexTurn()
+        lock.withLock { codexTurns[request.sessionID] = liveTurn }
+        var steerInFlight: (id: Int, input: ActiveCodexTurn.Input, deadline: ContinuousClock.Instant)?
+        var nextSteerID = 10
+        defer {
+            lock.withLock { codexTurns[request.sessionID] = nil }
+            liveTurn.close()?.finish(.init(error: "Codex 当前回合已结束，回复未发送"))
+            steerInFlight?.input.finish(.init(error: "未收到 Codex 确认，请在原会话核对后再发送"))
+        }
+        onAccepted?()
+
+        func pollReply() throws {
+            if let inFlight = steerInFlight, ContinuousClock.now >= inFlight.deadline {
+                steerInFlight = nil
+                liveTurn.resume()
+                inFlight.input.finish(.init(error: "未收到 Codex 确认，请在原会话核对后再发送"))
+            }
+            guard let input = liveTurn.take() else { return }
+            let id = nextSteerID
+            nextSteerID += 1
+            steerInFlight = (id, input, ContinuousClock.now + .seconds(12))
+            try send(["id": id, "method": "turn/steer", "params": [
+                "threadId": threadID, "expectedTurnId": turnID,
+                "input": [["type": "text", "text": input.text, "text_elements": []]]
+            ]])
+        }
+
+        func handleReply(_ row: [String: Any]) {
+            guard row["method"] == nil, let inFlight = steerInFlight, row["id"] as? Int == inFlight.id else { return }
+            let receipt = row["result"] as? [String: Any]
+            steerInFlight = nil
+            liveTurn.resume()
+            if receipt?["turnId"] as? String == turnID {
+                inFlight.input.finish(.init(delivered: true, steered: true))
+            } else {
+                inFlight.input.finish(.init(error: "未收到 Codex 确认，请在原会话核对后再发送"))
+            }
+        }
+
         let inbox = CodexServerApprovals.shared
         struct PendingApproval {
             let requestID: Any
             let packet: CodexApprovalPacket
+            let review: CodexServerReview
+            let itemID: String?
             var responded = false
         }
         func wireKey(_ id: Any?) -> String? {
@@ -427,9 +524,10 @@ final class AgentMessagingService {
                 .init("local.boringnotch.codex-approval"), object: nil, userInfo: nil, deliverImmediately: true)
         }
         var waiting: [String: PendingApproval] = [:]
-        func clearApproval(_ key: String) {
+        var proposedFiles: [String: CodexServerReview.FileProposal] = [:]
+        func clearApproval(_ key: String, acknowledgedByServer: Bool = false) {
             guard let cleared = waiting.removeValue(forKey: key) else { return }
-            inbox.remove(cleared.packet.id)
+            inbox.remove(cleared.packet.id, confirmed: acknowledgedByServer && cleared.responded)
             refreshApprovalUI()
         }
         defer {
@@ -439,41 +537,68 @@ final class AgentMessagingService {
             guard let rpcID = row["id"], let key = wireKey(rpcID), let method = row["method"] as? String else { return }
             guard waiting[key] == nil else { return }
             let params = row["params"] as? [String: Any] ?? [:]
-            let decisions = params["availableDecisions"] as? [Any]
-            let extraPermissions = params["additionalPermissions"]
-            let network = params["networkApprovalContext"]
-            guard method == "item/commandExecution/requestApproval",
-                  (params["threadId"] as? String).flatMap(UUID.init(uuidString:)) == request.sessionID,
+            let itemID = params["itemId"] as? String
+            guard (params["threadId"] as? String).flatMap(UUID.init(uuidString:)) == request.sessionID,
                   params["turnId"] as? String == turnID,
-                  extraPermissions == nil || extraPermissions is NSNull,
-                  network == nil || network is NSNull,
-                  decisions == nil || (decisions?.contains { ($0 as? String) == "accept" } == true
-                    && decisions?.contains { ($0 as? String) == "decline" } == true),
-                  let command = params["command"] as? String, !command.isEmpty, command.utf8.count <= 8000,
-                  let directory = params["cwd"] as? String, directory.hasPrefix("/") else {
+                  let review = CodexServerReview.make(method: method, params: params, workspace: cwd.path,
+                      proposedFiles: itemID.flatMap { proposedFiles[$0]?.detail }) else {
                 try send(["id": rpcID, "error": ["code": -32601, "message": "This approval is unavailable in Notch Harbor"]])
                 return
             }
             let now = Date().timeIntervalSince1970
             let packet = CodexApprovalPacket(id: UUID(), sessionID: request.sessionID,
-                tool: "Bash", cwd: directory, reason: params["reason"] as? String ?? "",
-                command: command, createdAt: now, expires: now + 90, pid: process.processIdentifier,
-                route: "app-server")
-            waiting[key] = PendingApproval(requestID: rpcID, packet: packet)
+                tool: review.tool, cwd: review.cwd, reason: params["reason"] as? String ?? "",
+                command: review.detail, createdAt: now, expires: now + 90, pid: process.processIdentifier,
+                route: "app-server", denialCancelsTurn: review.denialCancelsTurn ? true : nil)
+            waiting[key] = PendingApproval(requestID: rpcID, packet: packet, review: review, itemID: itemID)
             inbox.insert(packet)
             refreshApprovalUI()
+        }
+        func observeApprovalEvent(_ event: String, _ params: [String: Any]) throws {
+            if event == "serverRequest/resolved", let key = wireKey(params["requestId"]) {
+                clearApproval(key, acknowledgedByServer: true)
+                return
+            }
+            guard params["turnId"] as? String == turnID else { return }
+            if event == "item/started", let item = params["item"] as? [String: Any],
+               item["type"] as? String == "fileChange", let itemID = item["id"] as? String,
+               proposedFiles[itemID] != nil || proposedFiles.count < 24 {
+                proposedFiles[itemID] = CodexServerReview.fileProposal(item["changes"])
+            } else if event == "item/fileChange/patchUpdated", let itemID = params["itemId"] as? String,
+                      proposedFiles[itemID] != nil || proposedFiles.count < 24 {
+                let next = CodexServerReview.fileProposal(params["changes"])
+                guard next != proposedFiles[itemID] else { return }
+                proposedFiles[itemID] = nil
+                // The user must review the new patch. The previous button must not
+                // approve different bytes under the same wire identity.
+                for (key, pending) in waiting where pending.itemID == itemID && pending.packet.tool == "文件变更" && !pending.responded {
+                    try send(["id": pending.requestID, "result": pending.review.response(to: .deny)])
+                    clearApproval(key)
+                }
+                proposedFiles[itemID] = next
+            } else if event == "item/completed", let item = params["item"] as? [String: Any],
+                      let itemID = item["id"] as? String {
+                proposedFiles[itemID] = nil
+                for (key, pending) in waiting where pending.itemID == itemID {
+                    clearApproval(key, acknowledgedByServer: true)
+                }
+            }
+        }
+        func handleApprovalRow(_ row: [String: Any]) throws {
+            guard let method = row["method"] as? String else { return }
+            if row["id"] != nil {
+                try handleRequest(row)
+            } else if let params = row["params"] as? [String: Any],
+                      (params["threadId"] as? String).flatMap(UUID.init(uuidString:)) == request.sessionID {
+                try observeApprovalEvent(method, params)
+            }
         }
         func pollApprovals() throws {
             let now = Date().timeIntervalSince1970
             for (key, approval) in waiting where !approval.responded {
-                let decision: String
-                switch inbox.choice(for: approval.packet.id) {
-                case .allow: decision = "accept"
-                case .deny: decision = "decline"
-                case nil where now >= approval.packet.expires: decision = "cancel"
-                default: continue
-                }
-                try send(["id": approval.requestID, "result": ["decision": decision]])
+                let choice = inbox.choice(for: approval.packet.id)
+                guard choice != nil || now >= approval.packet.expires else { continue }
+                try send(["id": approval.requestID, "result": approval.review.response(to: choice)])
                 waiting[key]?.responded = true
             }
         }
@@ -481,22 +606,23 @@ final class AgentMessagingService {
         var text = ""
         let deadline = ContinuousClock.now + .seconds(600)
         do {
-            for request in earlyRequests { try handleRequest(request) }
+            for row in earlyRequests { try handleApprovalRow(row) }
         } catch {
             return .init(error: "消息已提交，审批连接已断开，请查看原会话", delivered: true)
         }
-        while let notification = try? read(until: deadline, pollApprovals: pollApprovals) {
-            if notification["method"] != nil, notification["id"] != nil {
-                do { try handleRequest(notification) }
-                catch { break }
-                continue
+        while let notification = try? read(until: deadline, pollApprovals: {
+            try pollApprovals()
+            try pollReply()
+        }) {
+            do {
+                handleReply(notification)
+                try handleApprovalRow(notification)
+                if notification["method"] as? String != "turn/completed" { try pollReply() }
             }
-            guard let event = notification["method"] as? String,
+            catch { break }
+            guard notification["id"] == nil, let event = notification["method"] as? String,
                   let params = notification["params"] as? [String: Any],
                   (params["threadId"] as? String).flatMap(UUID.init(uuidString:)) == request.sessionID else { continue }
-            if event == "serverRequest/resolved", let key = wireKey(params["requestId"]) {
-                clearApproval(key)
-            }
             if event == "item/completed", params["turnId"] as? String == turnID,
                let item = params["item"] as? [String: Any], item["type"] as? String == "agentMessage",
                let message = item["text"] as? String {

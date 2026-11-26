@@ -104,6 +104,9 @@ struct DynamicNotchApp: App {
     }()
 
     init() {
+        if CommandLine.arguments.contains("--prepare-identity-migration") {
+            exit(EXIT_SUCCESS)
+        }
         SettingsWindowController.shared.setUpdaterController(Self.updaterController)
     }
 

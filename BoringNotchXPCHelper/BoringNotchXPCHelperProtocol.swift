@@ -11,7 +11,7 @@ import Foundation
 @objc protocol BoringNotchXPCHelperProtocol {
     func agentInteraction(_ request: Data, with reply: @escaping (Data) -> Void)
     func pendingCodexApprovals(with reply: @escaping (Data) -> Void)
-    func submitCodexApproval(_ requestID: String, sessionID: String, choice: String, with reply: @escaping (Bool) -> Void)
+    func submitCodexApproval(_ requestID: String, sessionID: String, choice: String, with reply: @escaping (String) -> Void)
     func appMemoryRanking(with reply: @escaping (Data) -> Void)
     func isAccessibilityAuthorized(with reply: @escaping (Bool) -> Void)
     func requestAccessibilityAuthorization()
@@ -32,6 +32,7 @@ struct AgentInteractionRequest: Codable {
     var sessionID: UUID
     var text: String = ""
     var context: String = ""
+    var immediate: Bool? = nil
 }
 
 struct AgentReplyOption: Codable, Equatable {
@@ -78,7 +79,7 @@ struct AgentInteractionResult: Codable {
 /*
  To use the service from an application or other process, use NSXPCConnection to establish a connection to the service by doing something like this:
 
-     connectionToService = NSXPCConnection(serviceName: "theboringteam.boringnotch.BoringNotchXPCHelper")
+     connectionToService = NSXPCConnection(serviceName: "com.notchharbor.app.AgentHelper")
      connectionToService.remoteObjectInterface = NSXPCInterface(with: (any BoringNotchXPCHelperProtocol).self)
      connectionToService.resume()
 

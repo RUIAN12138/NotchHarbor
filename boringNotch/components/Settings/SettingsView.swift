@@ -5,6 +5,7 @@
 //  Created by Richard Kunkli on 07/08/2024.
 //
 
+import AppKit
 import AVFoundation
 import Defaults
 import EventKit
@@ -1971,9 +1972,40 @@ private struct AgentSuggestionSettings: View {
     @State private var newKey = ""
     @State private var hasKey = false
     @State private var status: String?
+    @State private var desktopApprovalAccess: Bool?
+    @State private var accessibilitySettingsRevision = 0
+    @State private var customRepliesLoaded = false
+    @State private var customReplySaveState: String?
+    @FocusState private var focusedReplyBody: UUID?
 
     var body: some View {
         Form {
+            Section("Codex 桌面审批") {
+                LabeledContent("原生审批卡片") {
+                    HStack(spacing: 8) {
+                        if desktopApprovalAccess == true {
+                            Label("已开启", systemImage: "checkmark.circle")
+                                .foregroundStyle(.secondary)
+                        } else if desktopApprovalAccess == false {
+                            Text("待授权").foregroundStyle(.secondary)
+                        }
+                        Button("打开系统授权设置", action: openAccessibilitySettings)
+                            .buttonStyle(.bordered)
+                            .accessibilityIdentifier("settings-codex-accessibility")
+                    }
+                }
+                if desktopApprovalAccess != true {
+                    Group {
+                        if #available(macOS 27.3, *) {
+                            Text("在系统授权页找到 Notch Harbor。如果可以选择应用，请仅选择 Codex。")
+                        } else {
+                            Text("在系统设置中为 Notch Harbor 开启辅助功能。")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
             Section("任务完成提醒") {
                 HStack(spacing: 12) {
                     Slider(value: $completionHaloDuration, in: AgentCompletionHaloSettings.durationRange, step: 1) {
@@ -1998,6 +2030,8 @@ private struct AgentSuggestionSettings: View {
                     Text("兼容 API").tag(AgentQuickReplySource.api)
                     Text("自定义快捷回复").tag(AgentQuickReplySource.custom)
                 }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier("settings-agent-quick-reply-source")
                 if quickReplySource == .api {
                     TextField("API 地址", text: $endpoint, prompt: Text(verbatim: "https://api.openai.com/v1"))
                     TextField("模型名称", text: $model)
@@ -2069,54 +2103,121 @@ private struct AgentSuggestionSettings: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Agent")
+        .task(id: accessibilitySettingsRevision) {
+            await refreshDesktopApprovalAccess()
+            guard accessibilitySettingsRevision > 0 else { return }
+            let deadline = ContinuousClock.now + .seconds(45)
+            while desktopApprovalAccess != true && ContinuousClock.now < deadline {
+                do { try await Task.sleep(for: .seconds(1)) }
+                catch { return }
+                await refreshDesktopApprovalAccess()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { @MainActor in await refreshDesktopApprovalAccess() }
+        }
+        .onChange(of: quickReplySource) { _, source in
+            if source == .custom { loadCustomReplies() }
+        }
+        .onChange(of: normalizedCustomReplies) { _, _ in customReplySaveState = nil }
         .onAppear {
             endpoint = savedEndpoint
             model = savedModel
             hasKey = AgentSuggestionAPI.key() != nil
-            customReplies = AgentQuickReplySource.customReplies(from: customReplyData).map {
-                CustomReplyDraft(title: $0.title, body: $0.body)
-            }
+            if quickReplySource == .custom { loadCustomReplies() }
         }
+    }
+
+    private func openAccessibilitySettings() {
+        if desktopApprovalAccess != true {
+            XPCHelperClient.shared.requestAccessibilityAuthorization()
+        }
+        let pane = URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility")!
+        if !NSWorkspace.shared.open(pane) {
+            let privacy = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+            NSWorkspace.shared.open(privacy)
+        }
+        accessibilitySettingsRevision += 1
+    }
+
+    private func refreshDesktopApprovalAccess() async {
+        desktopApprovalAccess = await XPCHelperClient.shared.isAccessibilityAuthorized()
+    }
+
+    private func loadCustomReplies() {
+        guard !customRepliesLoaded else { return }
+        customRepliesLoaded = true
+        customReplies = AgentQuickReplySource.customReplies(from: customReplyData).map {
+            CustomReplyDraft(title: $0.title, body: $0.body)
+        }
+        if customReplies.isEmpty { customReplies = [CustomReplyDraft()] }
     }
 
     @ViewBuilder
     private var customReplyEditor: some View {
         ForEach($customReplies) { $reply in
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
                     TextField("短标题（选填）", text: $reply.title)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("settings-custom-reply-title")
                     Button(role: .destructive) {
                         let id = reply.id
                         customReplies.removeAll { $0.id == id }
+                        if customReplies.isEmpty { customReplies = [CustomReplyDraft()] }
+                        customReplySaveState = nil
                     } label: {
                         Image(systemName: "minus.circle")
                     }
                     .buttonStyle(.borderless)
                     .accessibilityLabel("移除此回复")
+                    .accessibilityIdentifier("settings-remove-custom-reply")
                 }
                 TextField("发送给 Agent 的完整回复", text: $reply.body, axis: .vertical)
-                    .lineLimit(2...4)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(2...5)
+                    .focused($focusedReplyBody, equals: reply.id)
+                    .accessibilityIdentifier("settings-custom-reply-body")
             }
+            .padding(.vertical, 2)
         }
-        HStack {
-            Button {
-                customReplies.append(CustomReplyDraft())
-            } label: {
+        HStack(spacing: 8) {
+            Button(action: addCustomReply) {
                 Label("添加快捷回复", systemImage: "plus")
             }
+            .buttonStyle(.bordered)
             .disabled(customReplies.count >= AgentQuickReplySource.maximumChoices)
+            .accessibilityIdentifier("settings-add-custom-reply")
             Spacer()
-            Button("保存快捷回复") {
-                let options = normalizedCustomReplies
-                guard let encoded = try? JSONEncoder().encode(options) else { return }
-                customReplyData = encoded
-                customReplies = options.map { CustomReplyDraft(title: $0.title, body: $0.body) }
-            }
-            .disabled(normalizedCustomReplies == AgentQuickReplySource.customReplies(from: customReplyData))
+            Button("保存快捷回复", action: saveCustomReplies)
+                .buttonStyle(.borderedProminent)
+                .disabled(normalizedCustomReplies == AgentQuickReplySource.customReplies(from: customReplyData))
+                .accessibilityIdentifier("settings-save-custom-replies")
         }
-        Text("最多添加三条。留空的回复不会显示。")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        if let customReplySaveState {
+            Text(LocalizedStringKey(customReplySaveState)).font(.caption).foregroundStyle(.secondary)
+        } else {
+            Text("填写完整回复后保存。短标题可留空，最多保存三条。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func addCustomReply() {
+        let reply = CustomReplyDraft()
+        customReplies.append(reply)
+        customReplySaveState = nil
+        focusedReplyBody = reply.id
+    }
+
+    private func saveCustomReplies() {
+        let options = normalizedCustomReplies
+        guard let encoded = try? JSONEncoder().encode(options) else {
+            customReplySaveState = "快捷回复保存失败"
+            return
+        }
+        customReplyData = encoded
+        customReplySaveState = "快捷回复已保存"
     }
 
     private var normalizedCustomReplies: [AgentReplyOption] {

@@ -22,35 +22,20 @@ struct MusicPlayerView: View {
     let albumArtNamespace: Namespace.ID
     let viewportHeight: CGFloat
     var hasUnidentifiedAudio = false
-    @State private var showsUnidentifiedAudio = false
-
-    private var detectsUnidentifiedAudio: Bool {
-        hasUnidentifiedAudio && (!music.isPlaying || !music.hasPanelMedia)
-    }
-
     var body: some View {
         Group {
-            if music.hasPanelMedia && (music.isPlaying || !showsUnidentifiedAudio) {
+            if music.hasPanelMedia && (music.isPlaying || !hasUnidentifiedAudio) {
                 MusicControlsView(albumArtNamespace: albumArtNamespace, viewportHeight: max(1, viewportHeight - 4))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background { albumAtmosphere }
             } else {
-                MusicStandbyView(hasUnidentifiedAudio: showsUnidentifiedAudio)
+                MusicStandbyView(hasUnidentifiedAudio: hasUnidentifiedAudio)
                     .frame(maxWidth: .infinity, minHeight: min(64, viewportHeight))
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: music.hasPanelMedia)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: showsUnidentifiedAudio)
-        .task(id: detectsUnidentifiedAudio) {
-            guard detectsUnidentifiedAudio else {
-                showsUnidentifiedAudio = false
-                return
-            }
-            do { try await Task.sleep(for: .milliseconds(300)) }
-            catch { return }
-            showsUnidentifiedAudio = true
-        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: hasUnidentifiedAudio)
         .onAppear {
             if !UserDefaults.standard.bool(forKey: "lyricsFocusedMusicConfigured") {
                 Defaults[.enableLyrics] = true

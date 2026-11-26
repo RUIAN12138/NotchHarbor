@@ -27,7 +27,7 @@ class CalendarManager: ObservableObject {
     @Published private(set) var calendarConnectionError: String?
     private var selectedCalendars: [CalendarModel] = []
     private let calendarService = CalendarService()
-    private let logger = Logger(subsystem: "theboringteam.boringnotch", category: "CalendarSync")
+    private let logger = Logger(subsystem: "com.notchharbor.app", category: "CalendarSync")
 
     @Published private(set) var isLoading = false
     private var queryGeneration = 0

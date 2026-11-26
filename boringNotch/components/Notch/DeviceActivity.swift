@@ -624,26 +624,30 @@ final class AirPodsLidMonitor: NSObject, @preconcurrency CBCentralManagerDelegat
     }
 }
 
+enum NotchTextContrast: Equatable {
+    case standard, translucent, bright
+}
+
 private struct NotchTextContrastKey: EnvironmentKey {
-    static let defaultValue = false
+    static let defaultValue = NotchTextContrast.standard
 }
 
 extension EnvironmentValues {
-    var notchTextNeedsOutline: Bool {
+    var notchTextContrast: NotchTextContrast {
         get { self[NotchTextContrastKey.self] }
         set { self[NotchTextContrastKey.self] = newValue }
     }
 }
 
 private struct NotchReadableText: ViewModifier {
-    @Environment(\.notchTextNeedsOutline) private var needsOutline
+    @Environment(\.notchTextContrast) private var contrast
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if needsOutline {
+        if contrast != .standard {
             content
-                .shadow(color: .black.opacity(0.92), radius: 0.65)
-                .shadow(color: .black.opacity(0.78), radius: 0.4, y: 0.35)
+                .shadow(color: .black.opacity(contrast == .bright ? 1 : 0.82), radius: 0.65)
+                .shadow(color: .black.opacity(contrast == .bright ? 0.9 : 0.58), radius: 0.65, y: 0.35)
         } else {
             content
         }

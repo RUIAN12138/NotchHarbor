@@ -13,7 +13,7 @@ struct NotchDesktopRefraction: NSViewRepresentable {
     var shape: NotchShape
     var intensity: Double
     var previewCaptureSize: CGSize? = nil
-    var textContrastChanged: ((Bool) -> Void)? = nil
+    var textContrastChanged: ((Bool?) -> Void)? = nil
 
     func makeNSView(context: Context) -> RefractionHost {
         let host = RefractionHost()
@@ -80,7 +80,7 @@ private final class RefractionStreamOutput: NSObject, SCStreamOutput, SCStreamDe
 }
 
 final class RefractionHost: NSView {
-    private static let log = Logger(subsystem: "theboringteam.boringnotch", category: "DesktopRefraction")
+    private static let log = Logger(subsystem: "com.notchharbor.app", category: "DesktopRefraction")
     var shape = NotchShape()
     var intensity: Float = 1
     var previewCaptureSize: CGSize? {
@@ -144,8 +144,8 @@ final class RefractionHost: NSView {
     private var drawScheduled = false
     private var inFlight = false
     private var dirty = false
-    var textContrastChanged: ((Bool) -> Void)?
-    private var brightBackdrop = false
+    var textContrastChanged: ((Bool?) -> Void)?
+    private var brightBackdrop: Bool?
     private var contrastSampleAfter = ContinuousClock.Instant.now
     private var screenLocked = false
     private var displayAsleep = false
@@ -240,10 +240,10 @@ final class RefractionHost: NSView {
         dirty = false
         captureRect = nil
         surface.layer?.opacity = 0
-        if brightBackdrop {
-            brightBackdrop = false
+        if brightBackdrop != nil {
+            brightBackdrop = nil
             let notify = textContrastChanged
-            DispatchQueue.main.async { notify?(false) }
+            DispatchQueue.main.async { notify?(nil) }
         }
         if let stream { stream.stopCapture { _ in } }
         stream = nil
@@ -345,7 +345,7 @@ final class RefractionHost: NSView {
 
     private func sampleTextContrast(frame: RefractionFrame, local: CGRect, capture: CGRect) {
         let now = ContinuousClock.now
-        guard textContrastChanged != nil, now >= contrastSampleAfter, local.height >= 64 else { return }
+        guard textContrastChanged != nil, now >= contrastSampleAfter, local.height >= 28 else { return }
         contrastSampleAfter = now + .milliseconds(500)
         // Match the visible panel, rather than the full transparent window or the capture margin.
         let area = CGRect(x: (local.minX - capture.minX) / capture.width,
@@ -357,7 +357,7 @@ final class RefractionHost: NSView {
             guard let coverage = Self.brightCoverage(pixels, area: area) else { return }
             DispatchQueue.main.async {
                 guard let self, self.generation == token else { return }
-                let bright = coverage >= (self.brightBackdrop ? 0.20 : 0.34)
+                let bright = coverage >= (self.brightBackdrop == true ? 0.23 : 0.38)
                 guard bright != self.brightBackdrop else { return }
                 self.brightBackdrop = bright
                 self.textContrastChanged?(bright)
@@ -375,7 +375,10 @@ final class RefractionHost: NSView {
         let stride = CVPixelBufferGetBytesPerRow(pixels)
         var samples = 0
         var bright = 0
+        var brightestRow = 0.0
         for row in 0..<5 {
+            var rowBright = 0
+            var rowSamples = 0
             let y = area.minY + area.height * (0.24 + Double(row) * 0.15)
             for column in 0..<7 {
                 let x = area.minX + area.width * (0.13 + Double(column) * 0.122)
@@ -384,11 +387,15 @@ final class RefractionHost: NSView {
                 let blue = Double(base.load(fromByteOffset: offset, as: UInt8.self))
                 let green = Double(base.load(fromByteOffset: offset + 1, as: UInt8.self))
                 let red = Double(base.load(fromByteOffset: offset + 2, as: UInt8.self))
-                if red * 0.2126 + green * 0.7152 + blue * 0.0722 >= 187 { bright += 1 }
-                samples += 1
+                if red * 0.2126 + green * 0.7152 + blue * 0.0722 >= 180 { rowBright += 1 }
+                rowSamples += 1
             }
+            bright += rowBright
+            samples += rowSamples
+            // One bright band can sit under a whole line of text on mixed backgrounds.
+            if rowSamples >= 4 { brightestRow = max(brightestRow, Double(rowBright) / Double(rowSamples)) }
         }
-        return samples > 0 ? Double(bright) / Double(samples) : nil
+        return samples > 0 ? max(brightestRow, Double(bright) / Double(samples)) : nil
     }
 
     private func drawFrame() {

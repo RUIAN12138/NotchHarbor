@@ -303,7 +303,7 @@ class BoringViewModel: NSObject, ObservableObject {
     }
 
     static let expandedBottomInset: CGFloat = 8
-    static let expandedPageTopInset: CGFloat = 6
+    static let expandedPageTopInset: CGFloat = 9
 
     var expandedPageSize: CGSize {
         CGSize(width: max(1, expandedNotchSize.width - 2 * (usesSystemIslandTrigger ? expandedShoulderInset + 8 : 24)),

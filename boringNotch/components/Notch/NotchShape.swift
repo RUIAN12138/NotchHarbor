@@ -150,7 +150,7 @@ struct NotchGlassBackground: View, Animatable {
     var usesDarkGlassAppearance: Bool
     var transparency: Double
     var previewCaptureSize: CGSize?
-    var textContrastChanged: ((Bool) -> Void)?
+    var textContrastChanged: ((Bool?) -> Void)?
     private var agentConversationContrast: CGFloat
 
     /// Driven by `isExpanded`, but interpolated between states instead of
@@ -176,7 +176,7 @@ struct NotchGlassBackground: View, Animatable {
         usesDarkGlassAppearance: Bool = false,
         transparency: Double = 0.5,
         previewCaptureSize: CGSize? = nil,
-        textContrastChanged: ((Bool) -> Void)? = nil
+        textContrastChanged: ((Bool?) -> Void)? = nil
     ) {
         self.shape = shape
         self.isExpanded = isExpanded

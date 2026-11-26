@@ -254,8 +254,9 @@ struct ContentView: View {
     @State private var hoverTask: Task<Void, Never>?
     @State private var isHovering: Bool = false
     @AppStorage(MusicSpectrumSignal.enabledKey) private var musicLightEnabled = true
+    @State private var unidentifiedAudio = false
     @StateObject private var musicLightSignal = MusicSpectrumSignal()
-    @State private var textNeedsOutline = false
+    @State private var brightBackdrop: Bool?
     @ObservedObject private var spotlightGuide = NotchSpotlightGuideController.shared
     @State private var attentionGlow = false
     @State private var anyDropDebounceTask: Task<Void, Never>?
@@ -340,7 +341,7 @@ struct ContentView: View {
     }
 
     private var inlinePendingApproval: IslandActivity? {
-        guard !vm.compactAlertPresented, !vm.isSpotlightGuideActive else { return nil }
+        guard expandedPageRoute != .agent, !vm.compactAlertPresented, !vm.isSpotlightGuideActive else { return nil }
         let now = Date().timeIntervalSince1970
         return activities.proactiveAlerts.first { $0.hasPendingAgentApproval && $0.expires > now }
     }
@@ -349,10 +350,6 @@ struct ContentView: View {
         Button {
             guard let key = alert.agentAttentionKey,
                   let request = activities.currentAgentAttention(for: key) else { return }
-            if activities.codexApproval(for: request)?.route == "desktop" {
-                AgentApplicationIcons.open(activity: request)
-                return
-            }
             seenAgentRequests.insert(key)
             clearInlineCompletion()
             showCompactAlert(request)
@@ -470,6 +467,12 @@ struct ContentView: View {
     /// capture modes, so switching the backdrop cannot flip the palette.
     private var glassContentScheme: ColorScheme { isAgentConversationPage ? .dark : glassMaterialScheme }
 
+    private var glassTextContrast: NotchTextContrast {
+        guard vm.notchState == .open, usesSharedGlassShell, glassContentScheme == .dark else { return .standard }
+        guard desktopRefractionEnabled, !vm.openedForShelfDrag, let brightBackdrop else { return .translucent }
+        return brightBackdrop ? .bright : .standard
+    }
+
     private var glassMaterialScheme: ColorScheme {
         usesSharedGlassShell || !siriGlassEnabled ? .dark : systemColorScheme
     }
@@ -483,7 +486,7 @@ struct ContentView: View {
     }
 
     private var monitorsMusicPageAudio: Bool {
-        musicLightEnabled && vm.notchState == .open && expandedPageRoute == .music
+        musicLightEnabled && vm.notchState == .open && (expandedPageRoute == .music || musicLightSignal.audible)
             && !vm.compactAlertPresented && !vm.systemIslandPresentationActive
             && (!musicManager.hasPanelMedia || !musicManager.isPlaying)
     }
@@ -608,8 +611,7 @@ struct ContentView: View {
                     }
                 }
                     .environment(\.colorScheme, vm.notchState == .open ? glassContentScheme : .dark)
-                    .environment(\.notchTextNeedsOutline, vm.notchState == .open && !reduceTransparency
-                                 && desktopRefractionEnabled && textNeedsOutline)
+                    .environment(\.notchTextContrast, glassTextContrast)
                     .foregroundStyle(.primary)
                     .frame(alignment: .top)
                     .padding(.horizontal, vm.notchState == .open ? expandedContentHorizontalInset : cornerRadiusInsets.closed.bottom)
@@ -644,7 +646,7 @@ struct ContentView: View {
                             desktopRefractionEnabled: desktopRefractionEnabled && !vm.openedForShelfDrag,
                             keepsAgentConversationContrast: isAgentConversationPage,
                             usesDarkGlassAppearance: systemColorScheme == .dark, transparency: siriGlassTransparency,
-                            textContrastChanged: { textNeedsOutline = $0 }
+                            textContrastChanged: { brightBackdrop = $0 }
                         )
                             .environment(\.colorScheme, glassMaterialScheme)
                             .animation(reduceMotion ? nil : animationSpring, value: closedHoverHighlight)
@@ -946,6 +948,17 @@ struct ContentView: View {
             if !activities.proactiveAlerts.contains(where: \.isCompletedAgentSession) {
                 wingHandoffUntil = nil
             }
+            // Promote a visible original card over the earlier log-only notice.
+            if vm.compactAlertPresented, let previous = activeAgentRequest,
+               activities.codexApproval(for: previous)?.route == "desktop",
+               let live = activities.proactiveAlerts.first(where: {
+                   activities.codexApproval(for: $0)?.route == "desktop-panel"
+                       && $0.agentAttentionKey.map { !seenAgentRequests.contains($0) } == true
+               }), let key = live.agentAttentionKey {
+                seenAgentRequests.insert(key)
+                showCompactAlert(live)
+                return
+            }
             if let request = activeAgentRequest?.agentAttentionKey, !ids.contains(request), vm.compactAlertPresented {
                 completionHoverReplay = nil
                 withAnimation(shellAnimationForClose) { vm.close() }
@@ -1076,6 +1089,14 @@ struct ContentView: View {
                 transaction.animation = nil
                 transaction.disablesAnimations = true
             }
+        }
+        .task(id: musicLightSignal.audible && (!musicManager.hasPanelMedia || !musicManager.isPlaying)) {
+            guard musicLightSignal.audible && (!musicManager.hasPanelMedia || !musicManager.isPlaying) else {
+                unidentifiedAudio = false
+                return
+            }
+            do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+            unidentifiedAudio = true
         }
         .onChange(of: musicLightActive || monitorsMusicPageAudio, initial: true) { _, active in musicLightSignal.setActive(active) }
         .onDisappear { musicLightSignal.setActive(false) }
@@ -1245,7 +1266,7 @@ struct ContentView: View {
                                          agentHeightChanged: updateAgentListHeight,
                                          refreshWeather: { weatherRefreshRevision += 1 },
                                          onClipboardCopy: announceClipboardCopyReceipt,
-                                         hasUnidentifiedAudio: musicLightSignal.audible)
+                                         hasUnidentifiedAudio: unidentifiedAudio)
                             .id(expandedPageRoute)
                             .transition(pageTransition)
                     }
@@ -1568,6 +1589,10 @@ struct ContentView: View {
 
     private func canPresentAlert(_ alert: IslandActivity) -> Bool {
         if vm.notchState == .closed { return true }
+        if alert.hasPendingAgentApproval {
+            return !vm.compactAlertPresented && !vm.isAgentReplyEditing && !pageInteractionActive
+                && !menuIsTracking && !vm.anyDropZoneTargeting && !SharingStateManager.shared.preventNotchClose
+        }
         if alert.kind == "preview" { return !vm.isAgentReplyEditing }
         if alert.isCompletedAgentSession {
             return !(expandedPageRoute == .agent && vm.agentDetailExpanded)
@@ -1654,7 +1679,7 @@ struct ContentView: View {
             seenAutoAlerts[active.id] = active.expires
             showCompactAlert(active)
             if active.kind == "preview" {
-                Logger(subsystem: "theboringteam.boringnotch", category: "CompactAlert")
+                Logger(subsystem: "com.notchharbor.app", category: "CompactAlert")
                     .notice("Preview presented: \(active.title, privacy: .public), \(Int(vm.notchSize.width), privacy: .public) × \(Int(vm.notchSize.height), privacy: .public)")
             }
         } else {
@@ -1786,7 +1811,11 @@ struct ContentView: View {
         )
         selectedRouteBeforeOpening = vm.notchState == .closed
         let extraWidth: CGFloat = isTestingAgentHeadMotion ? 60 : (completionReply != nil || alert.agentAttentionKey != nil ? 32 : 0)
-        let approvalHeight: CGFloat = activities.codexApproval(for: alert)?.canReviewInNotch == true ? 170 : 100
+        let approvalHeight: CGFloat = if let approval = activities.codexApproval(for: alert), approval.canReviewInNotch {
+            approval.reviewSymbol == "terminal" ? 170 : 192
+        } else {
+            100
+        }
         let height: CGFloat = alert.isCompactWeather ? 49 : isTestingAgentHeadMotion ? AgentReplyChoiceCard.practiceHeight
             : alert.agentAttentionKey != nil ? approvalHeight : completionReply != nil ? 108 : alert.kind == "headphone-lid" ? 133 : isShowingClipboardReceipt ? 49 : alert.isCompletedAgentSession && Defaults[.enableGestures] ? 71 : 67
         let weatherClearance = alert.isCompactWeather
@@ -1938,7 +1967,10 @@ struct ContentView: View {
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(subject).notchReadableText().font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                if let action = requestAction, action != subject {
+                if codexRequest?.route == "desktop" {
+                    Text("等待原会话提供审批操作").notchReadableText()
+                        .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
+                } else if let action = requestAction, action != subject {
                     Text(action).notchReadableText().font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
@@ -1948,29 +1980,17 @@ struct ContentView: View {
             } else {
                 HStack(spacing: 5) {
                     Spacer(minLength: 0)
-                    Button { dismissAgentPopup(alert) } label: {
-                        Text("稍后").notchReadableText().font(.system(size: 11, weight: .medium))
-                            .padding(.horizontal, 9).frame(height: 24)
-                            .background(.primary.opacity(0.08), in: Capsule())
-                    }
+                    Button("稍后") { dismissAgentPopup(alert) }
+                        .buttonStyle(AgentApprovalButtonStyle(.neutral))
                     Button {
                         guard let key = alert.agentAttentionKey, let current = activities.currentAgentAttention(for: key) else { return }
-                        if codexRequest?.route == "desktop" {
-                            dismissAgentPopup(current)
-                            AgentApplicationIcons.open(activity: current)
-                        } else {
-                            openAlertDestination(current)
-                        }
+                        openAlertDestination(current)
                     } label: {
-                        Label(codexRequest?.route == "desktop" ? "在 Codex 审批" : approval ? "查看请求" : "查看并回复",
+                        Label(codexRequest?.route == "desktop" ? "查看待审批会话" : approval ? "查看请求" : "查看并回复",
                               systemImage: "arrow.up.right")
-                            .font(.system(size: 11, weight: .semibold)).lineLimit(1)
-                            .padding(.horizontal, 9).frame(height: 24)
-                            .foregroundStyle(accent)
-                            .background(accent.opacity(0.16), in: Capsule())
                     }
+                    .buttonStyle(AgentApprovalButtonStyle(.allow))
                 }
-                .buttonStyle(NotchControlStyle())
             }
         }
         .padding(.horizontal, 8)

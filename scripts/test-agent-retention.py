@@ -23,13 +23,13 @@ extension UnifiedActivities {
         for request in pending { request.acknowledge(in: testApprovals) }
         return (try? JSONEncoder().encode(pending + desktopApprovals)) ?? Data()
     }
-    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> Bool {
+    func submitCodexApproval(id: UUID, sessionID: UUID, choice: String) async -> String {
         guard let testApprovals, let choice = CodexApprovalPacket.Choice(rawValue: choice),
               let request = CodexApprovalPacket.pending(in: testApprovals).first(where: {
                   $0.id == id && $0.sessionID == sessionID
               })
-        else { return false }
-        return (try? request.submit(choice, in: testApprovals)) != nil
+        else { return "notSent" }
+        return (try? request.submit(choice, in: testApprovals)) != nil ? "confirmed" : "notSent"
     }
 }
 
@@ -79,11 +79,11 @@ extension UnifiedActivities {
         precondition(approvalHub.agentSession(for: popup.id) == popup && approvalHub.codexApproval(for: popup) == request)
         precondition(FileManager.default.fileExists(atPath: requestURL.deletingPathExtension().appendingPathExtension("ready").path))
         let sent = await approvalHub.submitCodexApproval(.deny, request: request)
-        precondition(sent)
+        precondition(sent == .confirmed)
         let result = try String(contentsOf: requestURL.deletingPathExtension().appendingPathExtension("decision"), encoding: .utf8)
         precondition(result == "deny")
         let duplicate = await approvalHub.submitCodexApproval(.allow, request: request)
-        precondition(!duplicate, "A second decision must not overwrite the first")
+        precondition(duplicate == .notSent, "A second decision must not overwrite the first")
         try FileManager.default.removeItem(at: requestURL)
         await approvalHub.refreshTestCodexApprovals()
         precondition(approvalHub.currentAgentAttention(for: popup.agentAttentionKey!) == nil)
@@ -98,7 +98,7 @@ extension UnifiedActivities {
         precondition(approvalHub.codexApproval(for: desktop)?.canReviewInNotch == false)
         let nativeRow = approvalHub.codexApproval(for: desktop)!
         let grant = await approvalHub.submitCodexApproval(.allow, request: nativeRow)
-        precondition(!grant, "Desktop notices must never authorize permissions from a log")
+        precondition(grant == .notSent, "Desktop notices must never authorize permissions from a log")
         XPCHelperClient.shared.desktopApprovals = []
         await approvalHub.refreshTestCodexApprovals()
         precondition(approvalHub.currentAgentAttention(for: desktop.agentAttentionKey!) == nil)

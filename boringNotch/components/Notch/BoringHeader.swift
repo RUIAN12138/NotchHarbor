@@ -188,7 +188,7 @@ struct BoringHeader: View {
             // Move the glass button and its glyph as one object, while the
             // outer pointer target remains stable during Dock-style motion.
             .scaleEffect(1 + magnification * 0.24, anchor: .bottom)
-            .offset(y: -magnification)
+            .offset(y: (vm.closedNotchSize.height > 0 ? 3 : 0) - magnification)
             .allowsHitTesting(false)
             .frame(width: width, height: controlHitHeight)
             .background { Color.clear }
