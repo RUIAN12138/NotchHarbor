@@ -435,24 +435,6 @@ struct GeneralSettings: View {
 
             gestureControls()
 
-            Section {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("高光使用引导")
-                        Text("在顶部刘海内交互式高亮演示五大核心工作台与快捷操作。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button {
-                        NotchSpotlightGuideController.shared.start(force: true)
-                    } label: {
-                        Label("开始引导", systemImage: "sparkles")
-                    }
-                }
-            } header: {
-                Text("快速上手")
-            }
         }
         .accentColor(.effectiveAccent)
         .navigationTitle("General")
@@ -507,7 +489,7 @@ struct GeneralSettings: View {
             Defaults.Toggle(key: .showIslandSideActivities) {
                 Text("显示刘海两侧的小灵动岛")
             }
-            .help("包括 Agent 工作状态和耳机等侧翼提示。")
+            .help("显示音乐封面与波形、复制回执、Agent 和耳机状态。")
 
             Defaults.Toggle(key: .openNotchOnHover) {
                 Text("Open notch on hover")
@@ -937,10 +919,6 @@ struct About: View {
                     CheckForUpdatesView(updater: updaterController.updater)
                 }
 
-                Button("重新查看高光使用引导") {
-                    NotchSpotlightGuideController.shared.start(force: true)
-                }
-
                 Button("重新启动 Notch Harbor") { ApplicationRelauncher.restart() }
 
                 Section {
@@ -1214,6 +1192,8 @@ struct Shelf: View {
 //}
 
 private struct HarborNotchPreview: View {
+    @Default(.collapsedShellStyle) private var collapsedStyle
+    @Default(.restingExtension) private var restingExtension
     @ObservedObject var liveModel: BoringViewModel
     @StateObject private var model = BoringViewModel(isSettingsPreview: true)
     @ObservedObject private var music = MusicManager.shared
@@ -1251,8 +1231,8 @@ private struct HarborNotchPreview: View {
 
     private var usesGlass: Bool { glassEnabled && !reduceTransparency }
     private var inkScheme: ColorScheme { usesGlass || !glassEnabled ? .dark : colorScheme }
-    private var shellHeight: CGFloat { expanded ? model.expandedNotchSize.height : model.effectiveClosedNotchHeight }
-    private var shellWidth: CGFloat { expanded ? model.expandedPanelWidth : model.closedNotchSize.width }
+    private var shellHeight: CGFloat { expanded ? model.expandedNotchSize.height : model.runningAgentHeight }
+    private var shellWidth: CGFloat { expanded ? model.expandedPanelWidth : model.runningAgentCenterWidth + (collapsedStyle == .hidden ? 0 : 2 * restingExtension) }
     private var musicLightActive: Bool {
         musicLightEnabled && expanded && usesGlass && !reduceMotion && lightIntensity > 0 && music.isPlaying
     }
@@ -1337,7 +1317,7 @@ private struct HarborNotchPreview: View {
     }
 
     private var panel: some View {
-        let shape = NotchShape.panel(expanded: expanded)
+        let shape = !expanded && collapsedStyle == .notch ? NotchShape() : NotchShape.panel(expanded: expanded)
         let hardware = model.expandedHeaderSize
         return ZStack(alignment: .top) {
             NotchGlassBackground(
@@ -1353,6 +1333,7 @@ private struct HarborNotchPreview: View {
                 usesDarkGlassAppearance: colorScheme == .dark, transparency: transparency,
                 previewCaptureSize: CGSize(width: model.expandedPanelWidth, height: max(1, shellHeight))
             )
+            .opacity(expanded || collapsedStyle != .hidden ? 1 : 0)
             .environment(\.colorScheme, inkScheme)
             .shadow(color: .black.opacity(enableShadow && !(usesGlass && NotchOpticalSupport.isAvailable) ? 0.18 : 0),
                     radius: 8, y: 3)
@@ -1437,6 +1418,10 @@ private struct HarborNotchPreview: View {
 }
 
 struct Appearance: View {
+    @Default(.collapsedShellStyle) private var collapsedStyle
+    @Default(.restingExtension) private var restingExtension
+    @Default(.lyricLineCount) private var lyricLineCount
+    @Default(.largerPanel) private var largerPanel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Default(.appAppearance) private var appearance
     @Default(.mirrorShape) var mirrorShape
@@ -1503,6 +1488,27 @@ struct Appearance: View {
     var body: some View {
         Form {
             Section("Color theme") { themeOptions }
+            Section("灵动岛布局") {
+                Picker("收起形态", selection: $collapsedStyle) {
+                    Text("完全收起").tag(CollapsedShellStyle.hidden)
+                    Text("刘海").tag(CollapsedShellStyle.notch)
+                    Text("灵动岛").tag(CollapsedShellStyle.island)
+                }
+                .pickerStyle(.segmented)
+                if collapsedStyle != .hidden {
+                    Slider(value: $restingExtension, in: 0...36, step: 1) {
+                        Text("两侧延伸 · \(Int(restingExtension)) pt")
+                    }
+                }
+                Picker("同步歌词", selection: $lyricLineCount) {
+                    Text("当前一句").tag(1)
+                    Text("当前与下一句").tag(2)
+                }
+                Toggle("加大展开面板", isOn: $largerPanel)
+                    .onChange(of: largerPanel) {
+                        NotificationCenter.default.post(name: .notchHeightChanged, object: nil)
+                    }
+            }
 
 
             Section {

@@ -25,7 +25,6 @@ struct OnboardingView: View {
     @Default(.settingsLanguage) private var settingsLanguage
     @State var step: OnboardingStep = .welcome
     let onFinish: () -> Void
-    var onSkipGuide: (() -> Void)? = nil
     let onOpenSettings: () -> Void
 
     private var isEnglish: Bool {
@@ -160,7 +159,6 @@ struct OnboardingView: View {
             case .finished:
                 OnboardingFinishView(
                     onFinish: onFinish,
-                    onSkipGuide: onSkipGuide,
                     onOpenSettings: onOpenSettings
                 )
             }

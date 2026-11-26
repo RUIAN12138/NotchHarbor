@@ -191,6 +191,7 @@ with tempfile.TemporaryDirectory(dir='/Applications', prefix='.notch-harbor-') a
             run('/usr/bin/open', '-g', str(old))
         raise
 subprocess.run([lsregister, '-u', str(build)], capture_output=True)
-shutil.rmtree(build)
+if not (os.statvfs(build).f_flag & os.ST_RDONLY):
+    shutil.rmtree(build)
 print(f'Installed and running: {new} (PID {pid})')
 print(f'Backup: {backup}')

@@ -679,8 +679,9 @@ final class AgentMessagingService {
         guard !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw Failure(message: "回复不能为空")
         }
+        // Resuming must inherit the original permission policy. Doubao rejects overrides on existing sessions.
         let output = try run(binary, args: ["--resume", sessionID, "-p", "-",
-                             "--permission-mode", "ask_always", "--output-format", "json"],
+                             "--output-format", "json"],
                              input: request.text, cwd: URL(fileURLWithPath: NSTemporaryDirectory()),
                              timeout: 180, codex: false)
         guard let row = (try? JSONSerialization.jsonObject(with: Data(output.utf8))) as? [String: Any],
@@ -764,6 +765,12 @@ final class AgentMessagingService {
             events.threadID = Self.codexEvents(in: String(decoding: prefix, as: UTF8.self)).threadID
         }
         guard inputWritten, process.terminationStatus == 0, events.failure == nil else {
+            if binary.lastPathComponent == "doubao",
+               let row = try? JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any],
+               row["is_error"] as? Bool == true {
+                let reason = (row["errors"] as? [String])?.first ?? "请检查登录状态和原会话"
+                throw Failure(message: "豆包 CLI：" + String(reason.prefix(180)))
+            }
             throw Failure(message: Self.failureMessage(events.failure.flatMap { $0.isEmpty ? nil : $0 } ?? errors))
         }
         if let expectedThread, events.threadID != expectedThread || !events.completed {

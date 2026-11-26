@@ -226,7 +226,7 @@ struct MusicControlsView: View {
                 songInfo.frame(height: 17)
                 if !trimmedTitle.isEmpty && lyricsEnabled && musicManager.isSong && height >= 36 {
                     MusicLyricsFocusView()
-                        .frame(height: min(54, height - 19), alignment: .topLeading)
+                        .frame(height: max(1, height - 19), alignment: .topLeading)
                         .clipped()
                 }
             }
@@ -833,6 +833,7 @@ private func albumLyricInk(_ color: NSColor) -> NSColor {
 }
 
 private struct MusicLyricsFocusView: View {
+    @Default(.lyricLineCount) private var lineCount
     @ObservedObject private var music = MusicManager.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var lineHeights: [Int: CGFloat] = [:]
@@ -858,7 +859,7 @@ private struct MusicLyricsFocusView: View {
             ZStack {
                 if !foliaRendered || foliaFailed { nativeRail }
                 if !foliaFailed, let url = Bundle.main.url(forResource: "FoliaRail", withExtension: "html") {
-                    FoliaLyricsRail(file: url, music: music, reduceMotion: reduceMotion) { rendered in
+                    FoliaLyricsRail(file: url, music: music, reduceMotion: reduceMotion, lineCount: lineCount) { rendered in
                         foliaRendered = rendered
                         foliaFailed = !rendered
                     }
@@ -880,7 +881,7 @@ private struct MusicLyricsFocusView: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .topLeading) {
                         if !music.syncedLyrics.isEmpty {
-                            ForEach(max(-1, current - 2)...min(music.syncedLyrics.count - 1, current + 2), id: \.self) { index in
+                            ForEach(current...min(music.syncedLyrics.count - 1, current + (lineCount == 1 ? 0 : 1)), id: \.self) { index in
                                 let distance = index - current
                                 let active = distance == 0
                                 let line = index < 0 ? "前奏" : music.syncedLyrics[index].text
@@ -975,6 +976,7 @@ private struct FoliaLyricsRail: NSViewRepresentable {
     let file: URL
     let music: MusicManager
     let reduceMotion: Bool
+    let lineCount: Int
     let reportRender: (Bool) -> Void
 
     func makeCoordinator() -> Bridge { Bridge(music: music, reportRender: reportRender) }
@@ -998,6 +1000,7 @@ private struct FoliaLyricsRail: NSViewRepresentable {
     }
 
     func updateNSView(_ web: WKWebView, context: Context) {
+        context.coordinator.lineCount = lineCount
         context.coordinator.reduced = reduceMotion
         context.coordinator.sync()
     }
@@ -1014,6 +1017,7 @@ private struct FoliaLyricsRail: NSViewRepresentable {
         weak var web: WKWebView?
         var timeout: Task<Void, Never>?
         let reportRender: (Bool) -> Void
+        var lineCount = 2
         var reduced = false
         private var ready = false
         private var inFlight = false
@@ -1063,7 +1067,7 @@ private struct FoliaLyricsRail: NSViewRepresentable {
             let lyrics = music.syncedLyrics
             // Include actual timeline revisions and duration; the prior
             // first/last-line heuristic missed replacements of middle times.
-            let key = "\(music.lyricsTimingRevision)|\(music.songDuration)"
+            let key = "\(music.lyricsTimingRevision)|\(music.songDuration)|\(lineCount)"
             let changed = lastKey != key
             let rgb = albumLyricInk(music.avgColor).usingColorSpace(.sRGB)
             let channels = [rgb?.redComponent, rgb?.greenComponent, rgb?.blueComponent].map {
@@ -1075,7 +1079,7 @@ private struct FoliaLyricsRail: NSViewRepresentable {
             guard changed || anchorChanged || lastReduced != reduced || lastAlbumInk != albumInk else { return }
             var payload: [String: Any] = ["key": key, "elapsed": elapsed, "rate": rate,
                                            "playing": playing, "reduced": reduced,
-                                           "albumInk": albumInk,
+                                           "albumInk": albumInk, "lineCount": lineCount,
                                            "duration": music.songDuration.isFinite ? music.songDuration : 0]
             if changed { payload["lines"] = lyrics.map { ["time": $0.time, "text": $0.text] } }
             inFlight = true

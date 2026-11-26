@@ -978,7 +978,11 @@ struct ClipboardTextTokens {
     func blocks(in visible: NSRange) -> [NSRange] {
         let string = text as NSString
         guard visible.length > 0, NSMaxRange(visible) <= string.length else { return [] }
-        let scope = string.lineRange(for: visible)
+        // Extremely long single-line clips must not force tokenization of the whole line.
+        let line = string.lineRange(for: visible)
+        let lower = max(line.location, visible.location - min(512, visible.location - line.location))
+        let upper = min(NSMaxRange(line), NSMaxRange(visible) + 512)
+        let scope = string.rangeOfComposedCharacterSequences(for: NSRange(location: lower, length: upper - lower))
         let atomicRanges = [Self.links as NSRegularExpression?, Self.email, Self.compound].compactMap { $0 }.reduce(into: [NSRange]()) { ranges, matcher in
             for match in matcher.matches(in: text, range: scope)
                 where !ranges.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) {
@@ -1069,16 +1073,8 @@ private struct ClipboardSelectableText: NSViewRepresentable {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
-        let width = proposal.width ?? 340
-        guard width > 0, let view = nsView.documentView as? WordPicker,
-              let layout = view.layoutManager, let container = view.textContainer else { return nil }
-        view.setFrameSize(NSSize(width: width, height: max(1, view.frame.height)))
-        layout.ensureLayout(for: container)
-        let docHeight = max(20, ceil(layout.usedRect(for: container).height) + 2 * view.textContainerInset.height + 2)
-        if abs(view.frame.height - docHeight) > 1 {
-            view.setFrameSize(NSSize(width: width, height: docHeight))
-        }
-        return CGSize(width: width, height: min(240, docHeight))
+        guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
+        return CGSize(width: width, height: 240)
     }
 
     final class WordPicker: NSTextView {

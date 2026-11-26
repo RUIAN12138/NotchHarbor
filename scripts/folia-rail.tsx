@@ -13,6 +13,7 @@ type Snapshot = {
     playing?: boolean;
     reduced: boolean;
     albumInk?: string;
+    lineCount: number;
 };
 type PlaybackAnchor = {
     elapsed: number;
@@ -122,8 +123,8 @@ function Rail() {
     const entries = useMemo(() => buildMonetVisibleLineEntries({
         lines, currentLineIndex: current,
         activeLine: lines[current] ?? null, recentCompletedLine: lines[current - 1] ?? null,
-        upcomingLine: lines[current + 1] ?? null, currentTime: clock.get(), before: 1, after: 1,
-    }), [lines, current, clock]);
+        upcomingLine: lines[current + 1] ?? null, currentTime: clock.get(), before: 0, after: snapshot?.lineCount === 1 ? 0 : 1,
+    }), [lines, current, clock, snapshot?.lineCount]);
 
     useEffect(() => {
         if (!lines.length) return;
@@ -155,7 +156,7 @@ function Rail() {
     return <MotionConfig reducedMotion={snapshot.reduced ? 'always' : 'never'}>
         <MonetLyricsRail key={snapshot.key} entries={entries} lines={lines} currentLineIndex={current}
             currentTime={clock} theme={theme}
-            lyricFontPx={20} inactiveFontPx={15} translationFontPx={12}
+            lyricFontPx={snapshot.lineCount === 1 ? 20 : 18} inactiveFontPx={14} translationFontPx={12}
             fontStack={fonts} keywordColoringEnabled={false} emptyText=""
             onLyricLineSeek={elapsed => (window as any).webkit.messageHandlers.foliaSeek.postMessage(elapsed)} />
     </MotionConfig>;

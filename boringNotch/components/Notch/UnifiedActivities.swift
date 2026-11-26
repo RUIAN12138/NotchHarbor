@@ -1404,6 +1404,8 @@ private enum AgentActivityFilter: String, CaseIterable, Identifiable {
 /// Compact viewport inside Boring Notch’s existing page geometry.
 struct NotchWingActivityView: View {
     let activity: IslandActivity
+    let signal: MusicSpectrumSignal
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let headphone: DeviceAlert?
     let centerWidth: CGFloat
     let height: CGFloat
@@ -1416,7 +1418,12 @@ struct NotchWingActivityView: View {
         HStack(spacing: 0) {
             Button(action: open) {
                 Group {
-                    if activity.kind == "headphones", let headphone {
+                    if activity.kind == "music" {
+                        Image(nsImage: MusicManager.shared.albumArt).resizable().aspectRatio(contentMode: .fill)
+                            .frame(width: 21, height: 21).clipShape(RoundedRectangle(cornerRadius: 5))
+                    } else if activity.kind == "clipboard-copy" {
+                        Image(systemName: "clipboard")
+                    } else if activity.kind == "headphones", let headphone {
                         DeviceArt(alert: headphone, size: 27)
                     } else {
                         ActivityAvatar(activity: activity, size: 18)
@@ -1434,7 +1441,19 @@ struct NotchWingActivityView: View {
                 Color.clear.frame(width: centerWidth, height: height).allowsHitTesting(false)
                 Button(action: open) {
                     Group {
-                        if activity.kind == "headphones", let headphone {
+                        if activity.kind == "music" {
+                            TimelineView(.animation(minimumInterval: 1.0 / 24, paused: reduceMotion || reveal == 0 || !signal.audible)) { _ in
+                                let bands = signal.lightResponse()
+                                HStack(spacing: 1.5) {
+                                    ForEach(0..<6, id: \.self) { i in
+                                        Capsule().frame(width: 2, height: 3 + 12 * CGFloat(min(1, max(0, bands[i * 3]))))
+                                    }
+                                }
+                                .foregroundStyle(Color(nsColor: MusicManager.shared.avgColor.blended(withFraction: 0.25, of: .white) ?? .white))
+                            }
+                        } else if activity.kind == "clipboard-copy" {
+                            Image(systemName: "checkmark").foregroundStyle(.green)
+                        } else if activity.kind == "headphones", let headphone {
                             HeadphoneBatteryRing(level: headphone.battery, size: 18, showsValue: false)
                         } else if activity.isGeneratingAgentReply {
                             AgentReplyGenerationSparkle()

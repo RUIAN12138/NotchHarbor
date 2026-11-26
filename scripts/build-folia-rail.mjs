@@ -14,6 +14,13 @@ const bundle = await build({
     plugins: [{
         name: 'notch-active-lyric-contrast',
         setup(builder) {
+            builder.onLoad({filter: /monetLyricsModel\.ts$/}, async ({path}) => {
+                const source = await readFile(path, 'utf8');
+                const contents = source.replace('Math.max(fontPx * 0.16, 8)', '1')
+                    .replace('Math.max(fontPx * 0.34, 14)', '1')
+                    .replace('Math.min(textLineCount, textLimit)', '1');
+                return {contents, loader: 'ts'};
+            });
             builder.onLoad({filter: /monetRailLayout\.ts$/}, async ({path}) => {
                 const upstream = await readFile(path, 'utf8');
                 const adjustments = [
@@ -28,9 +35,9 @@ const bundle = await build({
             tone.opacity *= 0.88;
         }
         const layout = getOrMeasureMonetLineLayout(layoutCache, entry, measureInputs);`],
-                    ['const focusCenterY = railHeight * 0.46;', 'const focusCenterY = Math.max(railHeight * 0.40, measuredEntries[anchorIndex].scaledHeight / 2 + 2);'],
+                    ['const focusCenterY = railHeight * 0.46;', 'const focusCenterY = measuredEntries[anchorIndex].scaledHeight / 2 + 1;'],
                     ['Math.max(MONET_ACTIVE_GAP_PX, lyricFontPx * MONET_ACTIVE_GAP_RATIO)',
-                     'Math.min(10, Math.max(MONET_ACTIVE_GAP_PX, lyricFontPx * MONET_ACTIVE_GAP_RATIO))'],
+                     '2'],
                 ];
                 let contents = upstream;
                 for (const [before, after] of adjustments) {
@@ -50,6 +57,6 @@ const css = `html,body{margin:0;overflow:hidden;background:transparent;color:whi
 .whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}
 .inline-block{display:inline-block}.inset-0{inset:0}
 #rail>.relative{height:100vh!important;max-width:none!important;mask-image:linear-gradient(black 0%,black 84%,transparent 100%)!important}
-#rail{filter:drop-shadow(0 1px 1px #374458c0) drop-shadow(0 0 1px #485670a0)}`;
+#rail [role=button] .whitespace-pre-wrap{white-space:nowrap}#rail{filter:drop-shadow(0 1px 1px #374458c0) drop-shadow(0 0 1px #485670a0)}`;
 const script = bundle.outputFiles[0].text.replace(/<\/script/gi, '<\\/script');
 await writeFile(output, `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=Content-Security-Policy content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"><style>${css}</style><div id=rail></div><script>${script}</script>`);

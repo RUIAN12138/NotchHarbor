@@ -741,34 +741,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupDragDetectors()
 
-        NotchSpotlightGuideController.shared.onRequestOpenNotch = { [weak self] in
-            guard let self else { return }
-            self.closeNotchTask?.cancel()
-            self.closeNotchTask = nil
-            self.coordinator.firstLaunch = false
-            var targetVM = self.vm
-            if Defaults[.showOnAllDisplays] {
-                let mouse = NSEvent.mouseLocation
-                if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main,
-                   let uuid = screen.displayUUID,
-                   let screenVM = self.viewModels[uuid] {
-                    targetVM = screenVM
-                }
-            }
-            if let win = (Defaults[.showOnAllDisplays] ? targetVM.screenUUID.flatMap { self.windows[$0] } : self.window) {
-                win.orderFrontRegardless()
-            }
-            withAnimation(targetVM.animation) {
-                targetVM.open()
-            }
-        }
-
-        if CommandLine.arguments.contains("--spotlight-guide") {
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(650))
-                NotchSpotlightGuideController.shared.start(force: true)
-            }
-        } else if coordinator.firstLaunch {
+        if coordinator.firstLaunch {
             DispatchQueue.main.async {
                 self.showOnboardingWindow()
             }
@@ -1045,16 +1018,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 rootView: OnboardingView(
                     step: step,
                     onFinish: { [weak self] in
-                        window.orderOut(nil)
-                        window.close()
-                        NSApp.deactivate()
-                        self?.coordinator.firstLaunch = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
-                            NotchSpotlightGuideController.shared.start(force: true)
-                        }
-                    },
-                    onSkipGuide: { [weak self] in
-                        NotchSpotlightGuideController.shared.hasCompleted = true
                         window.orderOut(nil)
                         window.close()
                         NSApp.deactivate()

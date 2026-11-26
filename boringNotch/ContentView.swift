@@ -257,7 +257,8 @@ struct ContentView: View {
     @State private var unidentifiedAudio = false
     @StateObject private var musicLightSignal = MusicSpectrumSignal()
     @State private var brightBackdrop: Bool?
-    @ObservedObject private var spotlightGuide = NotchSpotlightGuideController.shared
+    @Default(.collapsedShellStyle) private var collapsedStyle
+    @Default(.restingExtension) private var restingExtension
     @State private var attentionGlow = false
     @State private var anyDropDebounceTask: Task<Void, Never>?
     @State private var menuIsTracking = false
@@ -341,7 +342,7 @@ struct ContentView: View {
     }
 
     private var inlinePendingApproval: IslandActivity? {
-        guard expandedPageRoute != .agent, !vm.compactAlertPresented, !vm.isSpotlightGuideActive else { return nil }
+        guard expandedPageRoute != .agent, !vm.compactAlertPresented else { return nil }
         let now = Date().timeIntervalSince1970
         return activities.proactiveAlerts.first { $0.hasPendingAgentApproval && $0.expires > now }
     }
@@ -417,7 +418,7 @@ struct ContentView: View {
     private var shellTarget: ShellTarget {
         let expanded = vm.notchState == .open
         let restingSize = agentRestingFrame?.size
-            ?? CGSize(width: vm.closedNotchSize.width, height: vm.effectiveClosedNotchHeight)
+            ?? CGSize(width: vm.runningAgentCenterWidth + (collapsedStyle == .hidden ? 0 : 2 * restingExtension), height: vm.runningAgentHeight)
         return ShellTarget(expanded: expanded,
                            size: expanded ? CGSize(width: expandedWidth, height: vm.notchSize.height + replyPullHint) : restingSize)
     }
@@ -497,7 +498,13 @@ struct ContentView: View {
     private let expandedPageTopInset = BoringViewModel.expandedPageTopInset
 
     private var visibleWingActivity: IslandActivity? {
-        showIslandSideActivities ? activities.wingActivity : nil
+        guard showIslandSideActivities else { return nil }
+        if let activity = activities.wingActivity, activity.agentAttentionKey != nil { return activity }
+        if let clipboardCopyReceipt { return clipboardCopyReceipt }
+        if let activity = activities.wingActivity { return activity }
+        guard musicManager.isPlaying, musicManager.hasPanelMedia else { return nil }
+        return IslandActivity(id: "music-wings", kind: "music", title: musicManager.songTitle,
+                              detail: musicManager.artistName, symbol: "music.note", priority: 0, expires: 0)
     }
 
     private var presentsSideWings: Bool {
@@ -530,7 +537,7 @@ struct ContentView: View {
 
     private var pageInteractionActive: Bool {
         vm.isPanelPointerPressed || vm.isBatteryPopoverActive || vm.isMusicVolumePopoverActive
-            || vm.isMusicScrubbing || vm.isShelfRenameEditing || vm.isAirPodsPopoverActive || vm.isClipboardPreviewActive || vm.agentConversationPreviewID != nil || vm.isWeatherWarningListOpen || vm.isAgentReplyEditing || vm.isAgentVoiceReplyActive || vm.isHeaderMenuActive || vm.isSpotlightGuideActive
+            || vm.isMusicScrubbing || vm.isShelfRenameEditing || vm.isAirPodsPopoverActive || vm.isClipboardPreviewActive || vm.agentConversationPreviewID != nil || vm.isWeatherWarningListOpen || vm.isAgentReplyEditing || vm.isAgentVoiceReplyActive || vm.isHeaderMenuActive
     }
 
     private func swipePage(_ step: Int) -> Bool {
@@ -581,7 +588,8 @@ struct ContentView: View {
     }
 
     private var currentNotchShape: NotchShape {
-        .panel(expanded: vm.notchState == .open)
+        if vm.notchState == .closed, agentRestingFrame == nil, collapsedStyle == .notch { return NotchShape() }
+        return .panel(expanded: vm.notchState == .open)
     }
 
     private var gestureScale: CGFloat {
@@ -666,7 +674,7 @@ struct ContentView: View {
                     .offset(x: vm.notchState == .open ? 0 : (agentRestingFrame == nil ? 0 : vm.runningAgentOffset))
                     .modifier(NotchShellVisibility(
                         progress: vm.notchState == .open ? 1 : 0,
-                        collapsedPresence: agentRestingFrame != nil ? 1 : 0,
+                        collapsedPresence: agentRestingFrame != nil || collapsedStyle != .hidden ? 1 : 0,
                         allowsCollapsedShell: vm.runningAgentVisible
                     ))
                     .allowsHitTesting(vm.notchState == .open)
@@ -810,7 +818,7 @@ struct ContentView: View {
         }
         .overlay(alignment: .top) {
             if !vm.runningAgentWings.frame.isNull, let activity = visibleWingActivity ?? lastWingActivity {
-                NotchWingActivityView(activity: activity, headphone: activities.headphoneAlert,
+                NotchWingActivityView(activity: activity, signal: musicLightSignal, headphone: activities.headphoneAlert,
                                       centerWidth: vm.runningAgentCenterWidth, height: vm.runningAgentHeight,
                                       reveal: presentsSideWings ? 1 : 0, open: { openActivity(activity) })
                     .offset(x: vm.runningAgentOffset)
@@ -858,7 +866,7 @@ struct ContentView: View {
                 try? await Task.sleep(for: .milliseconds(240))
             }
             while !Task.isCancelled, receipt.expires > Date().timeIntervalSince1970 {
-                if !vm.systemIslandPresentationActive, vm.notchState == .closed {
+                if !showIslandSideActivities, !vm.systemIslandPresentationActive, vm.notchState == .closed {
                     showCompactAlert(receipt)
                     break
                 }
@@ -1098,7 +1106,7 @@ struct ContentView: View {
             do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
             unidentifiedAudio = true
         }
-        .onChange(of: musicLightActive || monitorsMusicPageAudio, initial: true) { _, active in musicLightSignal.setActive(active) }
+        .onChange(of: musicLightActive || monitorsMusicPageAudio || (presentsSideWings && visibleWingActivity?.kind == "music" && musicLightEnabled), initial: true) { _, active in musicLightSignal.setActive(active) }
         .onDisappear { musicLightSignal.setActive(false) }
         .onChange(of: vm.expandedNotchSize) { _, size in
             if vm.notchState == .open, vm.notchSize != size {
@@ -1226,94 +1234,59 @@ struct ContentView: View {
             // The parent owns insertion/removal. Keep the outgoing page
             // drawable while its reveal animates instead of swapping in
             // collapsed content as soon as the model changes state.
-            let guideVisible = vm.isSpotlightGuideActive && spotlightGuide.isActive && !coordinator.firstLaunch && vm.notchState == .open
             let headerClearance = (vm.usesSystemIslandTrigger ? vm.systemIslandClearanceWidth : expandedHeaderSize.width) + 4
-            let guideGeometry = SpotlightGuideGeometry(
-                panelWidth: vm.expandedPageSize.width,
-                headerHeight: expandedHeaderHeight,
-                cameraClearanceWidth: headerClearance + (vm.usesSystemIslandTrigger ? 4 : 16),
-                topInset: expandedPageTopInset,
-                pageWidth: vm.expandedPageSize.width,
-                pageHeight: pageViewportHeight,
-                shelfEnabled: Defaults[.boringShelf]
-            )
-
-            VStack(alignment: .center, spacing: SpotlightGuideGeometry.coachBarTopSpacing) {
-                VStack(alignment: .center, spacing: expandedPageTopInset) {
-                    if coordinator.firstLaunch {
-                        Spacer()
-                        HelloAnimation()
-                            .frame(width: getClosedNotchSize().width, height: 80)
-                            .onAppear { vm.closeHello() }
-                            .padding(.top, 40)
-                        Spacer()
-                    } else {
-                        BoringHeader(
-                            cameraClearanceWidth: headerClearance,
-                            headerHeight: expandedHeaderHeight,
-                            showsSpotlightTargets: guideVisible
-                        )
-                        .environment(\.colorScheme, glassHeaderScheme)
-                        .environment(\.usesSharedGlassShell, usesSharedGlassShell)
-                        .frame(height: expandedHeaderHeight)
-                        .opacity(1 - min(abs(gestureProgress) * 0.1, 0.3))
-                        .zIndex(2)
-                    }
-                    ZStack(alignment: .top) {
-                        NotchPageContent(page: expandedPageRoute, albumArtNamespace: albumArtNamespace,
-                                         viewportHeight: pageViewportHeight, previewColorScheme: systemColorScheme,
-                                         selectedID: Binding(get: { vm.selectedAgentID }, set: selectAgentSession),
-                                         agentHeightChanged: updateAgentListHeight,
-                                         refreshWeather: { weatherRefreshRevision += 1 },
-                                         onClipboardCopy: announceClipboardCopyReceipt,
-                                         hasUnidentifiedAudio: unidentifiedAudio)
-                            .id(expandedPageRoute)
-                            .transition(pageTransition)
-                    }
-                    .frame(width: vm.expandedPageSize.width, height: pageViewportHeight, alignment: .top)
-                    .overlay(alignment: .topTrailing) {
-                        if let approval = inlinePendingApproval {
-                            inlineApprovalButton(approval)
-                                .padding(.top, 4)
-                                .padding(.trailing, 10)
-                        } else if let alert = inlineAgentCompletion {
-                            inlineCompletionBanner(alert)
-                                .padding(.top, 4)
-                                .padding(.trailing, 10)
-                                .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: -5)))
-                        }
-                    }
-                    .animation(expandedPageAnimation, value: expandedPageRoute)
-                    // Matched artwork and outgoing pages stay below the hardware
-                    // header throughout an interrupted page transition.
-                    .clipped()
-                    .transition(.identity)
-                    .zIndex(1)
-                    .allowsHitTesting(vm.notchState == .open)
+            VStack(alignment: .center, spacing: expandedPageTopInset) {
+                if coordinator.firstLaunch {
+                    Spacer()
+                    HelloAnimation()
+                        .frame(width: getClosedNotchSize().width, height: 80)
+                        .onAppear { vm.closeHello() }
+                        .padding(.top, 40)
+                    Spacer()
+                } else {
+                    BoringHeader(
+                        cameraClearanceWidth: headerClearance,
+                        headerHeight: expandedHeaderHeight
+                    )
+                    .environment(\.colorScheme, glassHeaderScheme)
                     .environment(\.usesSharedGlassShell, usesSharedGlassShell)
-                    .opacity(gestureProgress != 0 ? 1.0 - min(abs(gestureProgress) * 0.1, 0.3) : 1.0)
+                    .frame(height: expandedHeaderHeight)
+                    .opacity(1 - min(abs(gestureProgress) * 0.1, 0.3))
+                    .zIndex(2)
                 }
-                .overlayPreferenceValue(NotchSpotlightNavigationAnchor.self) { anchor in
-                    if guideVisible {
-                        GeometryReader { layout in
-                            NotchSpotlightCutoutOverlay(
-                                geometry: guideGeometry,
-                                step: spotlightGuide.currentStep,
-                                navigationRect: anchor.map { layout[$0] }
-                            )
-                        }
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                        .zIndex(10)
+                ZStack(alignment: .top) {
+                    NotchPageContent(page: expandedPageRoute, albumArtNamespace: albumArtNamespace,
+                                     viewportHeight: pageViewportHeight, previewColorScheme: systemColorScheme,
+                                     selectedID: Binding(get: { vm.selectedAgentID }, set: selectAgentSession),
+                                     agentHeightChanged: updateAgentListHeight,
+                                     refreshWeather: { weatherRefreshRevision += 1 },
+                                     onClipboardCopy: announceClipboardCopyReceipt,
+                                     hasUnidentifiedAudio: unidentifiedAudio)
+                        .id(expandedPageRoute)
+                        .transition(pageTransition)
+                }
+                .frame(width: vm.expandedPageSize.width, height: pageViewportHeight, alignment: .top)
+                .overlay(alignment: .topTrailing) {
+                    if let approval = inlinePendingApproval {
+                        inlineApprovalButton(approval)
+                            .padding(.top, 4)
+                            .padding(.trailing, 10)
+                    } else if let alert = inlineAgentCompletion {
+                        inlineCompletionBanner(alert)
+                            .padding(.top, 4)
+                            .padding(.trailing, 10)
+                            .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: -5)))
                     }
                 }
-
-                if guideVisible {
-                    NotchSpotlightCoachBar()
-                        .frame(width: vm.expandedPageSize.width)
-                        .environment(\.colorScheme, .dark)
-                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 6)))
-                }
+                .animation(expandedPageAnimation, value: expandedPageRoute)
+                // Matched artwork and outgoing pages stay below the hardware
+                // header throughout an interrupted page transition.
+                .clipped()
+                .transition(.identity)
+                .zIndex(1)
+                .allowsHitTesting(vm.notchState == .open)
+                .environment(\.usesSharedGlassShell, usesSharedGlassShell)
+                .opacity(gestureProgress != 0 ? 1.0 - min(abs(gestureProgress) * 0.1, 0.3) : 1.0)
             }
             .fixedSize(horizontal: false, vertical: true)
             .contentShape(Rectangle())
@@ -1630,9 +1603,9 @@ struct ContentView: View {
             withAnimation(reduceMotion ? nil : animationSpring) { vm.open() }
             return
         }
-        if active.kind == "headphones" {
+        if ["headphones", "music", "clipboard-copy"].contains(active.kind) {
             withAnimation(reduceMotion ? nil : animationSpring) {
-                NotchPage.music.activate(coordinator: coordinator, activities: activities)
+                (active.kind == "clipboard-copy" ? NotchPage.clipboard : .music).activate(coordinator: coordinator, activities: activities)
                 selectedRouteBeforeOpening = true
                 vm.open()
             }
@@ -1742,7 +1715,7 @@ struct ContentView: View {
         if vm.notchState == .open, expandedPageRoute == .clipboard, !vm.compactAlertPresented {
             menuGraceUntil = max(menuGraceUntil, Date().addingTimeInterval(1.2))
             scheduleAutoClose()
-            return
+            if !showIslandSideActivities { return }
         }
 
         clipboardCopyReceipt = IslandActivity(id: "clipboard-copy:" + UUID().uuidString, kind: "clipboard-copy",

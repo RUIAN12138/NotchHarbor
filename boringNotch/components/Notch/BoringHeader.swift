@@ -106,7 +106,6 @@ struct BoringHeader: View {
     var cameraClearanceWidth: CGFloat? = nil
     /// Expanded header row height, normally the physical notch height (32 pt).
     var headerHeight: CGFloat = 32
-    var showsSpotlightTargets = false
     var previewPage: Binding<NotchPage>?
 
     /// Hit target stays inside the header row and never exceeds 36 pt.
@@ -144,9 +143,6 @@ struct BoringHeader: View {
                     let adjacent = hoveredIndex.map { abs($0 - index) == 1 } ?? false
                     navButton(destination, width: width, adjacentToHover: adjacent)
                 }
-            }
-            .anchorPreference(key: NotchSpotlightNavigationAnchor.self, value: .bounds) {
-                showsSpotlightTargets ? $0 : nil
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
@@ -273,12 +269,6 @@ struct BoringHeader: View {
                                 Button { showsTools = false; SettingsWindowController.shared.showWindow() } label: {
                                     Label("打开设置", systemImage: "gear")
                                 }
-                            }
-                            Button {
-                                showsTools = false
-                                NotchSpotlightGuideController.shared.start(force: true)
-                            } label: {
-                                Label("高光使用引导", systemImage: "sparkles")
                             }
                             if showMirror {
                                 Button { showsTools = false; vm.toggleCameraPreview() } label: {

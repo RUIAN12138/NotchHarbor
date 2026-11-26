@@ -68,6 +68,8 @@ enum OptionKeyAction: String, CaseIterable, Identifiable, Defaults.Serializable 
     var id: String { self.rawValue }
 }
 
+enum CollapsedShellStyle: String, Defaults.Serializable { case hidden, notch, island }
+
 enum HarborAppearance: String, CaseIterable, Defaults.Serializable {
     case system, light, dark
 
@@ -113,6 +115,10 @@ extension Defaults.Keys {
     static let hideFromScreenRecording = Key<Bool>("hideFromScreenRecording", default: false)
     
     // MARK: Appearance
+    static let collapsedShellStyle = Key<CollapsedShellStyle>("collapsedShellStyle", default: .hidden)
+    static let restingExtension = Key<Double>("restingExtension", default: 16)
+    static let lyricLineCount = Key<Int>("lyricLineCount", default: 2)
+    static let largerPanel = Key<Bool>("largerPanel", default: false)
     static let appAppearance = Key<HarborAppearance>("notchHarborAppearance", default: .system)
     static let settingsLanguage = Key<String>("notchHarborSettingsLanguage", default: "zh-Hans")
     static let siriGlassEnabled = Key<Bool>("siriGlassEnabled", default: true)

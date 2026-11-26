@@ -63,7 +63,6 @@ class BoringViewModel: NSObject, ObservableObject {
     @Published var agentVoiceHotkey = UUID()
     @Published var agentVoiceFocus: AgentVoiceFocus?
     @Published var isAgentVoiceReplyActive = false
-    @Published var isSpotlightGuideActive = false
     var clipboardPendingSelectionID: UUID?
 
     @Published var screenUUID: String?
@@ -105,17 +104,6 @@ class BoringViewModel: NSObject, ObservableObject {
         
         setupDetectorObserver()
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.isSpotlightGuideActive = NotchSpotlightGuideController.shared.isActive
-            NotchSpotlightGuideController.shared.$isActive
-                .removeDuplicates()
-                .receive(on: RunLoop.main)
-                .sink { [weak self] active in
-                    self?.isSpotlightGuideActive = active
-                }
-                .store(in: &self.cancellables)
-        }
     }
     
     private func setupDetectorObserver() {
@@ -265,11 +253,12 @@ class BoringViewModel: NSObject, ObservableObject {
     }
 
     private var fullPanelWidth: CGFloat {
-        guard usesSystemIslandTrigger else { return min(openNotchSize.width, 530) }
+        let preferred: CGFloat = Defaults[.largerPanel] ? 600 : 530
+        guard usesSystemIslandTrigger else { return min(getScreenFrame(screenUUID)?.width ?? preferred, preferred) }
         // Compact the body while reserving both banks beside the native island.
         let available = max(1, (getScreenFrame(screenUUID)?.width ?? 1512) - 40)
         let clearance = systemIslandClearanceWidth + 212
-        return min(available, max(clearance, min(530, systemIslandClearanceWidth * 1.65)))
+        return min(available, max(clearance, min(preferred, systemIslandClearanceWidth * (Defaults[.largerPanel] ? 1.95 : 1.65))))
     }
 
     var requiredWindowWidth: CGFloat {
@@ -284,17 +273,11 @@ class BoringViewModel: NSObject, ObservableObject {
 
     static let regularPanelHeight: CGFloat = 141
 
-    var spotlightGuideExtraHeight: CGFloat {
-        (isSpotlightGuideActive && !compactAlertPresented && !coordinator.firstLaunch)
-            ? SpotlightGuideGeometry.reservedExtraHeight
-            : 0
-    }
-
     var expandedNotchSize: CGSize {
         let baseHeight: CGFloat = compactAlertPresented
             ? compactAlertTopInset + compactAlertContentHeight
             : (agentDetailExpanded ? 346 : Self.regularPanelHeight + agentListExtraHeight)
-        return CGSize(width: expandedPanelWidth, height: baseHeight + spotlightGuideExtraHeight)
+        return CGSize(width: expandedPanelWidth, height: baseHeight + (!compactAlertPresented && Defaults[.largerPanel] ? 32 : 0))
     }
 
     var expandedHeaderSize: CGSize {
@@ -308,7 +291,7 @@ class BoringViewModel: NSObject, ObservableObject {
     var expandedPageSize: CGSize {
         CGSize(width: max(1, expandedNotchSize.width - 2 * (usesSystemIslandTrigger ? expandedShoulderInset + 8 : 24)),
                height: max(1, expandedNotchSize.height - expandedHeaderSize.height
-                   - Self.expandedPageTopInset - Self.expandedBottomInset - spotlightGuideExtraHeight))
+                   - Self.expandedPageTopInset - Self.expandedBottomInset))
     }
 
     var fileDropTopInset: CGFloat {
@@ -349,6 +332,14 @@ class BoringViewModel: NSObject, ObservableObject {
 
     func acceptsIslandHover(at position: NSPoint) -> Bool {
         if isOverNativeIsland(position) { return true }
+        if notchState == .closed, runningAgentVisible, Defaults[.collapsedShellStyle] != .hidden,
+           let screen = getScreenFrame(screenUUID) {
+            let width = runningAgentCenterWidth + 2 * Defaults[.restingExtension]
+            let bounds = CGRect(x: 0, y: 0, width: width, height: runningAgentHeight)
+            let local = CGPoint(x: position.x - screen.midX + width / 2, y: screen.maxY - position.y)
+            let shape = Defaults[.collapsedShellStyle] == .notch ? NotchShape() : NotchShape.panel(expanded: false)
+            if shape.path(in: bounds).contains(local) { return true }
+        }
         let wings = runningAgentWings
         guard showsRunningAgent, runningAgentVisible, wings.contains(position),
               let screen = getScreenFrame(screenUUID) else { return false }
@@ -431,8 +422,8 @@ class BoringViewModel: NSObject, ObservableObject {
     }
 
     func close() {
-        // Do not close while a share picker, sharing service, or spotlight guide is active
-        if SharingStateManager.shared.preventNotchClose || (isSpotlightGuideActive && !systemIslandPresentationActive) {
+        // Do not close while a share picker or sharing service is active
+        if SharingStateManager.shared.preventNotchClose {
             return
         }
         if usesSystemIslandTrigger && notchState == .open {
@@ -482,16 +473,7 @@ class BoringViewModel: NSObject, ObservableObject {
             guard let self else { return }
             self.coordinator.firstLaunch = false
             Task { @MainActor in
-                let onboardingVisible = NSApp.windows.contains {
-                    $0.identifier?.rawValue == "OnboardingWindow" && $0.isVisible
-                }
-                if !onboardingVisible && !NotchSpotlightGuideController.shared.hasCompleted {
-                    NotchSpotlightGuideController.shared.start(force: true)
-                } else {
-                    withAnimation(self.animationLibrary.animation) {
-                        self.close()
-                    }
-                }
+                withAnimation(self.animationLibrary.animation) { self.close() }
             }
         }
     }

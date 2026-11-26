@@ -32,15 +32,20 @@ https://github.com/user-attachments/assets/b5057165-52ab-4add-b2e7-3ffe893f935d
 5. **多路 CLI Agent 同屏监管、岛内回复与菜单栏监控**
    - 同屏聚合 **Codex、Claude Code、Antigravity ACP、豆包 CLI** 等多路本地会话状态，支持待审批红点提醒、悬停上下文快览、快捷建议/语音岛内直回，以及任务完成时的硬件边缘流光环绕（`AgentCompletionHalo`）。
    - 右上角菜单栏状态弹窗（`276pt`）支持切换查看 AI 配额双环、Apple Silicon 实时充电/整机功耗丝带（`MenuPowerTelemetry`）与 60 秒内存压力曲线。
-6. **气象预警、七日滚轮日程与首次启动高光引导**
+6. **气象预警与七日滚轮日程**
    - 左侧展示实时气温与本地降水/气象台预警，右侧通过七日横向滚轮速览日历会议与提醒事项。
-   - 内置**首次启动高光镂空引导教程（`NotchSpotlightGuide`）**，逐步高亮左翼五合一顶栏与各工作台核心手势；也可随时通过岛内 `•••` 菜单或「设置 → 通用 / 关于」一键重播。
 
 <p align="center">
   <img src="docs/media/storyboard-overview.jpg" alt="Notch Harbor 全场景分镜概览" width="100%" />
 </p>
 
 ---
+
+## 安装
+
+从 [GitHub Releases](https://github.com/RUIAN12138/NotchHarbor/releases/latest) 下载 通用版 DMG。打开磁盘映像后，可将 Notch Harbor 拖入 Applications，也可双击安装包使用系统安装器。当前发布包未经 Apple 公证。
+
+在「设置 → 外观」选择收起形态、两侧延伸距离、一句或两句同步歌词，以及加大的展开面板。默认完全收起。在「通用」启用两侧小灵动岛后，播放中的封面与音频波形、复制成功回执会复用刘海两侧的空间。系统灵动岛占用该位置时优先显示系统内容。
 
 ## 本地构建与运行
 
@@ -59,7 +64,7 @@ https://github.com/user-attachments/assets/b5057165-52ab-4add-b2e7-3ffe893f935d
 - 构建产物输出至 `.build/xcode/Build/Products/Release/Notch Harbor.app`，不会覆盖或干扰 `/Applications` 中正在运行的正式版本。
 - 构建脚本会自动拉取锁定的 Swift Package 与 npm 依赖、预编译离线 CSP 保护的 Folia 歌词视图，并将 `LICENSE` 与 `THIRD_PARTY_LICENSES` 随包嵌入。
 - 默认使用本地临时签名（ad-hoc），也可通过环境变量 `NOTCH_HARBOR_SIGNING_IDENTITY` 指定开发者签名证书。
-- 日常开发调试可直接打开 `NotchHarbor.xcodeproj`；如需直接启动并预览高光使用引导，可传入 `--spotlight-guide` 启动参数。
+- 日常开发调试可直接打开 `NotchHarbor.xcodeproj`。
 
 ---
 
@@ -92,7 +97,7 @@ Notch Harbor 默认零侵入运行，不会自动修改任何外部 CLI 配置�
 
 ## 自动化回归测试
 
-仓库内置针对光学几何、Metal 着色器、系统灵动岛避让、剪贴板、文件拖拽、歌词匹配、功耗遥测及高光引导几何的回归测试套件：
+仓库内置针对光学几何、Metal 着色器、系统灵动岛避让、剪贴板、文件拖拽、歌词匹配、功耗遥测的回归测试套件：
 
 ```sh
 for t in scripts/test-*.py; do
