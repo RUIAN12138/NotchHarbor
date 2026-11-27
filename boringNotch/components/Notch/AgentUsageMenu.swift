@@ -7,7 +7,7 @@ enum AgentQuotaRings {
     static let innerMinutes = 10_080
     private static let images: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
-        cache.countLimit = 16
+        cache.countLimit = 32
         return cache
     }()
 
@@ -22,11 +22,14 @@ enum AgentQuotaRings {
     }
 
     static func image(for usage: AgentProviderUsage, at now: Double = Date().timeIntervalSince1970) -> NSImage {
-        image(for: Levels(usage: usage, at: now))
+        if usage.isGeminiDualPool {
+            return dualArcImage(for: usage.geminiDualArcLevels(at: now))
+        }
+        return image(for: Levels(usage: usage, at: now))
     }
 
     static func image(for levels: Levels) -> NSImage {
-        let key = "\(levels.outer?.bitPattern ?? 0):\(levels.inner?.bitPattern ?? 0):\(levels.outer == nil):\(levels.inner == nil)" as NSString
+        let key = "single:\(levels.outer?.bitPattern ?? 0):\(levels.inner?.bitPattern ?? 0):\(levels.outer == nil):\(levels.inner == nil)" as NSString
         if let cached = images.object(forKey: key) { return cached }
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
             let center = NSPoint(x: rect.midX, y: rect.midY)
@@ -37,6 +40,99 @@ enum AgentQuotaRings {
         image.isTemplate = true
         images.setObject(image, forKey: key)
         return image
+    }
+
+    /// Dual-arc concentric rings for Gemini:
+    /// - Two concentric circles (outer = 5h / primary, inner = weekly / secondary).
+    /// - Major arc (优弧 > 180°): Gemini models quota.
+    /// - Minor arc (劣弧 < 180°): Claude & GPT models quota.
+    static func dualArcImage(for levels: AgentProviderUsage.GeminiDualArcLevels) -> NSImage {
+        let key = [
+            "gemini-dual",
+            "\(levels.outerMajorGemini?.bitPattern ?? 0):\(levels.outerMajorGemini == nil)",
+            "\(levels.outerMinorClaudeGPT?.bitPattern ?? 0):\(levels.outerMinorClaudeGPT == nil)",
+            "\(levels.innerMajorGemini?.bitPattern ?? 0):\(levels.innerMajorGemini == nil)",
+            "\(levels.innerMinorClaudeGPT?.bitPattern ?? 0):\(levels.innerMinorClaudeGPT == nil)",
+        ].joined(separator: "|") as NSString
+        if let cached = images.object(forKey: key) { return cached }
+
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+            let center = NSPoint(x: rect.midX, y: rect.midY)
+            // Outer concentric ring: 214° major arc (Gemini) + 104° minor arc (Claude/GPT)
+            drawSplitConcentricRing(
+                center: center,
+                radius: 7.05,
+                lineWidth: 1.4,
+                majorStart: 79,
+                majorSpan: 214,
+                majorRemaining: levels.outerMajorGemini,
+                minorStart: -157,
+                minorSpan: 104,
+                minorRemaining: levels.outerMinorClaudeGPT
+            )
+            // Inner concentric ring: 202° major arc (Gemini) + 98° minor arc (Claude/GPT)
+            drawSplitConcentricRing(
+                center: center,
+                radius: 3.85,
+                lineWidth: 1.32,
+                majorStart: 75,
+                majorSpan: 202,
+                majorRemaining: levels.innerMajorGemini,
+                minorStart: -157,
+                minorSpan: 98,
+                minorRemaining: levels.innerMinorClaudeGPT
+            )
+            return true
+        }
+        image.isTemplate = true
+        images.setObject(image, forKey: key)
+        return image
+    }
+
+    private static func drawSplitConcentricRing(
+        center: NSPoint,
+        radius: CGFloat,
+        lineWidth: CGFloat,
+        majorStart: CGFloat,
+        majorSpan: CGFloat,
+        majorRemaining: Double?,
+        minorStart: CGFloat,
+        minorSpan: CGFloat,
+        minorRemaining: Double?
+    ) {
+        drawArcSegment(center: center, radius: radius, lineWidth: lineWidth,
+                       startAngle: majorStart, totalSpan: majorSpan, remaining: majorRemaining)
+        drawArcSegment(center: center, radius: radius, lineWidth: lineWidth,
+                       startAngle: minorStart, totalSpan: minorSpan, remaining: minorRemaining)
+    }
+
+    private static func drawArcSegment(
+        center: NSPoint,
+        radius: CGFloat,
+        lineWidth: CGFloat,
+        startAngle: CGFloat,
+        totalSpan: CGFloat,
+        remaining: Double?
+    ) {
+        let track = NSBezierPath()
+        track.lineWidth = lineWidth
+        track.lineCapStyle = .round
+        track.appendArc(withCenter: center, radius: radius,
+                        startAngle: startAngle, endAngle: startAngle - totalSpan, clockwise: true)
+        NSColor.black.withAlphaComponent(remaining == nil ? 0.44 : 0.30).setStroke()
+        track.stroke()
+
+        guard let remaining, remaining > 0 else { return }
+        let clamped = min(100, max(0, remaining))
+        let sweep = totalSpan * CGFloat(clamped / 100.0)
+        guard sweep > 0.5 else { return }
+        let fill = NSBezierPath()
+        fill.lineWidth = lineWidth
+        fill.lineCapStyle = .round
+        fill.appendArc(withCenter: center, radius: radius,
+                       startAngle: startAngle, endAngle: startAngle - sweep, clockwise: true)
+        NSColor.black.setStroke()
+        fill.stroke()
     }
 
     private static func drawRing(center: NSPoint, radius: CGFloat, remaining: Double?) {
@@ -206,7 +302,9 @@ enum AgentUsageStatusLabel {
         case .provider(let provider) where provider.showsQuotaRings:
             title = ""
             image = AgentQuotaRings.image(for: provider)
-            label = "\(provider.name) 额度，外圈 5 小时，内圈每周"
+            label = provider.isGeminiDualPool
+                ? "\(provider.name) 额度，双同心圆：优弧 Gemini 模型，劣弧 Claude/GPT 模型（外圈 5 小时，内圈每周）"
+                : "\(provider.name) 额度，外圈 5 小时，内圈每周"
         case .provider(let provider):
             title = AgentUsageSelection.compactBilling(provider) ?? "—"
             image = nil
@@ -230,6 +328,7 @@ struct AgentUsagePopover: View {
     @AppStorage(AgentQuickReplySource.preferenceKey) private var quickReplySource = AgentQuickReplySource.current
     private var apiEnabled: Bool { quickReplySource == .api }
     @State private var page: Page = .overview
+    @State private var inspectedTabID: String? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var measured = false
     @State private var sample: MenuPowerSample?
@@ -257,8 +356,15 @@ struct AgentUsagePopover: View {
     var readMemoryApps: () async -> Data = { Data() }
     let openSettings: () -> Void
 
+    private var effectivePreferred: String {
+        if page == .quota, let inspectedTabID {
+            return inspectedTabID
+        }
+        return preferred
+    }
+
     private var selection: AgentUsageSelection {
-        AgentUsageSelection.resolve(hub.agentUsage, preferred: preferred, active: hub.runningAgent?.source,
+        AgentUsageSelection.resolve(hub.agentUsage, preferred: effectivePreferred, active: hub.activeQuotaAgentSource,
                                     apiEnabled: apiEnabled, today: apiUsage.today)
     }
 
@@ -337,43 +443,72 @@ struct AgentUsagePopover: View {
 
     @ViewBuilder
     private var sourceTabs: some View {
+        let selectedTab = inspectedTabID ?? preferred
         if !hub.agentUsage.isEmpty || apiEnabled || apiUsage.today != nil {
             ScrollView(.horizontal) {
                 HStack(spacing: 4) {
-                    sourceTab("自动", id: "")
-                    ForEach(hub.agentUsage) { usage in
-                        sourceTab(usage.name, id: usage.id)
+                    sourceTab("自动", id: "", selectedID: selectedTab) {
+                        inspectedTabID = nil
+                        preferred = ""
                     }
-                    if !hub.agentUsage.contains(where: { $0.id == "gemini" }) {
-                        sourceTab("Gemini", id: "gemini")
+                    ForEach(hub.agentUsage) { usage in
+                        sourceTab(usage.name, id: usage.id, selectedID: selectedTab) {
+                            inspectedTabID = usage.id
+                        }
+                    }
+                    if !hub.agentUsage.contains(where: { $0.isGeminiDualPool }) {
+                        sourceTab("Gemini", id: "gemini", selectedID: selectedTab) {
+                            inspectedTabID = "gemini"
+                        }
                     }
                     if !hub.agentUsage.contains(where: { $0.id == "doubao" }) {
-                        sourceTab("豆包", id: "doubao")
+                        sourceTab("豆包", id: "doubao", selectedID: selectedTab) {
+                            inspectedTabID = "doubao"
+                        }
                     }
                     if apiEnabled || apiUsage.today != nil {
-                        sourceTab(AgentUsageSelection.replyAPIName, id: AgentUsageSelection.replyAPIID)
+                        sourceTab(AgentUsageSelection.replyAPIName, id: AgentUsageSelection.replyAPIID, selectedID: selectedTab) {
+                            inspectedTabID = AgentUsageSelection.replyAPIID
+                        }
                     }
                 }
             }
             .scrollIndicators(.never)
             .frame(height: 25)
         }
-        Text(sourceName)
-            .font(.system(size: 12, weight: .semibold))
+        HStack(spacing: 6) {
+            Text(sourceName)
+                .font(.system(size: 12, weight: .semibold))
+            if preferred.isEmpty {
+                Text("自动跟随当前 Agent")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            } else {
+                Button("恢复自动跟随") {
+                    preferred = ""
+                    inspectedTabID = nil
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+            }
+            Spacer(minLength: 0)
+        }
     }
 
-    private func sourceTab(_ title: String, id: String) -> some View {
-        Button { preferred = id } label: {
+    private func sourceTab(_ title: String, id: String, selectedID: String, action: @escaping () -> Void) -> some View {
+        let isSelected = selectedID == id
+        return Button(action: action) {
             Text(title)
-                .font(.system(size: 11, weight: preferred == id ? .semibold : .medium))
+                .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
                 .lineLimit(1)
                 .padding(.horizontal, 7)
                 .padding(.vertical, 5)
-                .background(.primary.opacity(preferred == id ? 0.11 : 0.045), in: Capsule())
+                .background(.primary.opacity(isSelected ? 0.11 : 0.045), in: Capsule())
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityAddTraits(preferred == id ? .isSelected : [])
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     @ViewBuilder
@@ -388,6 +523,8 @@ struct AgentUsagePopover: View {
     @ViewBuilder
     private var availableQuotaSummary: some View {
         switch selection {
+        case .provider(let provider) where provider.isGeminiDualPool:
+            geminiDualArcSummaryView(provider, now: Date().timeIntervalSince1970)
         case .provider(let provider):
             let windows = sortedWindows(provider)
             if windows.isEmpty {
@@ -419,9 +556,48 @@ struct AgentUsagePopover: View {
         }
     }
 
+    private func geminiDualArcSummaryView(_ provider: AgentProviderUsage, now: Double) -> some View {
+        let levels = provider.geminiDualArcLevels(at: now)
+        func summaryText(outer: Double?, inner: Double?) -> String {
+            switch (outer, inner) {
+            case let (o?, i?): return "\(Int(o.rounded()))% · 周 \(Int(i.rounded()))%"
+            case let (o?, nil): return "\(Int(o.rounded()))%"
+            case let (nil, i?): return "周 \(Int(i.rounded()))%"
+            case (nil, nil): return "—"
+            }
+        }
+        return HStack(spacing: 10) {
+            GeminiDualArcGauge(levels: levels)
+                .frame(width: 36, height: 36)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Circle().fill(Color.cyan).frame(width: 6, height: 6)
+                    Text("优弧 · Gemini")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Text(summaryText(outer: levels.outerMajorGemini, inner: levels.innerMajorGemini))
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                }
+                HStack(spacing: 5) {
+                    Circle().fill(Color.orange).frame(width: 6, height: 6)
+                    Text("劣弧 · Claude/GPT")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Text(summaryText(outer: levels.outerMinorClaudeGPT, inner: levels.innerMinorClaudeGPT))
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                }
+            }
+        }
+    }
+
     private var unavailableQuotaProvider: String? {
-        guard ["gemini", "doubao"].contains(preferred), !hub.agentUsage.contains(where: { $0.id == preferred }) else { return nil }
-        return preferred
+        let target = effectivePreferred
+        guard target == "doubao",
+              !hub.agentUsage.contains(where: { AgentProviderUsage.matchesProviderID($0.id, query: target) }) else { return nil }
+        return target
     }
 
     private var quotaDetail: some View {
@@ -491,14 +667,62 @@ struct AgentUsagePopover: View {
 
     private func sortedWindows(_ provider: AgentProviderUsage) -> [AgentUsageWindow] {
         let periods = [AgentQuotaRings.outerMinutes, AgentQuotaRings.innerMinutes]
-        return provider.windows.sorted {
-            (periods.firstIndex(of: $0.windowMinutes ?? 0) ?? periods.count)
-                < (periods.firstIndex(of: $1.windowMinutes ?? 0) ?? periods.count)
+        return provider.windows.sorted { lhs, rhs in
+            if provider.isGeminiDualPool {
+                let lhsClaude = AgentProviderUsage.isClaudeGPTWindow(lhs) ? 1 : 0
+                let rhsClaude = AgentProviderUsage.isClaudeGPTWindow(rhs) ? 1 : 0
+                if lhsClaude != rhsClaude { return lhsClaude < rhsClaude }
+            }
+            return (periods.firstIndex(of: lhs.windowMinutes ?? 0) ?? periods.count)
+                < (periods.firstIndex(of: rhs.windowMinutes ?? 0) ?? periods.count)
         }
+    }
+
+    private func windowDisplayTitle(_ window: AgentUsageWindow, provider: AgentProviderUsage) -> String {
+        guard provider.isGeminiDualPool else { return window.cycle }
+        let poolPrefix = AgentProviderUsage.isClaudeGPTWindow(window) ? "Claude/GPT · " : "Gemini · "
+        if let label = window.label, !label.isEmpty {
+            let lower = label.lowercased()
+            if lower.contains("gemini") || lower.contains("claude") || lower.contains("gpt") {
+                return label
+            }
+        }
+        return poolPrefix + window.cycle
     }
 
     private func providerContent(_ provider: AgentProviderUsage, now: Double) -> some View {
         VStack(alignment: .leading, spacing: 9) {
+            if provider.isGeminiDualPool {
+                geminiDualArcSummaryView(provider, now: now)
+                Divider()
+                if provider.windows.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("外圈 5h · 内圈每周（优弧 Gemini / 劣弧 Claude & GPT）")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text("尚未读取到 CodexBar 的 Gemini / Antigravity 实时余量，请在 CodexBar 中启用并登录对应账号。")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 10) {
+                            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.steipete.codexbar") {
+                                Button {
+                                    NSWorkspace.shared.open(appURL)
+                                } label: {
+                                    Label("打开 CodexBar", systemImage: "arrow.up.right.square")
+                                }
+                                .buttonStyle(.plain)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Color.accentColor)
+                            }
+                            if let url = URL(string: "https://gemini.google.com/usage") {
+                                Link("Gemini 用量页", destination: url)
+                                    .font(.caption)
+                            }
+                        }
+                    }
+                }
+            }
             ForEach(Array(sortedWindows(provider).enumerated()), id: \.offset) { index, window in
                 if index > 0 { Divider() }
                 quotaRow(window, provider: provider, now: now)
@@ -521,7 +745,7 @@ struct AgentUsagePopover: View {
         let recovery = reset.map { date in
             if date.timeIntervalSince1970 <= now { return "等待新额度" }
             return shortTime(date)
-        } ?? "未知"
+        } ?? (window.usedPercent == 0 ? "满额待命" : "未知")
         let forecast: String = switch provider.exhaustion(for: window, at: now) {
         case .depleted: "已用完"
         case .beforeReset(let date): shortTime(date)
@@ -530,7 +754,7 @@ struct AgentUsagePopover: View {
         }
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Label(window.cycle, systemImage: cycleIcon(window)).font(.callout.weight(.medium))
+                Label(windowDisplayTitle(window, provider: provider), systemImage: cycleIcon(window)).font(.callout.weight(.medium))
                 Spacer(minLength: 6)
                 if current {
                     Text("\(Int(window.remaining))%").font(.system(size: 15, weight: .semibold, design: .rounded))
@@ -591,6 +815,62 @@ struct AgentUsagePopover: View {
         }
         .font(.callout)
         .accessibilityElement(children: .combine)
+    }
+}
+
+private struct GeminiDualArcGauge: View {
+    let levels: AgentProviderUsage.GeminiDualArcLevels
+
+    var body: some View {
+        Canvas { context, size in
+            let center = CGPoint(x: size.width / 2, y: size.height / 2)
+            let outerR = min(size.width, size.height) * 0.43
+            let innerR = min(size.width, size.height) * 0.25
+
+            // Outer concentric ring (5h / primary): 214° Major Arc (Gemini) + 104° Minor Arc (Claude/GPT)
+            drawArc(in: &context, center: center, radius: outerR, lineWidth: 3.0,
+                    startDeg: -79, spanDeg: 214, remaining: levels.outerMajorGemini, tint: .cyan)
+            drawArc(in: &context, center: center, radius: outerR, lineWidth: 3.0,
+                    startDeg: 157, spanDeg: 104, remaining: levels.outerMinorClaudeGPT, tint: .orange)
+
+            // Inner concentric ring (weekly / secondary): 202° Major Arc (Gemini) + 98° Minor Arc (Claude/GPT)
+            drawArc(in: &context, center: center, radius: innerR, lineWidth: 2.7,
+                    startDeg: -75, spanDeg: 202, remaining: levels.innerMajorGemini, tint: .cyan)
+            drawArc(in: &context, center: center, radius: innerR, lineWidth: 2.7,
+                    startDeg: 157, spanDeg: 98, remaining: levels.innerMinorClaudeGPT, tint: .orange)
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func drawArc(
+        in context: inout GraphicsContext,
+        center: CGPoint,
+        radius: CGFloat,
+        lineWidth: CGFloat,
+        startDeg: Double,
+        spanDeg: Double,
+        remaining: Double?,
+        tint: Color
+    ) {
+        var track = Path()
+        track.addArc(center: center, radius: radius,
+                     startAngle: .degrees(startDeg),
+                     endAngle: .degrees(startDeg + spanDeg),
+                     clockwise: false)
+        context.stroke(track, with: .color(tint.opacity(remaining == nil ? 0.38 : 0.24)),
+                       style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+
+        guard let remaining, remaining > 0 else { return }
+        let clamped = min(100, max(0, remaining))
+        let sweep = spanDeg * (clamped / 100.0)
+        guard sweep > 0.5 else { return }
+        var fill = Path()
+        fill.addArc(center: center, radius: radius,
+                    startAngle: .degrees(startDeg),
+                    endAngle: .degrees(startDeg + sweep),
+                    clockwise: false)
+        context.stroke(fill, with: .color(tint),
+                       style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
     }
 }
 

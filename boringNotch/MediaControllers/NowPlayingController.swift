@@ -30,6 +30,33 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
         await reader.close()
     }
 
+    @MainActor
+    func refreshTimelineOnly() async {
+        guard !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false }
+
+        let revision = playbackRevision
+        let snapshotProcess = adapterProcess("get", "--no-artwork")
+        let reader = JSONLinesPipeHandler()
+        snapshotProcess.standardOutput = await reader.getPipe()
+        snapshotProcess.standardError = FileHandle.nullDevice
+        guard (try? snapshotProcess.run()) != nil else { return }
+        await reader.readJSONLines(as: NowPlayingPayload.self) { [weak self] payload in
+            guard let self, self.playbackRevision == revision else { return }
+            let incomingBundle = payload.parentApplicationBundleIdentifier ?? payload.bundleIdentifier
+            let trackChanged = (payload.title != nil && payload.title != self.playbackState.title)
+                || (payload.artist != nil && payload.artist != self.playbackState.artist)
+                || (incomingBundle != nil && incomingBundle != self.playbackState.bundleIdentifier)
+            await self.handleAdapterUpdate(NowPlayingUpdate(payload: payload, diff: true))
+            if trackChanged {
+                self.refreshing = false
+                await self.updatePlaybackInfo()
+            }
+        }
+        await reader.close()
+    }
+
     @MainActor private var refreshing = false
     @MainActor private var playbackRevision = 0
 
@@ -270,8 +297,10 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
         
         self.playbackState = newPlaybackState
         
-        // Fetch favorite state for supported apps asynchronously
-        await fetchFavoriteStateIfSupported()
+        // Fetch favorite state only when track changes or on full snapshot
+        if trackChanged || !diff {
+            await fetchFavoriteStateIfSupported()
+        }
     }
     
     private func fetchFavoriteStateIfSupported() async {

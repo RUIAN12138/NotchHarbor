@@ -200,20 +200,33 @@ struct AgentProviderUsage: Codable, Equatable, Identifiable {
     let windows: [AgentUsageWindow]
     let billing: Billing?
     let localTokens30Days: Int?
+    var isAwaitingSync: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case id, updatedAt, windows, billing, localTokens30Days
+    }
+
+    static func geminiAwaitingSync(at now: Double = Date().timeIntervalSince1970) -> Self {
+        Self(id: "gemini", updatedAt: now, windows: [], billing: nil, localTokens30Days: nil, isAwaitingSync: true)
+    }
 
     var isValid: Bool {
         (1...64).contains(id.utf8.count) && id.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 45 }
             && updatedAt.isFinite && updatedAt > 0 && updatedAt <= Date().timeIntervalSince1970 + 5
-            && windows.count <= 6 && windows.allSatisfy(\.isValid)
+            && windows.count <= 8 && windows.allSatisfy(\.isValid)
             && (billing?.isValid ?? true) && (localTokens30Days.map { (0...100_000_000_000_000).contains($0) } ?? true)
             && (!windows.isEmpty || billing != nil || localTokens30Days != nil)
+    }
+
+    var isGeminiDualPool: Bool {
+        id == "gemini" || id == "antigravity"
     }
 
     var name: String {
         switch id {
         case "codex": "Codex"
         case "claude": "Claude"
-        case "antigravity": "Antigravity"
+        case "antigravity": "Gemini"
         case "gemini": "Gemini"
         case "openai": "OpenAI API"
         case "openrouter": "OpenRouter"
@@ -226,7 +239,65 @@ struct AgentProviderUsage: Codable, Equatable, Identifiable {
     }
 
     var showsQuotaRings: Bool {
-        !windows.isEmpty && (billing == nil || windows.contains { $0.windowMinutes == 300 || $0.windowMinutes == 10_080 })
+        isGeminiDualPool || (!windows.isEmpty && (billing == nil || windows.contains { $0.windowMinutes == 300 || $0.windowMinutes == 10_080 }))
+    }
+
+    static func isClaudeGPTWindow(_ window: AgentUsageWindow) -> Bool {
+        guard let raw = window.label?.lowercased(), !raw.isEmpty else { return false }
+        return raw.contains("claude") || raw.contains("gpt") || raw.contains("3p")
+            || raw.contains("sonnet") || raw.contains("opus")
+    }
+
+    struct GeminiDualArcLevels: Hashable {
+        let outerMajorGemini: Double?
+        let outerMinorClaudeGPT: Double?
+        let innerMajorGemini: Double?
+        let innerMinorClaudeGPT: Double?
+
+        var hasClaudeGPTPool: Bool {
+            outerMinorClaudeGPT != nil || innerMinorClaudeGPT != nil
+        }
+    }
+
+    func geminiDualArcLevels(at now: Double) -> GeminiDualArcLevels {
+        let currentWindows = windows.filter { isCurrent($0, at: now) }
+        let claudePool = currentWindows.filter(Self.isClaudeGPTWindow)
+        let geminiPool = currentWindows.filter { !Self.isClaudeGPTWindow($0) }
+
+        func resolvePair(_ pool: [AgentUsageWindow]) -> (outer: Double?, inner: Double?) {
+            guard !pool.isEmpty else { return (nil, nil) }
+            let hasStandardCadence = pool.contains { $0.windowMinutes == 300 || $0.windowMinutes == 10_080 }
+            if hasStandardCadence {
+                let outer = pool.filter { $0.windowMinutes == 300 }.map(\.remaining).min()
+                let inner = pool.filter { $0.windowMinutes == 10_080 }.map(\.remaining).min()
+                return (outer, inner)
+            }
+            let short = pool.first { ($0.windowMinutes ?? 300) < 1440 }
+            let long = pool.first { ($0.windowMinutes ?? 0) >= 1440 }
+            if short != nil || long != nil {
+                let outer = short?.remaining ?? pool.first?.remaining
+                let inner = long?.remaining ?? (pool.count > 1 ? pool.dropFirst().first?.remaining : nil)
+                return (outer, inner)
+            }
+            return (pool.first?.remaining, pool.dropFirst().first?.remaining)
+        }
+
+        let gem = resolvePair(geminiPool)
+        let thirdParty = resolvePair(claudePool)
+        return GeminiDualArcLevels(
+            outerMajorGemini: gem.outer,
+            outerMinorClaudeGPT: thirdParty.outer,
+            innerMajorGemini: gem.inner,
+            innerMinorClaudeGPT: thirdParty.inner
+        )
+    }
+
+    static func matchesProviderID(_ providerID: String, query: String) -> Bool {
+        if providerID == query { return true }
+        let geminiAliases: Set<String> = ["gemini", "antigravity"]
+        if geminiAliases.contains(providerID) && geminiAliases.contains(query) { return true }
+        if providerID == "doubao" && query == "doubao-desktop" { return true }
+        return false
     }
 
     func window(minutes: Int, at now: Double) -> AgentUsageWindow? {
@@ -260,9 +331,23 @@ struct AgentProviderUsage: Codable, Equatable, Identifiable {
     }
 
     static func selected(from providers: [Self], preferred: String, active: String?) -> Self? {
-        providers.first { $0.id == preferred }
-            ?? providers.first { $0.id == active }
-            ?? providers.first { $0.id == "codex" }
+        if !preferred.isEmpty {
+            if let explicit = providers.first(where: { matchesProviderID($0.id, query: preferred) }) {
+                return explicit
+            }
+            if matchesProviderID("gemini", query: preferred) {
+                return geminiAwaitingSync()
+            }
+        }
+        if preferred.isEmpty, let active, !active.isEmpty {
+            if let live = providers.first(where: { matchesProviderID($0.id, query: active) }) {
+                return live
+            }
+            if matchesProviderID("gemini", query: active) {
+                return geminiAwaitingSync()
+            }
+        }
+        return providers.first { $0.id == "codex" }
             ?? providers.first
     }
 }
@@ -630,18 +715,26 @@ final class UnifiedActivities: ObservableObject {
             return request.expires > now && sessions.insert(request.sessionActivityID).inserted
         }.map { request in
             let id = request.sessionID.uuidString.lowercased()
-            let existing = (activities + agentHistory).first {
+            let pool = activities + agentHistory
+            let existing = pool.first {
                 $0.source == request.source && ($0.conversationID ?? $0.sessionID)?.lowercased() == id
+            }
+            let desktopFallback: IslandActivity? = if existing == nil, request.route == "desktop-panel" {
+                pool.first { $0.source == request.source && $0.progress?.islandPhase?.isTerminal == false }
+                    ?? pool.first { $0.source == request.source }
+            } else {
+                nil
             }
             return IslandActivity(id: existing?.id ?? request.sessionActivityID, kind: "agent",
                 title: request.sourceName + " · 已请求审批",
-                detail: request.cwd.isEmpty ? (existing?.detail ?? "Codex 桌面会话") : URL(fileURLWithPath: request.cwd).lastPathComponent,
+                detail: request.cwd.isEmpty ? (existing?.detail ?? desktopFallback?.detail ?? "Codex 桌面会话") : URL(fileURLWithPath: request.cwd).lastPathComponent,
                 symbol: "hand.raised.fill", priority: 95, expires: request.expires, source: request.source,
                 sessionID: request.source == "codex" && request.route != "desktop-panel" ? id : nil,
                 progress: AgentProgress(phase: "waiting_for_approval", observedAt: request.createdAt, children: [],
                     lastTool: request.route == "desktop" ? "Codex 桌面审批" : request.tool,
                     requestID: request.id.uuidString.lowercased()),
-                sessionTitle: existing?.sessionTitle, conversationID: request.route == "desktop-panel" ? nil : id)
+                sessionTitle: existing?.sessionTitle ?? desktopFallback?.sessionTitle,
+                conversationID: request.route == "desktop-panel" ? nil : id)
         }
     }
 
@@ -656,7 +749,11 @@ final class UnifiedActivities: ObservableObject {
 
     func submitCodexApproval(_ choice: CodexApprovalRequest.Choice, request: CodexApprovalRequest) async -> CodexApprovalRequest.Submission {
         let response = await XPCHelperClient.shared.submitCodexApproval(id: request.id, sessionID: request.sessionID, choice: choice.rawValue)
-        return CodexApprovalRequest.Submission(rawValue: response) ?? .unconfirmed
+        let status = CodexApprovalRequest.Submission(rawValue: response) ?? .unconfirmed
+        if status == .confirmed {
+            await refreshCodexApprovals()
+        }
+        return status
     }
 
     var proactiveAlerts: [IslandActivity] {
@@ -823,6 +920,13 @@ final class UnifiedActivities: ObservableObject {
                 return (lhs?.islandPhase?.attentionPriority ?? 0, lhs?.observedAt ?? 0)
                     < (rhs?.islandPhase?.attentionPriority ?? 0, rhs?.observedAt ?? 0)
             }
+    }
+
+    var activeQuotaAgentSource: String? {
+        if let live = runningAgent?.source, !live.isEmpty {
+            return live
+        }
+        return agentSessions.first(where: { !($0.source ?? "").isEmpty })?.source
     }
 
     static let retainedAgentSessions = 2
@@ -1513,11 +1617,10 @@ private struct AgentSessionsPage: View {
     @ObservedObject private var hub = UnifiedActivities.shared
     @EnvironmentObject private var vm: BoringViewModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var listExpanded = false
-    @State private var heldListHeight: CGFloat = 0
-    @State private var heldVisibleRows = 0
-    @State private var revealedRows = 0
     @State private var hoveredSessionID: String?
+    @AppStorage("largerPanel") private var largerPanel = false
+    @State private var listExpanded = false
+    @State private var previewHovered = false
     @State private var revealedApproval: String?
     private var sessions: [IslandActivity] { hub.agentSessions }
     private var newestDoubaoSession: UUID? {
@@ -1552,6 +1655,12 @@ private struct AgentSessionsPage: View {
                         Text("\(sessions.count)")
                             .font(.system(size: 11, weight: .medium).monospacedDigit())
                             .foregroundStyle(.secondary)
+                        if sessions.count > visibleRows && !listExpanded {
+                            Text("下滑展开")
+
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                        }
                         Spacer()
                         AgentUsageSummary(hub: hub)
                     }
@@ -1559,12 +1668,12 @@ private struct AgentSessionsPage: View {
                     .frame(height: headingHeight)
                     ScrollView(.vertical) {
                         LazyVStack(spacing: 0) {
-                            ForEach(listExpanded ? sessions[...] : sessions.prefix(max(visibleRows, heldVisibleRows))) { item in
+                            ForEach(sessions) { item in
                                 AgentNotchTaskRow(
                                     item: item, name: agentName(item), title: sessionName(item),
                                     activity: currentAction(item, fallback: fallbackStatus(item)),
                                     rowHeight: rowHeight, hoveredSessionID: $hoveredSessionID,
-                                    revealedApproval: $revealedApproval, request: hub.codexApproval(for: item)
+                                    previewHovered: $previewHovered, revealedApproval: $revealedApproval, request: hub.codexApproval(for: item)
                                 ) { open(item.id) }
                                 .id(item.id)
                             }
@@ -1573,26 +1682,34 @@ private struct AgentSessionsPage: View {
                     }
                     .scrollIndicators(.never)
                     .scrollBounceBehavior(.basedOnSize)
+                    .background(AgentListExpandOnScroll(enabled: !listExpanded && sessions.count > visibleRows) {
+                        withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
+                            listExpanded = true
+                        }
+                    })
+                    .popover(isPresented: Binding(
+                        get: { previewSession != nil },
+                        set: { if !$0 && revealedApproval == nil { vm.agentConversationPreviewID = nil } }
+                    ), attachmentAnchor: .rect(.bounds), arrowEdge: .trailing) {
+                        ZStack {
+                            if let item = previewSession {
+                                AgentConversationHoverPreview(item: item)
+                                    .id(item.id)
+                                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 5)))
+                            }
+                        }
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: previewSession?.id)
+                        .onHover { previewHovered = $0 }
+                        .environmentObject(vm)
+                    }
                 }
                 .contentShape(Rectangle())
-                .panGesture(direction: .up, threshold: 12, startsWithMomentum: false, requiresEligibleStart: true,
-                            isEnabled: { canExpandList }) { _, phase in
-                    if phase == .began || phase == .changed { expandList() }
-                }
-                .accessibilityAction(named: "显示更多会话") { expandList() }
-                .frame(height: min(viewportHeight, max(listHeight, heldListHeight)), alignment: .top)
+                .frame(height: min(viewportHeight, listHeight), alignment: .top)
             }
         }
         .task(id: selectedID == nil ? listHeight : 0) {
             let extra = extraListHeight
-            let target = selectedID == nil ? listHeight : 0
-            if selectedID == nil, target < heldListHeight {
-                try? await Task.sleep(for: .milliseconds(1400))
-                guard !Task.isCancelled else { return }
-            }
             withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
-                heldListHeight = target
-                heldVisibleRows = selectedID == nil ? visibleRows : 0
                 vm.agentListPreviewHeightHeld = previewIndex != nil
                 listHeightChanged(extra)
             }
@@ -1606,11 +1723,6 @@ private struct AgentSessionsPage: View {
                 catch { return }
             }
         }
-        .onChange(of: visibleRows) { _, rows in
-            guard previewIndex != nil, !listExpanded else { return }
-            if rows > AgentSessionListMetrics.expandedCount { listExpanded = true }
-            else { revealedRows = max(revealedRows, rows) }
-        }
         .task(id: newestDoubaoSession) {
             guard let id = newestDoubaoSession else { return }
             _ = try? await AgentInteraction.shared.doubaoHistory(id)
@@ -1623,32 +1735,40 @@ private struct AgentSessionsPage: View {
         }
     }
 
+    private var previewSession: IslandActivity? {
+        guard selectedID == nil, revealedApproval == nil,
+              let id = vm.agentConversationPreviewID else { return nil }
+        return sessions.first { $0.id == id }
+    }
+
     private var previewIndex: Int? {
         guard selectedID == nil, let id = vm.agentConversationPreviewID else { return nil }
         return sessions.firstIndex(where: { $0.id == id })
     }
 
     private var visibleRows: Int {
-        AgentSessionListMetrics.visibleRows(total: sessions.count, expanded: listExpanded, previewIndex: previewIndex, minimum: revealedRows)
+        guard listExpanded else { return min(sessions.count, AgentSessionListMetrics.compactCount) }
+        // Keep the shell and its hit region within the visible display and window.
+        let screenHeight = getScreenFrame(vm.screenUUID)?.height ?? 900
+        let shellLimit = min(vm.requiredWindowHeight - 20, screenHeight - 40)
+        let reserved = vm.expandedHeaderSize.height + BoringViewModel.expandedPageTopInset
+            + BoringViewModel.expandedBottomInset + AgentSessionListMetrics.headingHeight
+            + AgentSessionListMetrics.listInset * 2 + (largerPanel ? 32 : 0)
+            + (revealedApproval == nil ? 0 : 120)
+        let capacity = max(AgentSessionListMetrics.compactCount,
+                           Int(max(0, shellLimit - reserved) / rowHeight))
+        return min(sessions.count, capacity)
     }
 
     private var listHeight: CGFloat {
         let reviewing = previewIndex.map { sessions[$0].agentAttentionKey == revealedApproval && revealedApproval != nil } ?? false
-        return AgentSessionListMetrics.height(for: visibleRows) + (previewIndex == nil ? 0 : reviewing ? 120 : AgentSessionListMetrics.inlinePreviewHeight)
+        return AgentSessionListMetrics.height(for: max(AgentSessionListMetrics.compactCount, visibleRows))
+            + (previewIndex != nil && reviewing ? 120 : 0)
     }
 
     private var extraListHeight: CGFloat {
         guard selectedID == nil else { return 0 }
         return max(0, listHeight - AgentSessionListMetrics.height(for: AgentSessionListMetrics.compactCount))
-    }
-
-    private var canExpandList: Bool {
-        selectedID == nil && previewIndex == nil && !listExpanded && sessions.count > max(AgentSessionListMetrics.compactCount, revealedRows)
-    }
-
-    private func expandList() {
-        guard canExpandList else { return }
-        listExpanded = true
     }
 
     private func open(_ id: String?) {
@@ -1729,21 +1849,29 @@ struct AgentApprovalButtonStyle: ButtonStyle {
 
     private var fill: Color {
         switch role {
-        case .allow: Color(red: 0.99, green: 0.72, blue: 0.37)
-        case .deny: Color(red: 0.67, green: 0.23, blue: 0.25)
-        case .neutral: Color(red: 0.24, green: 0.26, blue: 0.32)
+        case .allow: Color(red: 0.98, green: 0.75, blue: 0.36)
+        case .deny: Color(red: 0.68, green: 0.24, blue: 0.26)
+        case .neutral: Color.white.opacity(0.14)
         }
     }
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(role == .allow && isEnabled ? .black : .white)
+            .foregroundStyle(role == .allow && isEnabled ? Color.black.opacity(0.92) : .white)
             .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 9)
-            .frame(height: 25)
+            .frame(height: 24)
             .background(isEnabled ? fill : Color(white: 0.26), in: Capsule())
-            .brightness(configuration.isPressed ? -0.10 : 0)
+            .overlay {
+                Capsule().strokeBorder(
+                    role == .neutral ? Color.white.opacity(0.14) : Color.white.opacity(0.10),
+                    lineWidth: 0.75
+                )
+            }
+            .brightness(configuration.isPressed ? -0.08 : 0)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
             .contentShape(Capsule())
     }
 }
@@ -1756,58 +1884,146 @@ struct AgentCommandApprovalControls: View {
     @State private var sending = false
     @State private var submission: CodexApprovalRequest.Submission?
 
+    private var hasHeadline: Bool {
+        !request.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var usesProseFont: Bool {
+        request.route == "desktop-panel" || request.reviewSymbol != "terminal"
+    }
+
+    private var allowLabel: String {
+        if request.route == "desktop-panel" { return "允许一次" }
+        return request.tool == "本轮权限" ? "仅允许本轮" : "仅允许这次"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Label(request.reviewTitle, systemImage: request.reviewSymbol)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.orange)
-                    .fixedSize()
-                Spacer(minLength: 2)
-                Text(verbatim: request.cwd).notchReadableText()
-                    .font(.caption2).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.middle).help(request.cwd)
+        VStack(alignment: .leading, spacing: compact ? 8 : 6) {
+            if !compact {
+                HStack(spacing: 6) {
+                    Label(request.reviewTitle, systemImage: request.reviewSymbol)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .fixedSize()
+                    Spacer(minLength: 2)
+                    if !request.cwd.isEmpty {
+                        Text(verbatim: request.cwd).notchReadableText()
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle).help(request.cwd)
+                    }
+                }
             }
-            ScrollView {
-                Text(verbatim: request.command ?? "").notchReadableText()
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .scrollIndicators(.hidden)
-            .frame(height: request.reviewSymbol == "terminal" ? (compact ? 47 : 52) : 68)
-            HStack(spacing: 6) {
-                if let submission {
-                    Text(submission == .confirmed ? "已收到审批回执"
-                         : submission == .notSent ? "决定未送出，可以重试" : "审批结果未确认，请检查原会话")
+
+            VStack(alignment: .leading, spacing: hasHeadline ? 4 : 0) {
+                if hasHeadline {
+                    Text(verbatim: request.reason)
                         .notchReadableText()
-                        .font(.caption2).foregroundStyle(submission == .confirmed ? Color.secondary : .orange)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer(minLength: 2)
-                if request.route == "desktop-panel", submission == .notSent || submission == .unconfirmed {
-                    Button("打开 Codex") { AgentApplicationIcons.open(activity: item) }
-                        .buttonStyle(AgentApprovalButtonStyle(.neutral))
+                if !compact, !request.cwd.isEmpty {
+                    EmptyView()
+                } else if compact, !request.cwd.isEmpty {
+                    Text(verbatim: request.cwd)
+                        .notchReadableText()
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
-                if request.route == nil && decisionEnabled {
-                    Button("交回原会话") { send(.native) }
-                        .buttonStyle(AgentApprovalButtonStyle(.neutral))
-                        .accessibilityIdentifier("agent-approval-native")
+                if compact {
+                    Text(verbatim: request.command ?? "")
+                        .notchReadableText()
+                        .font(usesProseFont
+                              ? .system(size: 11.5, weight: .regular)
+                              : .system(size: 11, design: .monospaced))
+                        .foregroundStyle(hasHeadline ? .secondary : .primary)
+                        .lineSpacing(2)
+                        .lineLimit(hasHeadline ? 2 : 3)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, minHeight: hasHeadline ? 32 : 44, alignment: .topLeading)
+                } else {
+                    ScrollView(.vertical) {
+                        Text(verbatim: request.command ?? "")
+                            .notchReadableText()
+                            .font(usesProseFont
+                                  ? .system(size: 11.5, weight: .regular)
+                                  : .system(size: 11, design: .monospaced))
+                            .foregroundStyle(hasHeadline ? .secondary : .primary)
+                            .lineSpacing(2)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .scrollIndicators(.hidden)
+                    .frame(height: hasHeadline ? 44 : 56)
                 }
-                if decisionEnabled {
-                    Button(request.denialCancelsTurn == true ? "拒绝并取消" : "拒绝") { send(.deny) }
-                        .buttonStyle(AgentApprovalButtonStyle(.deny))
-                        .accessibilityIdentifier("agent-codex-deny")
-                    Button(request.tool == "本轮权限" ? "仅允许本轮" : "仅允许这次") { send(.allow) }
-                        .buttonStyle(AgentApprovalButtonStyle(.allow))
-                        .accessibilityIdentifier("agent-codex-allow-once")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.white.opacity(0.065))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.10), lineWidth: 0.75)
+                    }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                if sending {
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.mini)
+                        Text("正在同步审批…")
+                            .notchReadableText()
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                } else if let submission {
+                    HStack(spacing: 4) {
+                        Image(systemName: submission == .confirmed ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(submission == .confirmed ? Color.green : Color.orange)
+                        Text(submission == .confirmed ? "已完成审批"
+                             : submission == .notSent ? "未送达，可重试或切回窗口" : "请核对原窗口状态")
+                            .notchReadableText()
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(submission == .confirmed ? Color.secondary : Color.orange)
+                            .lineLimit(1)
+                    }
                 }
+
+                HStack(spacing: 5) {
+                    Spacer(minLength: 0)
+
+                    if request.route == "desktop-panel", submission == .notSent || submission == .unconfirmed {
+                        Button("切回窗口") { AgentApplicationIcons.open(activity: item) }
+                            .buttonStyle(AgentApprovalButtonStyle(.neutral))
+                    }
+                    if request.route == nil && decisionEnabled {
+                        Button("交回终端") { send(.native) }
+                            .buttonStyle(AgentApprovalButtonStyle(.neutral))
+                            .accessibilityIdentifier("agent-approval-native")
+                    }
+                    if decisionEnabled {
+                        Button(request.denialCancelsTurn == true ? "拒绝并取消" : "拒绝") { send(.deny) }
+                            .buttonStyle(AgentApprovalButtonStyle(.deny))
+                            .accessibilityIdentifier("agent-codex-deny")
+                        Button(allowLabel) { send(.allow) }
+                            .buttonStyle(AgentApprovalButtonStyle(.allow))
+                            .accessibilityIdentifier("agent-codex-allow-once")
+                    }
+                }
+                .frame(height: 25)
             }
             .disabled(sending)
         }
         .accessibilityIdentifier("agent-approval-controls")
     }
 
-    private var decisionEnabled: Bool { submission == nil || submission == .notSent }
+    private var decisionEnabled: Bool { submission == nil || submission == .notSent || submission == .unconfirmed }
 
     private func send(_ choice: CodexApprovalRequest.Choice) {
         guard !sending, decisionEnabled, request.canReviewInNotch else { return }
@@ -1829,7 +2045,7 @@ private struct AgentSessionAttention: View {
     var openDetails: (() -> Void)? = nil
     @ObservedObject private var activities = UnifiedActivities.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var showCommand = false
+    @State private var showCommand = true
 
     private var needsApproval: Bool { item.progress?.islandPhase == .waitingForApproval }
 
@@ -1887,8 +2103,155 @@ private struct AgentSessionAttention: View {
                 AgentCommandApprovalControls(item: item, request: request, compact: false).id(request.id)
             }
         }
-        .onChange(of: request?.id) { showCommand = false }
+        .onChange(of: request?.id) { showCommand = true }
     }
+}
+
+private struct AgentListExpandOnScroll: NSViewRepresentable {
+    let enabled: Bool
+    let expand: () -> Void
+
+    func makeNSView(context: Context) -> MonitorView { MonitorView() }
+    func updateNSView(_ view: MonitorView, context: Context) {
+        view.enabled = enabled
+        view.expand = expand
+    }
+    static func dismantleNSView(_ view: MonitorView, coordinator: ()) { view.stop() }
+
+    final class MonitorView: NSView {
+        var enabled = false
+        var expand: (() -> Void)?
+        private var monitor: Any?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            stop()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self, self.enabled, event.momentumPhase.isEmpty,
+                      NotchScrollHitRegion.contains(eventWindow: event.window,
+                                                    locationInWindow: event.locationInWindow, in: self),
+                      event.scrollingDeltaY < -0.5,
+                      abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) else { return event }
+                self.enabled = false
+                self.expand?()
+                return nil
+            }
+        }
+        func stop() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+    }
+}
+
+private struct AgentConversationHoverPreview: View {
+    let item: IslandActivity
+    @State private var previewBusy = false
+    @State private var recentMessages: [AgentConversationMessage] = []
+    @State private var historyFile: URL?
+    private var name: String { item.title.components(separatedBy: " · ").first ?? "Agent" }
+
+    private var previewTarget: (AgentConversationSource, UUID)? {
+        guard let source = item.source.flatMap(AgentConversationSource.init(rawValue:)),
+              let id = (item.conversationID ?? item.sessionID).flatMap(UUID.init(uuidString:)) else { return nil }
+        return (source, id)
+    }
+
+
+    var body: some View {
+        transcriptPreview
+        .task(id: item.id) {
+            guard let (source, id) = previewTarget else { return }
+            previewBusy = true
+            recentMessages = []
+            if source == .doubao {
+                if let cached = AgentInteraction.shared.cachedDoubaoHistory(id) {
+                    recentMessages = Array(cached.messages.suffix(4))
+                    previewBusy = false
+                }
+                let result = try? await AgentInteraction.shared.doubaoHistory(id)
+                guard !Task.isCancelled else { return }
+                if let result { recentMessages = Array(result.messages.suffix(4)) }
+                previewBusy = false
+                return
+            }
+            let bookmark = UserDefaults.standard.data(forKey: "agentConversationRoot.\(source.rawValue)")
+            let knownFile = historyFile
+            let task = Task.detached(priority: .utility) {
+                try? AgentConversationHistory.read(bookmark: bookmark, source: source, id: id, before: nil, knownFile: knownFile)
+            }
+            let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+            guard !Task.isCancelled else { return }
+            historyFile = result?.file
+            recentMessages = Array(result?.page.messages.suffix(4) ?? [])
+            previewBusy = false
+        }
+    }
+
+    private var transcriptPreview: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                ActivityAvatar(activity: item, size: 16).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.sessionTitle.flatMap { $0.isEmpty ? nil : $0 } ?? item.detail.components(separatedBy: " · ").first ?? name)
+                        .font(.system(size: 12, weight: .semibold))
+                        .lineLimit(1)
+                    Text(name).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 3)
+            .padding(.bottom, 6)
+            Divider().opacity(0.3)
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 6) {
+                    if recentMessages.isEmpty {
+                        if previewBusy { ProgressView().controlSize(.small) }
+                        else { Text("暂无可读取的对话").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    ForEach(recentMessages) { message in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(message.role == "user" ? "你" : name)
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            AgentConversationMessageText(entry: message)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+                .background(AgentPreviewScrollBoundary())
+            }
+            .defaultScrollAnchor(.bottom)
+            .scrollIndicators(.never)
+            .scrollBounceBehavior(.basedOnSize)
+            .modifier(AgentTranscriptEdgeFade(length: 10))
+        }
+        .frame(width: 270, height: 160, alignment: .topLeading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .foregroundStyle(.white)
+        .background {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(.ultraThinMaterial.opacity(0.32))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(.linearGradient(colors: [.black.opacity(0.62), .black.opacity(0.23)],
+                                              startPoint: .top, endPoint: .bottom))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(.white.opacity(0.14), lineWidth: 1)
+                }
+        }
+        .environment(\.colorScheme, .dark)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .accessibilityIdentifier("agent-conversation-hover-preview")
+    }
+
 }
 
 /// InstanceRow and TaskRowButtonStyle from Agent Notch, adapted to IslandActivity.
@@ -1899,26 +2262,16 @@ private struct AgentNotchTaskRow: View {
     let activity: String
     let rowHeight: CGFloat
     @Binding var hoveredSessionID: String?
+    @Binding var previewHovered: Bool
     @Binding var revealedApproval: String?
     let request: CodexApprovalRequest?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let openDetails: () -> Void
     @EnvironmentObject private var vm: BoringViewModel
     @State private var isHovered = false
-    @State private var previewHovered = false
-    @State private var previewBusy = false
-    @State private var recentMessages: [AgentConversationMessage] = []
-    @State private var historyFile: URL?
-
     private var previewOpen: Bool { vm.agentConversationPreviewID == item.id }
     private var shouldClosePreview: Bool {
         previewOpen && !reviewing && !isHovered && !previewHovered && hoveredSessionID == nil
-    }
-
-    private var previewTarget: (AgentConversationSource, UUID)? {
-        guard let source = item.source.flatMap(AgentConversationSource.init(rawValue:)),
-              let id = (item.conversationID ?? item.sessionID).flatMap(UUID.init(uuidString:)) else { return nil }
-        return (source, id)
     }
 
     private var phase: String { item.progress?.phase ?? "" }
@@ -1993,13 +2346,18 @@ private struct AgentNotchTaskRow: View {
                 .padding(.horizontal, 12)
                 .frame(maxWidth: .infinity, minHeight: 120)
                 .transition(reduceMotion ? .opacity : .move(edge: .trailing).combined(with: .opacity))
-            } else if previewOpen {
-                transcriptPreview
-                    .transition(.opacity.combined(with: .offset(y: -4)))
-                    .onHover { previewHovered = $0 }
             }
         }
         .clipped()
+        .task(id: isHovered) {
+            guard isHovered, !reviewing else { return }
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled, isHovered, hoveredSessionID == item.id else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                revealedApproval = nil
+                vm.agentConversationPreviewID = item.id
+            }
+        }
         .onChange(of: item.agentAttentionKey) { old, _ in
             if old != nil && revealedApproval == old { reveal(false) }
         }
@@ -2014,30 +2372,6 @@ private struct AgentNotchTaskRow: View {
                 previewHovered = false
                 if revealedApproval == item.agentAttentionKey { revealedApproval = nil }
             }
-        }
-        .task(id: previewOpen) {
-            guard previewOpen, let (source, id) = previewTarget else { return }
-            if source == .doubao {
-                if let cached = AgentInteraction.shared.cachedDoubaoHistory(id) {
-                    recentMessages = Array(cached.messages.suffix(4))
-                    previewBusy = false
-                }
-                let result = try? await AgentInteraction.shared.doubaoHistory(id)
-                guard !Task.isCancelled, previewOpen else { return }
-                if let result { recentMessages = Array(result.messages.suffix(4)) }
-                previewBusy = false
-                return
-            }
-            let bookmark = UserDefaults.standard.data(forKey: "agentConversationRoot.\(source.rawValue)")
-            let knownFile = historyFile
-            let task = Task.detached(priority: .utility) {
-                try? AgentConversationHistory.read(bookmark: bookmark, source: source, id: id, before: nil, knownFile: knownFile)
-            }
-            let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
-            guard !Task.isCancelled, previewOpen else { return }
-            historyFile = result?.file
-            recentMessages = Array(result?.page.messages.suffix(4) ?? [])
-            previewBusy = false
         }
         .onDisappear {
             if hoveredSessionID == item.id { hoveredSessionID = nil }
@@ -2064,6 +2398,13 @@ private struct AgentNotchTaskRow: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
+                if item.hasPendingAgentApproval, let request, request.canReviewInNotch {
+                    Button(reviewing ? "收起" : "审批") {
+                        reveal(!reviewing)
+                    }
+                    .buttonStyle(AgentApprovalButtonStyle(.allow))
+                    .accessibilityIdentifier("agent-row-quick-approve")
+                }
                 Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
@@ -2076,7 +2417,7 @@ private struct AgentNotchTaskRow: View {
         .accessibilityValue("\(status)，\(activity)")
         .accessibilityIdentifier("agent-session-summary")
         .background {
-            RoundedRectangle(cornerRadius: 10).fill(.primary.opacity(isHovered ? 0.07 : 0))
+            RoundedRectangle(cornerRadius: 10).fill(.primary.opacity(previewOpen && !reviewing ? 0.13 : isHovered ? 0.07 : 0))
         }
         .overlay(alignment: .bottom) {
             Rectangle().fill(.primary.opacity(0.12)).frame(height: 0.5)
@@ -2084,74 +2425,9 @@ private struct AgentNotchTaskRow: View {
         }
         .onHover { hovering in
             isHovered = hovering
-            if hovering, previewTarget != nil || waiting { hoveredSessionID = item.id }
+            if hovering { hoveredSessionID = item.id }
             else if hoveredSessionID == item.id { hoveredSessionID = nil }
         }
-        .task(id: isHovered) {
-            guard isHovered, !previewOpen, previewTarget != nil || waiting,
-                  !vm.systemIslandPresentationActive else { return }
-            let delay: Duration = vm.agentConversationPreviewID == nil ? .milliseconds(570) : .milliseconds(240)
-            try? await Task.sleep(for: delay)
-            guard !Task.isCancelled, isHovered, hoveredSessionID == item.id, vm.notchState == .open,
-                  !previewOpen, !vm.systemIslandPresentationActive, NSEvent.pressedMouseButtons == 0 else { return }
-            previewBusy = previewTarget != nil
-            withAnimation(reduceMotion ? nil : NotchPanelMotion.spring(reduceMotion: false)) {
-                vm.agentConversationPreviewID = item.id
-            }
-        }
-    }
-
-    private var transcriptPreview: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if waiting && request?.route != "desktop" {
-                AgentSessionAttention(item: item, openDetails: openDetails)
-            }
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 6) {
-                    if recentMessages.isEmpty {
-                        if previewBusy { ProgressView().controlSize(.small) }
-                        else { Text("暂无可读取的对话").font(.caption).foregroundStyle(.secondary) }
-                    }
-                    ForEach(recentMessages) { message in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(message.role == "user" ? "你" : name)
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            AgentConversationMessageText(entry: message)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 10)
-                .background(AgentPreviewScrollBoundary())
-            }
-            .defaultScrollAnchor(.bottom)
-            .scrollIndicators(.never)
-            .scrollBounceBehavior(.basedOnSize)
-            .modifier(AgentTranscriptEdgeFade(length: 10))
-        }
-        .frame(height: AgentSessionListMetrics.inlinePreviewHeight - 22, alignment: .topLeading)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .foregroundStyle(.white)
-        .background {
-            RoundedRectangle(cornerRadius: 10)
-                .fill(.ultraThinMaterial.opacity(0.32))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(.linearGradient(colors: [.black.opacity(0.62), .black.opacity(0.23)],
-                                              startPoint: .top, endPoint: .bottom))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10)
-                        .strokeBorder(.white.opacity(0.14), lineWidth: 1)
-                }
-        }
-        .environment(\.colorScheme, .dark)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-        .accessibilityIdentifier("agent-conversation-hover-preview")
     }
 
     private func closePreview() {
@@ -3059,7 +3335,7 @@ private struct AgentUsageSummary: View {
     @AppStorage(AgentQuickReplySource.preferenceKey) private var quickReplySource = AgentQuickReplySource.current
 
     var body: some View {
-        switch AgentUsageSelection.resolve(hub.agentUsage, preferred: preferred, active: hub.runningAgent?.source,
+        switch AgentUsageSelection.resolve(hub.agentUsage, preferred: preferred, active: hub.activeQuotaAgentSource,
                                            apiEnabled: quickReplySource == .api, today: apiUsage.today) {
         case .provider(let snapshot):
             providerBadge(snapshot)

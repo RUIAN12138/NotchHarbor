@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import sys
@@ -76,26 +77,36 @@ def make_request(event, now, pid, provider="codex"):
     tool_input = tool_input if isinstance(tool_input, dict) else {}
     cwd = tool_input.get("workdir") or event.get("cwd") or ""
     reason = tool_input.get("description") or tool_input.get("justification") or tool_input.get("reason") or ""
-    command = tool_input.get("command")
+    raw_cmd = tool_input.get("command") if "command" in tool_input else tool_input.get("cmd")
+    if isinstance(raw_cmd, list) and raw_cmd and all(isinstance(part, str) for part in raw_cmd):
+        command = shlex.join(raw_cmd)
+    else:
+        command = raw_cmd
     # A complete plain command or patch can be reviewed here. Requests for a
     # particular network host, permission set, or another tool stay in Codex.
-    allowed_keys = {"command", "description", "justification", "cwd", "workdir"}
+    allowed_keys = {
+        "command", "cmd", "description", "justification", "reason",
+        "cwd", "workdir", "timeout", "timeout_ms", "login", "tty",
+        "sandbox_permissions", "prefix_rule",
+    }
     if provider == "claude":
-        allowed_keys |= {"timeout", "run_in_background"}
+        allowed_keys |= {"run_in_background"}
+    is_shell = tool in ("Bash", "shell", "shell_command", "exec_command")
     is_patch = provider == "codex" and tool == "apply_patch"
     if is_patch and isinstance(command, str):
         patch = command.strip()
         is_patch = patch.startswith("*** Begin Patch\n") and patch.endswith("\n*** End Patch")
-    can_decide = ((tool == "Bash" or is_patch) and set(tool_input) <= allowed_keys
+    can_decide = ((is_shell or is_patch) and set(tool_input) <= allowed_keys
                   and isinstance(reason, str) and not reason.lstrip().lower().startswith("network-access ")
-                  and isinstance(command, str) and 0 < len(command.encode()) <= (12000 if is_patch else 2000)
+                  and isinstance(command, str) and 0 < len(command.encode()) <= (12000 if is_patch else 4000)
                   and not any(unicodedata.category(c) in ("Cc", "Cf") and c not in "\t\n" for c in command)
                   and isinstance(cwd, str) and cwd.startswith("/") and len(cwd) <= 512
                   and not any(unicodedata.category(c) in ("Cc", "Cf") for c in cwd))
     if provider == "claude" and not can_decide:
         # The existing passive hook continues to surface the request.
         return None
-    return dict(id=str(uuid.uuid4()), sessionID=session_id, tool="文件变更" if is_patch else tool, provider=provider,
+    display_tool = "文件变更" if is_patch else ("Bash" if is_shell else tool)
+    return dict(id=str(uuid.uuid4()), sessionID=session_id, tool=display_tool, provider=provider,
                 cwd=cwd[:512] if isinstance(cwd, str) else "",
                 reason=reason[:240] if isinstance(reason, str) else "",
                 command=command if can_decide else None, createdAt=now,
@@ -137,7 +148,7 @@ def wait_for_choice(request, root, on_change, parent, pause=time.sleep, clock=ti
     write_request(incoming, request)
     try:
         on_change()
-        ack_deadline = min(request["expires"], clock() + 3)
+        ack_deadline = min(request["expires"], clock() + 5)
         while clock() < ack_deadline and not ready.exists():
             pause(0.1)
         if not ready.exists():

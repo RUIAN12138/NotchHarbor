@@ -57,7 +57,24 @@ import Foundation
         precondition(Labels.role("Deny") == .deny && Labels.role("拒绝") == .deny)
         precondition(Labels.role("本次允许") == .allow && Labels.role("本次允許") == .allow)
         precondition(Labels.role("本次允许 ⌘↵") == .allow && Labels.role("Allow once\u{00A0}Return") == .allow)
-        precondition(Labels.role("拒绝\nEsc") == .deny && Labels.role("Deny ⎋") == .deny)
+        precondition(Labels.role("允许一次 ↩") == .allow && Labels.role("允许一次↩") == .allow && Labels.role("允许一次 ⮐") == .allow)
+        precondition(Labels.role("拒绝\nEsc") == .deny && Labels.role("Deny ⎋") == .deny && Labels.role("拒绝Esc") == .deny)
+        precondition(Labels.isKeycapOnly("Esc") && Labels.isKeycapOnly("↩") && !Labels.isKeycapOnly("允许一次"))
+        let formatted = CodexDesktopApprovalPanel.formatCardText([
+            .init(text: "权限", y: 100),
+            .init(text: "允许 ChatGPT 查看", y: 128),
+            .init(text: "Fonts", y: 129),
+            .init(text: "的内容吗？", y: 128),
+            .init(text: "测试审批流程：申请对", y: 156),
+            .init(text: "/System/Library/Fonts", y: 156),
+            .init(text: "的只读访问，不会读取或修改目录内容。", y: 157),
+        ])!
+        precondition(formatted.tool == "本轮权限")
+        precondition(formatted.headline == "允许 ChatGPT 查看 Fonts 的内容吗？")
+        precondition(formatted.body == "测试审批流程：申请对 /System/Library/Fonts 的只读访问，不会读取或修改目录内容。")
+        let idA = CodexDesktopApprovalPanel.stablePacketID(pid: 75571, canonicalKey: formatted.canonicalKey)
+        let idB = CodexDesktopApprovalPanel.stablePacketID(pid: 75571, canonicalKey: formatted.canonicalKey)
+        precondition(idA == idB)
         precondition(Labels.role("Allow this conversation ⌘↵") == nil && Labels.role("允许本次对话使用 ↵") == nil)
         precondition(Labels.role("Always allow Esc") == nil && Labels.role("Allow once (all files)") == nil)
         precondition(Labels.role("Always allow") == nil && Labels.role("Allow this conversation") == nil)

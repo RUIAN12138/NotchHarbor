@@ -29,6 +29,8 @@ class AppleMusicController: MediaControllerProtocol {
     }
 
     private var notificationTask: Task<Void, Never>?
+    private var lastArtworkTrackKey: String?
+    private var cachedArtworkData: Data?
     
     // MARK: - Initialization
     init() {
@@ -128,9 +130,49 @@ class AppleMusicController: MediaControllerProtocol {
         await updatePlaybackInfo()
     }
     
+    func refreshTimelineOnly() async {
+        guard isActive() else { return }
+        let script = """
+        tell application "Music"
+            try
+                set playerState to player state is playing
+                set currentTrackName to name of current track
+                set currentTrackArtist to artist of current track
+                set currentTrackAlbum to album of current track
+                set trackPosition to player position
+                set trackDuration to duration of current track
+                return {playerState, currentTrackName, currentTrackArtist, currentTrackAlbum, trackPosition, trackDuration}
+            on error
+                return {false, "Not Playing", "Unknown", "Unknown", 0, 0}
+            end try
+        end tell
+        """
+        guard let descriptor = try? await AppleScriptHelper.execute(script),
+              descriptor.numberOfItems >= 6 else { return }
+        let sampledAt = Date()
+        let title = descriptor.atIndex(2)?.stringValue ?? "Unknown"
+        let artist = descriptor.atIndex(3)?.stringValue ?? "Unknown"
+        let album = descriptor.atIndex(4)?.stringValue ?? "Unknown"
+        let key = "\(title)\u{1F}\(artist)\u{1F}\(album)"
+        if key != lastArtworkTrackKey && title != "Not Playing" {
+            await updatePlaybackInfo()
+            return
+        }
+        var updatedState = self.playbackState
+        updatedState.isPlaying = descriptor.atIndex(1)?.booleanValue ?? false
+        updatedState.title = title
+        updatedState.artist = artist
+        updatedState.album = album
+        updatedState.currentTime = descriptor.atIndex(5)?.doubleValue ?? 0
+        updatedState.duration = descriptor.atIndex(6)?.doubleValue ?? 0
+        updatedState.lastUpdated = sampledAt
+        self.playbackState = updatedState
+    }
+
     func updatePlaybackInfo() async {
         guard let descriptor = try? await fetchPlaybackInfoAsync() else { return }
         guard descriptor.numberOfItems >= 11 else { return }
+        let sampledAt = Date()
         var updatedState = self.playbackState
         
         updatedState.isPlaying = descriptor.atIndex(1)?.booleanValue ?? false
@@ -144,10 +186,21 @@ class AppleMusicController: MediaControllerProtocol {
         updatedState.repeatMode = RepeatMode(rawValue: Int(repeatModeValue)) ?? .off
         let volumePercentage = descriptor.atIndex(9)?.int32Value ?? 50
         updatedState.volume = Double(volumePercentage) / 100.0
-        updatedState.artwork = descriptor.atIndex(10)?.data as Data?
+        let key = "\(updatedState.title)\u{1F}\(updatedState.artist)\u{1F}\(updatedState.album)"
+        if let art = descriptor.atIndex(10)?.data as Data?, !art.isEmpty {
+            updatedState.artwork = art
+            lastArtworkTrackKey = key
+            cachedArtworkData = art
+        } else if key == lastArtworkTrackKey {
+            updatedState.artwork = cachedArtworkData
+        } else {
+            updatedState.artwork = nil
+            lastArtworkTrackKey = key
+            cachedArtworkData = nil
+        }
         let lovedState = descriptor.atIndex(11)?.booleanValue ?? false
         updatedState.isFavorite = lovedState
-        updatedState.lastUpdated = Date()
+        updatedState.lastUpdated = sampledAt
         self.playbackState = updatedState
     }
     

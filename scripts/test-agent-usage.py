@@ -75,4 +75,67 @@ with tempfile.TemporaryDirectory() as directory:
     stale = {entry['id']: entry for entry in collect_provider_usage(home, now + 86401, None)}
     assert 'openai' not in stale
     assert not collect_provider_usage(home/'missing', now, None)
-print('PASS: CodexBar multi-provider widget input, API spend, alternate quota periods, stale billing and identity exclusion')
+
+    # Antigravity dual-pool (Gemini + Claude/GPT) upgrades unlabeled slots and normalizes to 'gemini'
+    widget.write_text(json.dumps(dict(entries=[
+        dict(
+            provider='antigravity',
+            updatedAt=stamp,
+            primary=dict(usedPercent=25, windowMinutes=300, resetsAt=reset),
+            secondary=dict(usedPercent=40, windowMinutes=10080, resetsAt=reset),
+            usageRows=[
+                dict(title='Gemini 5-hour', window=dict(usedPercent=25, windowMinutes=300, resetsAt=reset)),
+                dict(title='Gemini weekly', window=dict(usedPercent=15, windowMinutes=10080, resetsAt=reset)),
+                dict(title='Claude/GPT 5-hour', window=dict(usedPercent=60, windowMinutes=300, resetsAt=reset)),
+                dict(title='Claude/GPT weekly', window=dict(usedPercent=40, windowMinutes=10080, resetsAt=reset)),
+            ],
+        )
+    ])))
+    dual = {entry['id']: entry for entry in collect_provider_usage(home, now, None)}
+    assert 'gemini' in dual and 'antigravity' not in dual
+    labels = [w.get('label') for w in dual['gemini']['windows']]
+    assert 'Gemini 5-hour' in labels and 'Gemini weekly' in labels
+    assert 'Claude/GPT 5-hour' in labels and 'Claude/GPT weekly' in labels
+
+    # Slot-id usageRows upgrade primary/secondary labels without duplicating windows, and CLI nested 'usage' parses cleanly
+    widget.write_text(json.dumps(dict(entries=[
+        dict(
+            provider='claude',
+            updatedAt=stamp,
+            primary=dict(usedPercent=32, windowMinutes=300, resetsAt=reset),
+            secondary=dict(usedPercent=10, windowMinutes=10080, resetsAt=reset),
+            usageRows=[
+                dict(id='primary', title='Session', percentLeft=68),
+                dict(id='secondary', title='Weekly', percentLeft=90),
+            ],
+        )
+    ])))
+    override = home / '.multiagent-notch/provider-usage.json'
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(json.dumps([
+        dict(
+            provider='antigravity',
+            source='cli',
+            rateWindowLabels=dict(primary='Gemini Models', secondary='Claude and GPT'),
+            usage=dict(
+                updatedAt=stamp,
+                primary=dict(usedPercent=86.5, windowMinutes=300, resetsAt=reset),
+                secondary=dict(usedPercent=0, windowMinutes=300, resetsAt='1970-01-01T00:00:00Z'),
+                extraRateWindows=[
+                    dict(id='gemini-5h', title='Gemini 5-hour', window=dict(usedPercent=86.5, windowMinutes=300, resetsAt=reset)),
+                    dict(id='gemini-weekly', title='Gemini weekly', window=dict(usedPercent=22, windowMinutes=10080, resetsAt=reset)),
+                    dict(id='3p-5h', title='Claude/GPT 5-hour', window=dict(usedPercent=0, windowMinutes=300, resetsAt='1970-01-01T00:00:00Z')),
+                    dict(id='3p-weekly', title='Claude/GPT weekly', window=dict(usedPercent=0, windowMinutes=10080, resetsAt='1970-01-01T00:00:00Z')),
+                ],
+            ),
+        )
+    ]))
+    merged = {entry['id']: entry for entry in collect_provider_usage(home, now, None)}
+    assert len(merged['claude']['windows']) == 2
+    assert [w['label'] for w in merged['claude']['windows']] == ['Session', 'Weekly']
+    assert len(merged['gemini']['windows']) == 4
+    assert [w['label'] for w in merged['gemini']['windows']] == [
+        'Gemini 5-hour', 'Gemini weekly', 'Claude/GPT 5-hour', 'Claude/GPT weekly'
+    ]
+    assert merged['gemini']['windows'][2]['resetsAt'] is None and merged['gemini']['windows'][2]['usedPercent'] == 0
+print('PASS: CodexBar multi-provider widget input, Gemini/Claude-GPT dual-pool normalization, API spend, alternate quota periods, stale billing and identity exclusion')

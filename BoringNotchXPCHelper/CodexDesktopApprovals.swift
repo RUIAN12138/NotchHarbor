@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import CryptoKit
 import Foundation
+import OSLog
 import Security
 
 /// Reads the current desktop client's own approval notification lifecycle.
@@ -198,14 +199,25 @@ final class CodexDesktopApprovalPanel: @unchecked Sendable {
         private static let allow = [
             "allow once", "allow for this turn", "approve once",
             "仅允许本次", "仅本次允许", "允许本次", "本次允许", "仅允许这次", "仅允许一次", "允许一次",
-            "仅本轮允许", "仅允许本轮", "本轮允许", "仅限本轮",
-            "僅允許本次", "本次允許", "允許一次", "僅允許一次", "僅允許本輪"
+            "仅本轮允许", "仅允许本轮", "本轮允许", "仅限本轮", "允许此回合", "仅允许此回合",
+            "僅允許本次", "本次允許", "允許一次", "僅允許一次", "僅允許本輪", "允許此回合", "僅允許此回合"
         ]
         private static let deny = ["deny", "decline", "拒绝", "拒絕"]
 
         private static let shortcut = try! NSRegularExpression(
-            pattern: #"(?:\s+(?:esc|escape|enter|return)|\s*[⌘⌥⌃⇧]*\s*[↵⏎⎋])$"#)
+            pattern: #"(?:(?:\s+|(?<=[^\x00-\x7F]))(?:esc|escape|enter|return)|\s*[⌘⌥⌃⇧]*\s*[↵⏎⎋↩⮐⌤])$"#)
+        private static let standaloneKeycap = try! NSRegularExpression(
+            pattern: #"^(?:[⌘⌥⌃⇧]*\s*(?:esc|escape|enter|return|[↵⏎⎋↩⮐⌤]))$"#)
         private static let ignoredFormatting = CharacterSet(charactersIn: "\u{200E}\u{200F}\u{2066}\u{2067}\u{2068}\u{2069}")
+
+        static func isKeycapOnly(_ raw: String) -> Bool {
+            let cleaned = raw.components(separatedBy: ignoredFormatting).joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !cleaned.isEmpty else { return false }
+            return standaloneKeycap.firstMatch(
+                in: cleaned, range: NSRange(cleaned.startIndex..., in: cleaned)
+            ) != nil
+        }
 
         static func role(_ label: String) -> CodexApprovalPacket.Choice? {
             let words = label.components(separatedBy: ignoredFormatting).joined()
@@ -214,6 +226,7 @@ final class CodexDesktopApprovalPanel: @unchecked Sendable {
             // name. Drop only a recognized trailing key, then match the scope.
             let name = shortcut.stringByReplacingMatches(in: words,
                 range: NSRange(words.startIndex..., in: words), withTemplate: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             if allow.contains(name) { return .allow }
             if deny.contains(name) { return .deny }
             return nil
@@ -235,15 +248,25 @@ final class CodexDesktopApprovalPanel: @unchecked Sendable {
             && guest.map { SecCodeCheckValidity($0, [], desktopRequirement) == errSecSuccess } == true
     }
 
+    private struct CardContent: Equatable {
+        let tool: String
+        let headline: String
+        let body: String
+        let canonicalKey: String
+    }
+
+    struct TextFragment {
+        let text: String
+        let y: CGFloat?
+    }
+
     private struct Match {
+        let pid: pid_t
+        let window: AXUIElement
         let allow: AXUIElement
         let deny: AXUIElement
-        let detail: String
-
-        func equals(_ other: Self) -> Bool {
-            CFEqual(allow, other.allow) && CFEqual(deny, other.deny)
-                && detail.utf8.elementsEqual(other.detail.utf8)
-        }
+        let content: CardContent
+        let packetID: UUID
     }
 
     private struct Record {
@@ -251,147 +274,564 @@ final class CodexDesktopApprovalPanel: @unchecked Sendable {
         let match: Match
     }
 
+    private static let logger = Logger(subsystem: "com.notchharbor.app", category: "DesktopApproval")
     private let lock = NSLock()
     private var record: Record?
     private var lastScan = Date.distantPast
+    private var lastMatchedAt = Date.distantPast
     private var dispatchedID: UUID?
     private var checkedPID: pid_t?
     private var trustedPID = false
+    private var lastDiagnosticState = ""
 
-    /// The panel uses a local presentation key. It does not infer a Codex
-    /// conversation ID from an accessibility window title or a different log.
+    private func noteDiagnostic(_ state: String) {
+        guard state != lastDiagnosticState else { return }
+        lastDiagnosticState = state
+        Self.logger.notice("DesktopApproval state: \(state, privacy: .public)")
+    }
+
+    static func stablePacketID(pid: pid_t, canonicalKey: String) -> UUID {
+        let raw = "desktop-panel:\(pid):\(canonicalKey)"
+        let digest = Array(SHA256.hash(data: Data(raw.utf8)))
+        return UUID(uuid: (
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7],
+            digest[8], digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15]
+        ))
+    }
+
+    static func smartJoin(_ lhs: String, _ rhs: String) -> String {
+        guard let left = lhs.unicodeScalars.last, let right = rhs.unicodeScalars.first else {
+            return lhs + rhs
+        }
+        let noLeadingSpacePunctuation = CharacterSet(charactersIn: "，。！？；：、）》】」』,.!?;:)]}")
+        let noTrailingSpacePunctuation = CharacterSet(charactersIn: "（《【「『([{")
+        if noLeadingSpacePunctuation.contains(right) || noTrailingSpacePunctuation.contains(left) {
+            return lhs + rhs
+        }
+        let leftASCII = left.isASCII && !CharacterSet.whitespacesAndNewlines.contains(left)
+        let rightASCII = right.isASCII && !CharacterSet.whitespacesAndNewlines.contains(right)
+        if leftASCII || rightASCII {
+            return lhs + " " + rhs
+        }
+        return lhs + rhs
+    }
+
+    private static let headerBadges: Set<String> = [
+        "权限", "權限", "permission", "permissions",
+        "命令", "终端", "command", "审批", "審批", "approval"
+    ]
+
+    static func formatCardText(_ fragments: [TextFragment]) -> (tool: String, headline: String, body: String, canonicalKey: String)? {
+        guard !fragments.isEmpty else { return nil }
+        var paragraphs: [String] = []
+        var currentLine = ""
+        var currentY: CGFloat?
+
+        for item in fragments {
+            let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if currentLine.isEmpty {
+                currentLine = trimmed
+                currentY = item.y
+                continue
+            }
+            if let y = item.y, let prevY = currentY, abs(y - prevY) <= 8 {
+                currentLine = smartJoin(currentLine, trimmed)
+                currentY = (prevY + y) * 0.5
+            } else {
+                paragraphs.append(currentLine)
+                currentLine = trimmed
+                currentY = item.y
+            }
+        }
+        if !currentLine.isEmpty {
+            paragraphs.append(currentLine)
+        }
+
+        var tool = "Codex 桌面审批"
+        if paragraphs.count >= 2, let first = paragraphs.first {
+            let normalizedFirst = first.lowercased()
+            if headerBadges.contains(normalizedFirst) {
+                if ["权限", "權限", "permission", "permissions"].contains(normalizedFirst) {
+                    tool = "本轮权限"
+                }
+                paragraphs.removeFirst()
+            }
+        }
+
+        let joinedAll = paragraphs.joined(separator: "\n")
+        guard !paragraphs.isEmpty, joinedAll.count >= 6, joinedAll.utf8.count <= 7_000 else { return nil }
+
+        let headline: String
+        let body: String
+        if paragraphs.count >= 2 {
+            headline = paragraphs[0]
+            body = paragraphs.dropFirst().joined(separator: "\n")
+        } else {
+            headline = ""
+            body = paragraphs[0]
+        }
+        let canonical = (headline + "\n" + body)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        return (tool: tool, headline: headline, body: body, canonicalKey: canonical)
+    }
+
+    /// The panel uses a deterministic presentation key per live card so minor
+    /// Electron DOM re-renders never orphan an in-flight approval click.
     func pending(now: Date = Date()) -> [CodexApprovalPacket] {
         lock.lock()
         defer { lock.unlock() }
-        if now.timeIntervalSince(lastScan) >= 1.25 {
+        if now.timeIntervalSince(lastScan) >= 1.0 {
             lastScan = now
-            guard let match = uniqueVisibleMatch() else { record = nil; return [] }
-            if record?.match.equals(match) != true {
-                let id = UUID()
-                let stamp = now.timeIntervalSince1970
-                record = Record(packet: CodexApprovalPacket(id: id, sessionID: id,
-                    tool: "Codex 桌面审批", cwd: "", reason: "", command: match.detail,
-                    createdAt: stamp, expires: stamp + CodexDesktopApprovals.lifetime,
-                    pid: 0, route: "desktop-panel"), match: match)
+            let outcome = scanVisibleMatch()
+            switch outcome {
+            case .matched(let match):
+                lastMatchedAt = now
+                if record?.packet.id != match.packetID
+                    || record?.packet.reason != match.content.headline
+                    || record?.packet.command != match.content.body {
+                    let stamp = record?.packet.id == match.packetID
+                        ? (record?.packet.createdAt ?? now.timeIntervalSince1970)
+                        : now.timeIntervalSince1970
+                    if record?.packet.id != match.packetID {
+                        dispatchedID = nil
+                    }
+                    record = Record(packet: CodexApprovalPacket(
+                        id: match.packetID,
+                        sessionID: match.packetID,
+                        tool: match.content.tool,
+                        cwd: "",
+                        reason: match.content.headline,
+                        command: match.content.body,
+                        createdAt: stamp,
+                        expires: stamp + CodexDesktopApprovals.lifetime,
+                        pid: match.pid,
+                        route: "desktop-panel"
+                    ), match: match)
+                } else if let existing = record {
+                    record = Record(packet: existing.packet, match: match)
+                }
+            case .transientUnavailable:
+                // Keep the existing record briefly across Space transitions or 1-frame AX timeouts.
+                if now.timeIntervalSince(lastMatchedAt) > 3.5 {
+                    record = nil
+                    dispatchedID = nil
+                }
+            case .absent:
+                record = nil
+                dispatchedID = nil
             }
         }
         return record.map { [$0.packet] } ?? []
+    }
+
+    private enum ScanOutcome {
+        case matched(Match)
+        case transientUnavailable
+        case absent
     }
 
     /// On submission the original controls are found again. A changed,
     /// disabled or ambiguous card can never receive a previous decision.
     func submit(_ choice: CodexApprovalPacket.Choice, id: UUID, session: UUID,
                 home: URL) -> CodexApprovalSubmission {
-        // Logs confirm a response, but access to them is independent of AX.
-        // Take the checkpoint before revalidating the live card, so there is
-        // no filesystem work between matching and pressing the original button.
+        guard choice != .native, id == session else { return .notSent }
         let checkpoint = Self.responseFiles(home: home)
-        let dispatch = lock.withLock { () -> (CodexApprovalSubmission, Date?) in
-            guard choice != .native, let record, record.packet.id == id,
-                  record.packet.sessionID == session, record.packet.expires > Date().timeIntervalSince1970
-            else { return (.notSent, nil) }
-            if dispatchedID == id { return (.unconfirmed, nil) }
-            guard let current = uniqueVisibleMatch(), current.equals(record.match) else { return (.notSent, nil) }
-            let button = choice == .allow ? current.allow : current.deny
-            let started = Date()
-            AXUIElementSetMessagingTimeout(button, 1)
-            defer { AXUIElementSetMessagingTimeout(button, 0) }
-            let action = AXUIElementPerformAction(button, kAXPressAction as CFString)
-            // A timed-out accessibility call can still reach the target.
-            guard action == .success || action == .cannotComplete else { return (.notSent, nil) }
-            dispatchedID = id
-            return (.unconfirmed, started)
-        }
-        guard let started = dispatch.1, !checkpoint.isEmpty else { return dispatch.0 }
+        let started = Date()
 
-        // Let polling continue while we wait for independent confirmation.
-        let deadline = ContinuousClock.now + .seconds(3)
-        var received = false
-        while ContinuousClock.now < deadline {
-            if !received {
-                received = Self.receivedResponse(home: home, since: started, checkpoint: checkpoint, choice: choice)
-            }
-            if received, lock.withLock({
-                guard let match = record?.match, record?.packet.id == id else { return true }
-                let button = choice == .allow ? match.allow : match.deny
-                return !Self.enabled(button) || uniqueVisibleMatch()?.equals(match) != true
-            }) {
-                return .confirmed
-            }
-            Thread.sleep(forTimeInterval: 0.12)
+        let alreadyDispatched = lock.withLock { () -> Bool in
+            if dispatchedID == id { return true }
+            dispatchedID = id
+            return false
         }
-        return .unconfirmed
+        if alreadyDispatched {
+            Self.logger.notice("submit skipped: duplicate in-flight id=\(id.uuidString, privacy: .public)")
+            return .unconfirmed
+        }
+
+        func finish(_ result: CodexApprovalSubmission, stage: String) -> CodexApprovalSubmission {
+            lock.withLock {
+                if result == .confirmed {
+                    if record?.packet.id == id {
+                        record = nil
+                        lastScan = .distantPast
+                    }
+                    dispatchedID = nil
+                } else {
+                    // Allow user retry when the card did not close.
+                    dispatchedID = nil
+                }
+            }
+            Self.logger.notice("submit finished: status=\(result.rawValue, privacy: .public) stage=\(stage, privacy: .public)")
+            return result
+        }
+
+        func isConfirmedDismissed(since start: Date) -> Bool {
+            if !checkpoint.isEmpty && Self.receivedResponse(home: home, since: start, checkpoint: checkpoint, choice: choice) {
+                return true
+            }
+            return lock.withLock {
+                switch scanVisibleMatch() {
+                case .absent:
+                    return hasVisibleDesktopWebArea()
+                case .matched(let live):
+                    return live.packetID != id
+                case .transientUnavailable:
+                    return false
+                }
+            }
+        }
+
+        // Stage 1: Silent background AXPress (with AXManualAccessibility + focus).
+        let stage1Match = lock.withLock { () -> Match? in
+            if case .matched(let current) = scanVisibleMatch(), current.packetID == id {
+                return current
+            }
+            return nil
+        }
+
+        if let current = stage1Match {
+            let appRoot = AXUIElementCreateApplication(current.pid)
+            _ = AXUIElementSetAttributeValue(appRoot, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            let button = choice == .allow ? current.allow : current.deny
+            let err = Self.performPress(on: button)
+            Self.logger.notice("submit stage1 AXPress: choice=\(choice.rawValue, privacy: .public) err=\(err.rawValue, privacy: .public)")
+            if err == .success || err == .cannotComplete {
+                for _ in 0..<4 {
+                    Thread.sleep(forTimeInterval: 0.10)
+                    if isConfirmedDismissed(since: started) {
+                        return finish(.confirmed, stage: "stage1_axpress")
+                    }
+                }
+            }
+        }
+
+        // Stage 2: Activate Codex/ChatGPT window (needed when Electron is unfocused or on another Space),
+        // re-verify the exact same card, and invoke AXPress again.
+        let targetPID: pid_t? = stage1Match?.pid ?? NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex").first?.processIdentifier
+        if let pid = targetPID, Self.officialDesktop(pid),
+           let runningApp = NSRunningApplication(processIdentifier: pid) {
+            DispatchQueue.main.sync {
+                _ = runningApp.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            }
+            if let win = stage1Match?.window {
+                _ = AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+                _ = AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+            }
+            Thread.sleep(forTimeInterval: 0.18)
+            if isConfirmedDismissed(since: started) {
+                return finish(.confirmed, stage: "stage2_post_activate")
+            }
+
+            let stage2Match = lock.withLock { () -> Match? in
+                if case .matched(let refreshed) = scanVisibleMatch(), refreshed.packetID == id {
+                    return refreshed
+                }
+                return nil
+            }
+            if let refreshed = stage2Match {
+                let appRoot = AXUIElementCreateApplication(refreshed.pid)
+                _ = AXUIElementSetAttributeValue(appRoot, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+                _ = AXUIElementPerformAction(refreshed.window, kAXRaiseAction as CFString)
+                let button = choice == .allow ? refreshed.allow : refreshed.deny
+                let err = Self.performPress(on: button)
+                Self.logger.notice("submit stage2 AXPress: err=\(err.rawValue, privacy: .public)")
+                for _ in 0..<5 {
+                    Thread.sleep(forTimeInterval: 0.10)
+                    if isConfirmedDismissed(since: started) {
+                        return finish(.confirmed, stage: "stage2_axpress")
+                    }
+                }
+
+                // Stage 3: Hit-tested pointer click on the verified foreground button when React/Radix
+                // binds pointer events that ignore synthetic AXPress.
+                let frontPID = DispatchQueue.main.sync {
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier
+                }
+                if frontPID == refreshed.pid,
+                   let latest = lock.withLock({ () -> Match? in
+                       if case .matched(let m) = scanVisibleMatch(), m.packetID == id { return m }
+                       return nil
+                   }) {
+                    let targetButton = choice == .allow ? latest.allow : latest.deny
+                    if Self.performVerifiedHitClick(on: targetButton, pid: latest.pid) {
+                        Self.logger.notice("submit stage3 verified hit-click dispatched")
+                        for _ in 0..<10 {
+                            Thread.sleep(forTimeInterval: 0.10)
+                            if isConfirmedDismissed(since: started) {
+                                return finish(.confirmed, stage: "stage3_hit_click")
+                            }
+                        }
+                    }
+                }
+                return finish(.unconfirmed, stage: "stage2_unconfirmed")
+            }
+        }
+
+        return finish(stage1Match == nil ? .notSent : .unconfirmed, stage: "no_live_match")
     }
 
-    private func uniqueVisibleMatch() -> Match? {
-        guard AXIsProcessTrusted() else { return nil }
+    private static func performPress(on button: AXUIElement) -> AXError {
+        AXUIElementSetMessagingTimeout(button, 1.0)
+        defer { AXUIElementSetMessagingTimeout(button, 0) }
+        _ = AXUIElementSetAttributeValue(button, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        let status = AXUIElementPerformAction(button, kAXPressAction as CFString)
+        if status == .success { return status }
+        if let kids = attribute(button, kAXChildrenAttribute) as? [AXUIElement] {
+            for child in kids.prefix(6) where role(child) == kAXButtonRole {
+                let childStatus = AXUIElementPerformAction(child, kAXPressAction as CFString)
+                if childStatus == .success { return childStatus }
+            }
+        }
+        return status
+    }
+
+    private static func performVerifiedHitClick(on button: AXUIElement, pid: pid_t) -> Bool {
+        guard enabled(button), let rect = frame(of: button),
+              rect.width >= 24, rect.height >= 16, rect.width <= 420, rect.height <= 96 else {
+            return false
+        }
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        var hit: AXUIElement?
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, 0.25)
+        defer { AXUIElementSetMessagingTimeout(systemWide, 0) }
+        guard AXUIElementCopyElementAtPosition(systemWide, Float(center.x), Float(center.y), &hit) == .success,
+              let hitElement = hit else {
+            return false
+        }
+        var hitPID: pid_t = 0
+        guard AXUIElementGetPid(hitElement, &hitPID) == .success, hitPID == pid,
+              element(hitElement, isOrInside: button) else {
+            return false
+        }
+        let savedMouse = CGEvent(source: nil)?.location
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: center, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: center, mouseButton: .left)
+        else {
+            return false
+        }
+        down.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.025)
+        up.post(tap: .cghidEventTap)
+        if let savedMouse,
+           let restore = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: savedMouse, mouseButton: .left) {
+            Thread.sleep(forTimeInterval: 0.02)
+            restore.post(tap: .cghidEventTap)
+        }
+        return true
+    }
+
+    private static func element(_ candidate: AXUIElement, isOrInside target: AXUIElement) -> Bool {
+        var current: AXUIElement? = candidate
+        for _ in 0..<8 {
+            guard let node = current else { return false }
+            if CFEqual(node, target) { return true }
+            guard let parent = attribute(node, kAXParentAttribute),
+                  CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            current = (parent as! AXUIElement)
+        }
+        return false
+    }
+
+    private func hasVisibleDesktopWebArea() -> Bool {
+        guard AXIsProcessTrusted() else { return false }
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex")
-        guard running.count == 1, let pid = running.first?.processIdentifier else { return nil }
+        guard running.count == 1, let pid = running.first?.processIdentifier else { return false }
         if checkedPID != pid {
             checkedPID = pid
             trustedPID = Self.officialDesktop(pid)
         }
-        guard trustedPID else { return nil }
+        guard trustedPID else { return false }
         let root = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(root, 0.10)
         let windows = Self.attribute(root, kAXWindowsAttribute) as? [AXUIElement] ?? []
-        return Self.uniqueMatch(in: windows)
+        var queue = windows.filter { Self.attribute($0, kAXMinimizedAttribute) as? Bool != true }
+        var cursor = 0
+        while cursor < queue.count, cursor < 240 {
+            let node = queue[cursor]
+            cursor += 1
+            if Self.isOfficialWebArea(node) { return true }
+            let nodeRole = Self.role(node)
+            if ![kAXStaticTextRole, kAXImageRole, kAXButtonRole, "AXInlineTextBox"].contains(nodeRole) {
+                queue += (Self.attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []).prefix(64)
+            }
+        }
+        return false
     }
 
-    private static func uniqueMatch(in windows: [AXUIElement]) -> Match? {
+    private func scanVisibleMatch() -> ScanOutcome {
+        guard AXIsProcessTrusted() else {
+            noteDiagnostic("ax_untrusted")
+            return .absent
+        }
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex")
+        guard running.count == 1, let pid = running.first?.processIdentifier else {
+            noteDiagnostic("running_count=\(running.count)")
+            return .absent
+        }
+        if checkedPID != pid {
+            checkedPID = pid
+            trustedPID = Self.officialDesktop(pid)
+        }
+        guard trustedPID else {
+            noteDiagnostic("untrusted_pid=\(pid)")
+            return .absent
+        }
+        let root = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(root, 0.35)
+        let windows = Self.attribute(root, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        if windows.isEmpty {
+            noteDiagnostic("transient_empty_windows")
+            return .transientUnavailable
+        }
+        let (match, summary, sawWebArea) = Self.uniqueMatchWithSummary(in: windows, pid: pid)
+        noteDiagnostic(summary)
+        if let match {
+            return .matched(match)
+        }
+        return sawWebArea ? .absent : .transientUnavailable
+    }
+
+    private static func isOfficialWebArea(_ node: AXUIElement) -> Bool {
+        guard role(node) == "AXWebArea",
+              let raw = attribute(node, kAXURLAttribute),
+              let url = (raw as? URL) ?? (raw as? String).flatMap(URL.init(string:)),
+              url.scheme == "app", url.host(percentEncoded: false) == "-"
+        else { return false }
+        return true
+    }
+
+    private static func uniqueMatchWithSummary(in windows: [AXUIElement], pid: pid_t) -> (Match?, String, Bool) {
         // A separate web area may belong to an in-app web page. Accept controls
         // only from Codex's own application document and never a nested frame.
-        var list = windows.filter { attribute($0, kAXMinimizedAttribute) as? Bool != true }.map { ($0, false) }
-        let limit = ContinuousClock.now + .milliseconds(500)
+        struct QueueEntry {
+            let element: AXUIElement
+            let window: AXUIElement
+            let insideDocument: Bool
+        }
+        var list = windows.filter { attribute($0, kAXMinimizedAttribute) as? Bool != true }
+            .map { QueueEntry(element: $0, window: $0, insideDocument: false) }
+        let limit = ContinuousClock.now + .milliseconds(900)
         var matches: [Match] = []
         var cursor = 0
-        while cursor < list.count, cursor < 1_600, ContinuousClock.now < limit {
-            let (node, insideDocument) = list[cursor]
+        var webAreas = 0
+        var buttonsSeen = 0
+        var allowCandidates = 0
+        let leafRoles: Set<String> = [kAXStaticTextRole, kAXImageRole, "AXInlineTextBox"]
+        while cursor < list.count, cursor < 12_000, ContinuousClock.now < limit {
+            let entry = list[cursor]
+            let node = entry.element
             cursor += 1
             let nodeRole = role(node)
-            var inside = insideDocument
+            if leafRoles.contains(nodeRole) { continue }
+            var inside = entry.insideDocument
             if nodeRole == "AXWebArea" {
-                guard !inside, let raw = attribute(node, kAXURLAttribute),
-                      let url = (raw as? URL) ?? (raw as? String).flatMap(URL.init(string:)),
-                      url.scheme == "app", url.host(percentEncoded: false) == "-", url.path == "/index.html"
-                else { continue }
+                guard !inside, isOfficialWebArea(node) else { continue }
                 inside = true
+                webAreas += 1
             }
-            if inside, nodeRole == kAXButtonRole, label(node).flatMap(DecisionLabels.role) == .allow,
-               enabled(node), let match = card(containing: node) {
-                matches.append(match)
-                if matches.count > 1 { return nil }
+            if inside, nodeRole == kAXButtonRole {
+                buttonsSeen += 1
+                if buttonDecisionRole(node) == .allow, enabled(node) {
+                    allowCandidates += 1
+                    if let match = card(containing: node, window: entry.window, pid: pid) {
+                        matches.append(match)
+                        if matches.count > 1 { return (nil, "ambiguous_matches=\(matches.count)", webAreas > 0) }
+                    }
+                }
+                continue
             }
-            list += (attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []).prefix(140).map { ($0, inside) }
+            let kids = attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []
+            if kids.count <= 600 {
+                list += kids.map { QueueEntry(element: $0, window: entry.window, insideDocument: inside) }
+            } else {
+                list += (Array(kids.prefix(100)) + Array(kids.suffix(500)))
+                    .map { QueueEntry(element: $0, window: entry.window, insideDocument: inside) }
+            }
         }
-        guard cursor == list.count, matches.count == 1 else { return nil }
-        return matches.first
+        guard cursor == list.count else {
+            return (nil, "incomplete:cursor=\(cursor),total=\(list.count),web=\(webAreas),btns=\(buttonsSeen),allow=\(allowCandidates)", webAreas > 0)
+        }
+        guard matches.count == 1, let matched = matches.first else {
+            return (nil, "no_match:win=\(windows.count),nodes=\(cursor),web=\(webAreas),btns=\(buttonsSeen),allow=\(allowCandidates)", webAreas > 0)
+        }
+        return (matched, "matched:win=\(windows.count),web=\(webAreas),btns=\(buttonsSeen)", true)
     }
 
-    private static func card(containing allow: AXUIElement) -> Match? {
+    private static func card(containing allow: AXUIElement, window: AXUIElement, pid: pid_t) -> Match? {
         var current = allow
-        for _ in 0..<8 {
+        for _ in 0..<12 {
             guard let parent = attribute(current, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { return nil }
             current = parent as! AXUIElement
             guard role(current) != "AXWebArea" else { return nil }
-            guard let nodes = children(in: current, limit: 56) else { return nil }
+            guard let nodes = children(in: current, limit: 200) else { return nil }
             let buttons = nodes.filter { role($0) == kAXButtonRole && enabled($0) }
-            let allows = buttons.filter { label($0).flatMap(DecisionLabels.role) == .allow }
-            let denies = buttons.filter { label($0).flatMap(DecisionLabels.role) == .deny }
+            let allows = buttons.filter { buttonDecisionRole($0) == .allow }
+            let denies = buttons.filter { buttonDecisionRole($0) == .deny }
             if allows.count > 1 || denies.count > 1 { return nil }
             guard let deny = denies.first, allows.count == 1 else { continue }
 
             var seen = Set<String>()
-            let lines = nodes.compactMap { node -> String? in
+            let fragments = nodes.compactMap { node -> TextFragment? in
                 guard [kAXStaticTextRole, kAXHeadingRole].contains(role(node)), let text = label(node),
-                      DecisionLabels.role(text) == nil, seen.insert(text).inserted else { return nil }
-                return text
+                      DecisionLabels.role(text) == nil, !DecisionLabels.isKeycapOnly(text) else { return nil }
+                let y = position(of: node)?.y
+                let dedupKey = "\(Int((y ?? -9999).rounded()))|\(text)"
+                guard seen.insert(dedupKey).inserted else { return nil }
+                return TextFragment(text: text, y: y)
             }
-            let detail = lines.joined(separator: "\n")
-            guard lines.count >= 1, lines.count <= 16, detail.count >= 8, detail.utf8.count <= 7_000 else { continue }
-            return Match(allow: allow, deny: deny, detail: detail)
+            guard fragments.count >= 1, fragments.count <= 36,
+                  let formatted = formatCardText(fragments) else { continue }
+            let content = CardContent(
+                tool: formatted.tool,
+                headline: formatted.headline,
+                body: formatted.body,
+                canonicalKey: formatted.canonicalKey
+            )
+            let packetID = stablePacketID(pid: pid, canonicalKey: content.canonicalKey)
+            return Match(pid: pid, window: window, allow: allow, deny: deny, content: content, packetID: packetID)
         }
         return nil
+    }
+
+    private static func position(of element: AXUIElement) -> CGPoint? {
+        guard let raw = attribute(element, kAXPositionAttribute),
+              CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+        var point = CGPoint.zero
+        return AXValueGetValue(raw as! AXValue, .cgPoint, &point) ? point : nil
+    }
+
+    private static func frame(of element: AXUIElement) -> CGRect? {
+        guard let origin = position(of: element),
+              let rawSize = attribute(element, kAXSizeAttribute),
+              CFGetTypeID(rawSize) == AXValueGetTypeID() else { return nil }
+        var size = CGSize.zero
+        guard AXValueGetValue(rawSize as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+
+    private static func buttonDecisionRole(_ button: AXUIElement) -> CodexApprovalPacket.Choice? {
+        if let direct = label(button).flatMap(DecisionLabels.role) {
+            return direct
+        }
+        var queue = [button]
+        var cursor = 0
+        var parts: [String] = []
+        while cursor < queue.count && queue.count <= 16 {
+            let item = queue[cursor]
+            cursor += 1
+            if item !== button, role(item) == kAXStaticTextRole, let text = label(item),
+               !DecisionLabels.isKeycapOnly(text) {
+                parts.append(text)
+            }
+            queue += (attribute(item, kAXChildrenAttribute) as? [AXUIElement] ?? []).prefix(8)
+        }
+        guard !parts.isEmpty else { return nil }
+        return DecisionLabels.role(parts.joined(separator: " "))
     }
 
     private static func children(in root: AXUIElement, limit: Int) -> [AXUIElement]? {

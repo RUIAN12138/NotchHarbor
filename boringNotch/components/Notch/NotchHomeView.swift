@@ -31,7 +31,7 @@ struct MusicPlayerView: View {
                     .background { albumAtmosphere }
             } else {
                 MusicStandbyView(hasUnidentifiedAudio: hasUnidentifiedAudio)
-                    .frame(maxWidth: .infinity, minHeight: min(64, viewportHeight))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: music.hasPanelMedia)
@@ -41,7 +41,11 @@ struct MusicPlayerView: View {
                 Defaults[.enableLyrics] = true
                 UserDefaults.standard.set(true, forKey: "lyricsFocusedMusicConfigured")
             }
+            MusicManager.shared.setMusicViewportVisible(true)
             MusicManager.shared.refreshLyrics()
+        }
+        .onDisappear {
+            MusicManager.shared.setMusicViewportVisible(false)
         }
     }
 
@@ -49,12 +53,12 @@ struct MusicPlayerView: View {
         GeometryReader { geometry in
             let tint = Color(nsColor: music.avgColor)
             RadialGradient(stops: [
-                .init(color: tint.opacity(0.25), location: 0),
-                .init(color: tint.opacity(0.14), location: 0.38),
-                .init(color: tint.opacity(0.045), location: 0.7),
+                .init(color: tint.opacity(0.28), location: 0),
+                .init(color: tint.opacity(0.15), location: 0.40),
+                .init(color: tint.opacity(0.05), location: 0.72),
                 .init(color: .clear, location: 1),
-            ], center: UnitPoint(x: min(0.5, 34 / max(1, geometry.size.width)), y: 0.32),
-               startRadius: 0, endRadius: min(235, geometry.size.height * 0.55))
+            ], center: UnitPoint(x: min(0.32, 64 / max(1, geometry.size.width)), y: 0.38),
+               startRadius: 0, endRadius: min(310, max(geometry.size.height * 0.85, geometry.size.width * 0.56)))
             .opacity(!playerColorTinting || music.isPlayerIdle || reduceTransparency || music.usingAppIconForArtwork ? 0 : 1)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.42), value: music.avgColor)
         }
@@ -185,20 +189,27 @@ struct MusicControlsView: View {
     @Default(.enableLyrics) private var lyricsEnabled
 
     var body: some View {
-        let seekHeight: CGFloat = showsProgress ? 27 : 0
-        let stageHeight = max(1, viewportHeight - seekHeight)
-        let controlsWidth = transportWidth
-        let artworkSize = max(1, min(58, stageHeight - 2))
-        VStack(alignment: .leading, spacing: 3) {
-            GeometryReader { geometry in
-                musicStage(height: stageHeight, artworkSize: artworkSize,
-                           transportSpace: min(controlsWidth, floor(geometry.size.width * 0.40)))
-            }
-            .frame(height: stageHeight)
-            .clipped()
+        let sliderHeight: CGFloat = showsProgress ? 16 : 0
+        let controlsHeight: CGFloat = 24
+        let dockSpacing: CGFloat = showsProgress ? 2 : 0
+        let bottomDockHeight: CGFloat = sliderHeight + dockSpacing + controlsHeight
+        let stageBottomGap: CGFloat = 4
+        let stageHeight = max(46, viewportHeight - bottomDockHeight - stageBottomGap)
+        let artworkSize = max(46, min(74, stageHeight - 2))
+        VStack(alignment: .leading, spacing: stageBottomGap) {
+            musicStage(height: stageHeight, artworkSize: artworkSize)
+                .frame(maxWidth: .infinity)
+                .frame(height: stageHeight)
 
-            if showsProgress {
-                musicSlider.frame(height: 24)
+            VStack(spacing: dockSpacing) {
+                if showsProgress {
+                    musicSlider.frame(height: sliderHeight)
+                }
+                GeometryReader { geometry in
+                    transportControls(in: geometry.size.width)
+                        .frame(width: geometry.size.width, height: controlsHeight, alignment: .center)
+                }
+                .frame(height: controlsHeight)
             }
         }
         .buttonStyle(PlainButtonStyle())
@@ -213,33 +224,60 @@ struct MusicControlsView: View {
         .onDisappear { cancelScrub() }
     }
 
-    private func musicStage(height: CGFloat, artworkSize: CGFloat, transportSpace: CGFloat) -> some View {
-        HStack(spacing: 10) {
+    private func musicStage(height: CGFloat, artworkSize: CGFloat) -> some View {
+        HStack(alignment: .center, spacing: 12) {
             AlbumArtView(vm: vm, albumArtNamespace: albumArtNamespace)
                 .frame(width: artworkSize, height: artworkSize)
                 .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(.white.opacity(0.14), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(.white.opacity(0.16), lineWidth: 1)
                         .allowsHitTesting(false)
                 }
+                .shadow(color: .black.opacity(0.26), radius: 6, y: 2)
+
+            let showsLyricsStage = !trimmedTitle.isEmpty && lyricsEnabled && musicManager.isSong && height >= 40
             VStack(alignment: .leading, spacing: 2) {
-                songInfo.frame(height: 17)
-                if !trimmedTitle.isEmpty && lyricsEnabled && musicManager.isSong && height >= 36 {
+                if showsLyricsStage {
+                    songInfo.frame(height: 16)
                     MusicLyricsFocusView()
-                        .frame(height: max(1, height - 19), alignment: .topLeading)
-                        .clipped()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                } else {
+                    nonLyricTrackStage
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            if transportSpace > 0 {
-                transportControls(in: transportSpace)
-                    .frame(width: transportSpace, height: 30)
-                    .padding(.bottom, showsProgress ? 5 : 0)
-                    .frame(height: height, alignment: showsProgress ? .bottom : .center)
-            }
+            .frame(maxWidth: .infinity, maxHeight: height, alignment: .topLeading)
         }
         .frame(height: height)
+    }
+
+    private var nonLyricTrackStage: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Spacer(minLength: 0)
+            if !trimmedTitle.isEmpty {
+                Text(trimmedTitle)
+                    .notchReadableText()
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            let albumText = musicManager.album.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !albumText.isEmpty && albumText != "Self Love" && albumText != "Unknown" {
+                Text(albumText)
+                    .notchReadableText()
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            } else if !sourceSubtitle.isEmpty {
+                Text(sourceSubtitle)
+                    .notchReadableText()
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     private var scrubTrackIdentity: [String] {
@@ -316,7 +354,7 @@ struct MusicControlsView: View {
 
     private var transportWidth: CGFloat {
         let slots = activeSlots
-        let buttons = slots.reduce(CGFloat.zero) { $0 + ($1 == .playPause ? 34 : 26) }
+        let buttons = slots.reduce(CGFloat.zero) { $0 + ($1 == .playPause ? 32 : 25) }
         return buttons + CGFloat(max(0, slots.count - 1)) * 2
     }
 
@@ -328,6 +366,7 @@ struct MusicControlsView: View {
                 .reservesHorizontalNotchScrolling()
         } else {
             slotToolbar
+                .frame(maxWidth: .infinity, alignment: .center)
         }
     }
 
@@ -546,18 +585,18 @@ private struct MusicDeckButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: prominent ? 13 : 11, weight: prominent ? .bold : .semibold))
+                .font(.system(size: prominent ? 12 : 10.5, weight: prominent ? .bold : .semibold))
                 .foregroundStyle(.primary.opacity(prominent || active || hovering ? 1 : 0.76))
                 .contentTransition(reduceMotion ? .identity : .symbolEffect)
                 .offset(x: icon == "play.fill" ? 0.65 : 0)
-                .frame(width: prominent ? 30 : 24, height: prominent ? 27 : 23)
+                .frame(width: prominent ? 28 : 22, height: prominent ? 22 : 20)
                 .background {
                     if prominent || active || hovering {
                         NotchControlSurface(shape: Capsule(), emphasized: prominent || active, isHovered: hovering)
                             .allowsHitTesting(false)
                     }
                 }
-                .frame(width: prominent ? 34 : 26, height: 30)
+                .frame(width: prominent ? 32 : 25, height: 24)
                 .contentShape(Rectangle())
         }
         .buttonStyle(NotchControlStyle())
@@ -680,13 +719,8 @@ struct NotchHomeView: View {
     var refreshWeather: () -> Void = {}
 
     var body: some View {
-        Group {
-            if !coordinator.firstLaunch {
-                mainContent
-            }
-        }
-        // simplified: use a straightforward opacity transition
-        .transition(.opacity)
+        mainContent
+            .transition(.opacity)
     }
 
     private var shouldShowCamera: Bool {
@@ -837,29 +871,88 @@ private struct MusicLyricsFocusView: View {
     @ObservedObject private var music = MusicManager.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var lineHeights: [Int: CGFloat] = [:]
-    @State private var foliaRendered = false
+    @State private var foliaRendered = FoliaWebViewHost.shared.hasRenderedOnce
     @State private var foliaFailed = false
 
-    private func trackOffset(_ index: Int, around current: Int) -> CGFloat {
-        func step(_ index: Int) -> CGFloat {
-            let height = max(23, lineHeights[index] ?? 24)
-            return index == current ? height + 7 : height * 0.78 + 7
+    private var plainLyricLines: [String] {
+        music.currentLyrics
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func anchorY(for current: Int, in containerHeight: CGFloat) -> CGFloat {
+        let activeHeight = max(19, lineHeights[current] ?? 20)
+        let preferredCenter = lineCount == 1
+            ? containerHeight * 0.48
+            : (current <= 0 ? min(containerHeight * 0.30, activeHeight / 2 + 4) : containerHeight * 0.34)
+        let unclamped = preferredCenter - activeHeight / 2
+        guard activeHeight <= containerHeight - 4 else { return 1 }
+        return min(max(2, unclamped), containerHeight - activeHeight - 2)
+    }
+
+    private func trackOffset(_ index: Int, around current: Int, in containerHeight: CGFloat) -> CGFloat {
+        let base = anchorY(for: current, in: containerHeight)
+        func step(_ idx: Int) -> CGFloat {
+            let h = max(18, lineHeights[idx] ?? 19)
+            return idx == current ? h + 4 : h * 0.86 + 3
         }
-        if index < current { return -(index..<current).reduce(0) { $0 + step($1) } }
-        return (current..<index).reduce(0) { $0 + step($1) }
+        if index == current { return base }
+        if index < current {
+            return base - (index..<current).reduce(CGFloat.zero) { $0 + step($1) }
+        }
+        return base + (current..<index).reduce(CGFloat.zero) { $0 + step($1) }
     }
 
     var body: some View {
         if music.syncedLyrics.isEmpty {
-            Text(music.isFetchingLyrics ? "正在匹配同步歌词…" : "暂无带时间轴的歌词")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.78))
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            if music.isFetchingLyrics {
+                Text("正在匹配同步歌词…")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            } else if !plainLyricLines.isEmpty {
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(plainLyricLines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .notchReadableText()
+                                .font(.system(size: 14.5, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.88))
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .mask(LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .black, location: 0.06),
+                        .init(color: .black, location: 0.90),
+                        .init(color: .clear, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                ))
+            } else {
+                Text("暂无带时间轴的歌词")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            }
         } else {
+            let syncTrigger = "\(music.lyricsTimingRevision)|\(music.elapsedTime)|\(music.timestampDate.timeIntervalSinceReferenceDate)|\(music.isPlaying)|\(music.playbackRate)|\(lineCount)"
             ZStack {
                 if !foliaRendered || foliaFailed { nativeRail }
                 if !foliaFailed, let url = Bundle.main.url(forResource: "FoliaRail", withExtension: "html") {
-                    FoliaLyricsRail(file: url, music: music, reduceMotion: reduceMotion, lineCount: lineCount) { rendered in
+                    FoliaLyricsRail(
+                        file: url,
+                        music: music,
+                        reduceMotion: reduceMotion,
+                        lineCount: lineCount,
+                        syncTrigger: syncTrigger
+                    ) { rendered in
                         foliaRendered = rendered
                         foliaFailed = !rendered
                     }
@@ -868,69 +961,83 @@ private struct MusicLyricsFocusView: View {
                     .accessibilityHidden(!foliaRendered)
                 }
             }
+            .clipped()
         }
     }
 
     private var nativeRail: some View {
-            TimelineView(.animation(minimumInterval: reduceMotion ? 0.1 : 1.0 / 30, paused: !music.isPlaying)) { timeline in
-                let elapsed = music.estimatedPlaybackPosition(at: timeline.date)
-                let frame = MusicLyricTimeline.frame(lines: music.syncedLyrics, plain: music.currentLyrics, elapsed: elapsed)
-                let displayed = frame.isPrelude ? "前奏" : (frame.index != nil && frame.current.isEmpty) ? "间奏" : frame.current.isEmpty
-                    ? (music.isFetchingLyrics ? "正在载入歌词…" : "暂无匹配歌词") : frame.current
-                let current = frame.index ?? -1
-                GeometryReader { geometry in
-                    ZStack(alignment: .topLeading) {
-                        if !music.syncedLyrics.isEmpty {
-                            ForEach(current...min(music.syncedLyrics.count - 1, current + (lineCount == 1 ? 0 : 1)), id: \.self) { index in
-                                let distance = index - current
-                                let active = distance == 0
-                                let line = index < 0 ? "前奏" : music.syncedLyrics[index].text
-                                let label = line.isEmpty ? "间奏" : line
-                                let isCredit = label.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    .range(of: #"^(?:作[词詞曲]|[编編]曲|[词詞曲]|[製制]作人?)\s*[:：]"#,
-                                           options: .regularExpression) != nil
-                                let start = index < 0 ? 0 : music.syncedLyrics[index].time
-                                let end = index + 1 < music.syncedLyrics.count
-                                    ? music.syncedLyrics[index + 1].time : max(start + 0.25, music.songDuration)
-                                let fraction = min(1, max(0, (elapsed - start) / max(0.25, end - start)))
-                                Button {
-                                    if index >= 0 { music.seek(toLyric: music.syncedLyrics[index].time) }
-                                } label: {
-                                    lyricText(label, active: active, progress: fraction)
-                                        .font(.system(size: isCredit ? 14 : 20, weight: isCredit ? .semibold : .bold))
-                                        .shadow(color: Color(red: 0.23, green: 0.29, blue: 0.39).opacity(0.75), radius: 1, y: 1)
-                                        .lineLimit(2)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .frame(width: geometry.size.width, alignment: .leading)
-                                        .onGeometryChange(for: CGFloat.self, of: \.size.height) { height in
-                                            lineHeights[index] = height
-                                        }
-                                }
-                                .buttonStyle(.plain)
-                                .scaleEffect(active ? 1 : 0.78, anchor: .topLeading)
-                                .opacity(active ? 1 : distance == 1 ? 0.86 : 0)
-                                .blur(radius: reduceMotion || active ? 0 : 0.65)
-                                .offset(y: trackOffset(index, around: current) + 3)
-                                .transition(.identity)
-                                .allowsHitTesting(index >= 0 && (0...1).contains(distance))
-                                .accessibilityHidden(index < 0 || !(0...1).contains(distance))
-                                .accessibilityLabel("跳到歌词：\(label)")
+        TimelineView(.animation(minimumInterval: reduceMotion ? 0.08 : 1.0 / 30, paused: !music.isPlaying)) { timeline in
+            let elapsed = music.estimatedPlaybackPosition(at: timeline.date)
+            let frame = MusicLyricTimeline.frame(lines: music.syncedLyrics, plain: music.currentLyrics, elapsed: elapsed)
+            let displayed = frame.isPrelude ? "前奏" : (frame.index != nil && frame.current.isEmpty) ? "间奏" : frame.current.isEmpty
+                ? (music.isFetchingLyrics ? "正在载入歌词…" : "暂无匹配歌词") : frame.current
+            let current = frame.index ?? -1
+            let lowerBound = lineCount == 1 ? current : max(-1, current - 1)
+            let upperBound = min(music.syncedLyrics.count - 1, current + (lineCount == 1 ? 0 : 2))
+            GeometryReader { geometry in
+                ZStack(alignment: .topLeading) {
+                    if !music.syncedLyrics.isEmpty, lowerBound <= upperBound {
+                        ForEach(lowerBound...upperBound, id: \.self) { index in
+                            let distance = index - current
+                            let active = distance == 0
+                            let line = index < 0 ? "前奏" : music.syncedLyrics[index].text
+                            let label = line.isEmpty ? "间奏" : line
+                            let isCredit = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                                .range(of: #"^(?:作[词詞曲]|[编編]曲|[词詞曲]|[製制]作人?)\s*[:：]"#,
+                                       options: .regularExpression) != nil
+                            let start = index < 0 ? 0 : music.syncedLyrics[index].time
+                            let end = index + 1 < music.syncedLyrics.count
+                                ? music.syncedLyrics[index + 1].time : max(start + 0.25, music.songDuration)
+                            let fraction = min(1, max(0, (elapsed - start) / max(0.25, end - start)))
+                            Button {
+                                if index >= 0 { music.seek(toLyric: music.syncedLyrics[index].time) }
+                            } label: {
+                                lyricText(label, active: active, progress: fraction)
+                                    .font(.system(size: active ? (isCredit ? 12.5 : 15.5) : 12.5, weight: active ? .bold : .semibold))
+                                    .shadow(color: Color(red: 0.12, green: 0.16, blue: 0.24).opacity(0.68), radius: 1.5, y: 1)
+                                    .lineLimit(active ? nil : 3)
+                                    .multilineTextAlignment(.leading)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(width: max(1, geometry.size.width), alignment: .leading)
+                                    .onGeometryChange(for: CGFloat.self, of: \.size.height) { height in
+                                        lineHeights[index] = height
+                                    }
                             }
-                        } else {
-                            Text(displayed).font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(.secondary).padding(.top, 7)
+                            .buttonStyle(.plain)
+                            .scaleEffect(active ? 1 : 0.88, anchor: .topLeading)
+                            .opacity(active ? 1 : distance < 0 ? 0.42 : (distance == 1 ? 0.78 : 0.48))
+                            .blur(radius: reduceMotion || active ? 0 : 0.5)
+                            .offset(y: trackOffset(index, around: current, in: geometry.size.height))
+                            .transition(.identity)
+                            .allowsHitTesting(index >= 0)
+                            .accessibilityHidden(index < 0)
+                            .accessibilityLabel("跳到歌词：\(label)")
                         }
+                    } else {
+                        Text(displayed)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 7)
                     }
-                    .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
-                    .animation(reduceMotion ? nil : .spring(response: 0.34, dampingFraction: 0.86), value: current)
                 }
-                .mask(LinearGradient(stops: [.init(color: .black, location: 0),
-                                            .init(color: .black, location: 0.86), .init(color: .clear, location: 1)],
-                                     startPoint: .top, endPoint: .bottom))
-                .accessibilityValue(displayed)
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
+                .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86), value: current)
             }
-            .id(music.songTitle + "|" + music.artistName)
-            .accessibilityLabel("歌词")
+            .mask(LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0),
+                    .init(color: .black, location: 0.06),
+                    .init(color: .black, location: 0.90),
+                    .init(color: .clear, location: 1),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            ))
+            .accessibilityValue(displayed)
+        }
+        .id(music.songTitle + "|" + music.artistName)
+        .accessibilityLabel("歌词")
     }
 
     @ViewBuilder
@@ -956,7 +1063,7 @@ private struct MonetLineSweep: TextRenderer {
         for line in layout {
             let rect = line.typographicBounds.rect
             var base = context
-            base.opacity = 0.96
+            base.opacity = 0.54
             base.draw(line)
             if remaining > 0 {
                 var lit = context
@@ -972,136 +1079,250 @@ private struct MonetLineSweep: TextRenderer {
 }
 
 @MainActor
+private final class FoliaWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    static let shared = FoliaWebViewHost()
+
+    private(set) var webView: WKWebView?
+    private var loadedFileURL: URL?
+    private(set) var ready = false
+    private(set) var hasRenderedOnce = false
+    private var inFlight = false
+    private var pendingSync = false
+    private var timeout: Task<Void, Never>?
+    private var reportRender: ((Bool) -> Void)?
+
+    private var lineCount = 2
+    private var reduced = false
+    private var lastKey: String?
+    private var lastRawElapsed: Double?
+    private var lastTimestampDate: Date?
+    private var lastPlaying: Bool?
+    private var lastRate: Double?
+    private var lastReduced: Bool?
+    private var lastAlbumInk: String?
+
+    func ensureWebView(for file: URL) -> WKWebView {
+        if let existing = webView, loadedFileURL == file {
+            return existing
+        }
+        teardownWebView()
+        let config = WKWebViewConfiguration()
+        config.userContentController.add(self, name: "foliaReady")
+        config.userContentController.add(self, name: "foliaSeek")
+        config.userContentController.add(self, name: "foliaRendered")
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.setValue(false, forKey: "drawsBackground")
+        web.navigationDelegate = self
+        web.loadFileURL(file, allowingReadAccessTo: file)
+        webView = web
+        loadedFileURL = file
+        ready = false
+        hasRenderedOnce = false
+        lastKey = nil
+        scheduleRenderTimeout()
+        return web
+    }
+
+    private func scheduleRenderTimeout() {
+        timeout?.cancel()
+        timeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2.2))
+            guard let self, !Task.isCancelled, !self.hasRenderedOnce else { return }
+            self.reportRender?(false)
+        }
+    }
+
+    private func teardownWebView() {
+        timeout?.cancel()
+        if let webView {
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "foliaReady")
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "foliaSeek")
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "foliaRendered")
+        }
+        webView = nil
+        loadedFileURL = nil
+        ready = false
+        hasRenderedOnce = false
+        inFlight = false
+        pendingSync = false
+        lastKey = nil
+    }
+
+    func update(lineCount: Int, reduced: Bool, reportRender: @escaping (Bool) -> Void) {
+        self.lineCount = lineCount
+        self.reduced = reduced
+        self.reportRender = reportRender
+        if hasRenderedOnce {
+            reportRender(true)
+        }
+        sync(force: false)
+    }
+
+    func forceSyncOnAttach() {
+        lastRawElapsed = nil
+        sync(force: true)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        teardownWebView()
+        reportRender?(false)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        reportRender?(false)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        reportRender?(false)
+    }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.frameInfo.isMainFrame else { return }
+        if message.name == "foliaRendered" {
+            timeout?.cancel()
+            hasRenderedOnce = true
+            reportRender?(true)
+        } else if message.name == "foliaReady" {
+            ready = true
+            lastKey = nil
+            sync(force: true)
+        } else if message.name == "foliaSeek", let time = message.body as? Double, time.isFinite {
+            let music = MusicManager.shared
+            if music.syncedLyrics.contains(where: { abs($0.time - time) < 0.01 }) {
+                music.seek(toLyric: time)
+            }
+        }
+    }
+
+    func sync(force: Bool) {
+        guard ready, let web = webView else { return }
+        if inFlight {
+            pendingSync = true
+            return
+        }
+        let music = MusicManager.shared
+        let now = Date()
+        let elapsed = music.estimatedPlaybackPosition(at: now)
+        let rawElapsed = music.elapsedTime
+        let timestampDate = music.timestampDate
+        let anchorWallMs: Double = timestampDate == .distantPast ? 0 : timestampDate.timeIntervalSince1970 * 1000
+        let playing = music.isPlaying
+        let rate = music.playbackRate.isFinite ? music.playbackRate : 1
+        let rich = music.richSyncedLyrics
+        let lyrics = music.syncedLyrics
+        let trackKey = music.lyricTimingTrackKey ?? "\(music.songTitle)|\(music.artistName)"
+        let key = "\(trackKey)|\(music.lyricsTimingRevision)|\(music.songDuration)|\(lineCount)"
+        let changed = force || lastKey != key
+        let rgb = albumLyricInk(music.avgColor).usingColorSpace(.sRGB)
+        let channels = [rgb?.redComponent, rgb?.greenComponent, rgb?.blueComponent].map {
+            Int((min(1, max(0, $0 ?? 1)) * 255).rounded())
+        }
+        let albumInk = String(format: "#%02x%02x%02x", channels[0], channels[1], channels[2])
+        let anchorChanged = lastRawElapsed != rawElapsed || lastTimestampDate != timestampDate
+            || lastPlaying != playing || lastRate != rate
+        guard changed || anchorChanged || lastReduced != reduced || lastAlbumInk != albumInk else { return }
+
+        var payload: [String: Any] = [
+            "key": key,
+            "trackKey": trackKey,
+            "elapsed": elapsed,
+            "anchorElapsed": rawElapsed.isFinite ? max(0, rawElapsed) : 0,
+            "anchorWallMs": anchorWallMs,
+            "rate": rate,
+            "playing": playing,
+            "reduced": reduced,
+            "albumInk": albumInk,
+            "lineCount": lineCount,
+            "duration": music.songDuration.isFinite ? music.songDuration : 0,
+        ]
+        if changed {
+            if rich.count == lyrics.count && !rich.isEmpty {
+                payload["lines"] = rich.map { line -> [String: Any] in
+                    var dict: [String: Any] = ["time": line.time, "text": line.text]
+                    if let endTime = line.endTime, endTime.isFinite { dict["endTime"] = endTime }
+                    if !line.words.isEmpty {
+                        dict["words"] = line.words.map { [
+                            "text": $0.text,
+                            "startTime": $0.startTime,
+                            "endTime": $0.endTime,
+                        ] }
+                    }
+                    return dict
+                }
+            } else {
+                payload["lines"] = lyrics.map { ["time": $0.time, "text": $0.text] }
+            }
+        }
+
+        inFlight = true
+        pendingSync = false
+        web.callAsyncJavaScript("window.updateFolia(snapshot)", arguments: ["snapshot": payload],
+                                in: nil, in: .page) { [weak self] result in
+            guard let self else { return }
+            self.inFlight = false
+            if case .success = result {
+                self.lastKey = key
+                self.lastRawElapsed = rawElapsed
+                self.lastTimestampDate = timestampDate
+                self.lastPlaying = playing
+                self.lastRate = rate
+                self.lastReduced = payload["reduced"] as? Bool
+                self.lastAlbumInk = albumInk
+            }
+            if self.pendingSync {
+                self.pendingSync = false
+                self.sync(force: false)
+            }
+        }
+    }
+}
+
+@MainActor
 private struct FoliaLyricsRail: NSViewRepresentable {
     let file: URL
     let music: MusicManager
     let reduceMotion: Bool
     let lineCount: Int
+    let syncTrigger: String
     let reportRender: (Bool) -> Void
 
-    func makeCoordinator() -> Bridge { Bridge(music: music, reportRender: reportRender) }
-
-    func makeNSView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        let bridge = context.coordinator
-        config.userContentController.add(bridge, name: "foliaReady")
-        config.userContentController.add(bridge, name: "foliaSeek")
-        config.userContentController.add(bridge, name: "foliaRendered")
-        let web = WKWebView(frame: .zero, configuration: config)
-        web.setValue(false, forKey: "drawsBackground")
-        bridge.web = web
-        web.navigationDelegate = bridge
-        web.loadFileURL(file, allowingReadAccessTo: file)
-        bridge.timeout = Task { @MainActor [weak bridge] in
-            try? await Task.sleep(for: .seconds(2))
-            if !Task.isCancelled { bridge?.reportRender(false) }
-        }
-        return web
-    }
-
-    func updateNSView(_ web: WKWebView, context: Context) {
-        context.coordinator.lineCount = lineCount
-        context.coordinator.reduced = reduceMotion
-        context.coordinator.sync()
-    }
-
-    static func dismantleNSView(_ web: WKWebView, coordinator: Bridge) {
-        coordinator.timeout?.cancel()
-        web.configuration.userContentController.removeScriptMessageHandler(forName: "foliaReady")
-        web.configuration.userContentController.removeScriptMessageHandler(forName: "foliaSeek")
-        web.configuration.userContentController.removeScriptMessageHandler(forName: "foliaRendered")
-    }
-
-    final class Bridge: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
-        let music: MusicManager
-        weak var web: WKWebView?
-        var timeout: Task<Void, Never>?
-        let reportRender: (Bool) -> Void
-        var lineCount = 2
-        var reduced = false
-        private var ready = false
-        private var inFlight = false
-        private var pendingSync = false
-        private var lastKey: String?
-        private var lastRawElapsed: Double?
-        private var lastTimestampDate: Date?
-        private var lastPlaying: Bool?
-        private var lastRate: Double?
-        private var lastReduced: Bool?
-        private var lastAlbumInk: String?
-
-        init(music: MusicManager, reportRender: @escaping (Bool) -> Void) {
-            self.music = music
-            self.reportRender = reportRender
-        }
-
-        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { reportRender(false) }
-        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { reportRender(false) }
-        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { reportRender(false) }
-
-        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard message.frameInfo.isMainFrame else { return }
-            if message.name == "foliaRendered" {
-                timeout?.cancel()
-                reportRender(true)
-            } else if message.name == "foliaReady", !ready {
-                ready = true
-                sync()
-            } else if message.name == "foliaSeek", let time = message.body as? Double, time.isFinite,
-                      music.syncedLyrics.contains(where: { abs($0.time - time) < 0.001 }) {
-                music.seek(toLyric: time)
+    final class ContainerView: NSView {
+        override func layout() {
+            super.layout()
+            for subview in subviews {
+                subview.frame = bounds
             }
         }
+    }
 
-        func sync() {
-            guard ready, let web else { return }
-            if inFlight {
-                pendingSync = true
-                return
-            }
-            let elapsed = music.estimatedPlaybackPosition()
-            let rawElapsed = music.elapsedTime
-            let timestampDate = music.timestampDate
-            let playing = music.isPlaying
-            let rate = music.playbackRate.isFinite ? music.playbackRate : 1
-            let lyrics = music.syncedLyrics
-            // Include actual timeline revisions and duration; the prior
-            // first/last-line heuristic missed replacements of middle times.
-            let key = "\(music.lyricsTimingRevision)|\(music.songDuration)|\(lineCount)"
-            let changed = lastKey != key
-            let rgb = albumLyricInk(music.avgColor).usingColorSpace(.sRGB)
-            let channels = [rgb?.redComponent, rgb?.greenComponent, rgb?.blueComponent].map {
-                Int((min(1, max(0, $0 ?? 1)) * 255).rounded())
-            }
-            let albumInk = String(format: "#%02x%02x%02x", channels[0], channels[1], channels[2])
-            let anchorChanged = lastRawElapsed != rawElapsed || lastTimestampDate != timestampDate
-                || lastPlaying != playing || lastRate != rate
-            guard changed || anchorChanged || lastReduced != reduced || lastAlbumInk != albumInk else { return }
-            var payload: [String: Any] = ["key": key, "elapsed": elapsed, "rate": rate,
-                                           "playing": playing, "reduced": reduced,
-                                           "albumInk": albumInk, "lineCount": lineCount,
-                                           "duration": music.songDuration.isFinite ? music.songDuration : 0]
-            if changed { payload["lines"] = lyrics.map { ["time": $0.time, "text": $0.text] } }
-            inFlight = true
-            pendingSync = false
-            web.callAsyncJavaScript("window.updateFolia(snapshot)", arguments: ["snapshot": payload],
-                                    in: nil, in: .page) { [weak self] result in
-                guard let self else { return }
-                self.inFlight = false
-                if case .success = result {
-                    self.lastKey = key
-                    self.lastRawElapsed = rawElapsed
-                    self.lastTimestampDate = timestampDate
-                    self.lastPlaying = playing
-                    self.lastRate = rate
-                    self.lastReduced = payload["reduced"] as? Bool
-                    self.lastAlbumInk = albumInk
-                }
-                if self.pendingSync {
-                    self.pendingSync = false
-                    self.sync()
-                }
-            }
+    func makeNSView(context: Context) -> ContainerView {
+        let container = ContainerView(frame: .zero)
+        let host = FoliaWebViewHost.shared
+        let web = host.ensureWebView(for: file)
+        web.removeFromSuperview()
+        web.frame = container.bounds
+        web.autoresizingMask = [.width, .height]
+        container.addSubview(web)
+        host.update(lineCount: lineCount, reduced: reduceMotion, reportRender: reportRender)
+        host.forceSyncOnAttach()
+        return container
+    }
+
+    func updateNSView(_ container: ContainerView, context: Context) {
+        let host = FoliaWebViewHost.shared
+        let web = host.ensureWebView(for: file)
+        if web.superview !== container {
+            web.removeFromSuperview()
+            web.frame = container.bounds
+            container.addSubview(web)
+        }
+        _ = syncTrigger
+        host.update(lineCount: lineCount, reduced: reduceMotion, reportRender: reportRender)
+    }
+
+    static func dismantleNSView(_ container: ContainerView, coordinator: ()) {
+        for subview in container.subviews {
+            subview.removeFromSuperview()
         }
     }
 }
@@ -1141,8 +1362,8 @@ struct MusicSliderView: View {
                         : Defaults[.sliderColor] == SliderColorEnum.accent ? .effectiveAccent : .white,
                     dragging: $dragging,
                     lastDragged: $lastDragged,
-                    effectiveHeight: 24,
-                    baseTrackHeight: 7,
+                    effectiveHeight: 16,
+                    baseTrackHeight: 5.5,
                     accessibilityName: "播放进度",
                     accessibilityText: timeString(from: currentValue),
                     onValueChange: onValueChange,

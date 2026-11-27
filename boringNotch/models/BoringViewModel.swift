@@ -63,6 +63,8 @@ class BoringViewModel: NSObject, ObservableObject {
     @Published var agentVoiceHotkey = UUID()
     @Published var agentVoiceFocus: AgentVoiceFocus?
     @Published var isAgentVoiceReplyActive = false
+    @Published var isSpotlightGuideActive = false
+    private let isSettingsPreviewInstance: Bool
     var clipboardPendingSelectionID: UUID?
 
     @Published var screenUUID: String?
@@ -85,6 +87,7 @@ class BoringViewModel: NSObject, ObservableObject {
 
     init(screenUUID: String? = nil, isSettingsPreview: Bool = false) {
         animation = animationLibrary.animation
+        isSettingsPreviewInstance = isSettingsPreview
 
         super.init()
         
@@ -104,6 +107,23 @@ class BoringViewModel: NSObject, ObservableObject {
         
         setupDetectorObserver()
 
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isSpotlightGuideActive = NotchSpotlightGuideController.shared.isActive
+            NotchSpotlightGuideController.shared.$isActive
+                .removeDuplicates()
+                .receive(on: RunLoop.main)
+                .sink { [weak self] active in
+                    guard let self else { return }
+                    self.isSpotlightGuideActive = active
+                    if self.notchState == .open {
+                        withAnimation(NotchPanelMotion.spring(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)) {
+                            self.notchSize = self.expandedNotchSize
+                        }
+                    }
+                }
+                .store(in: &self.cancellables)
+        }
     }
     
     private func setupDetectorObserver() {
@@ -247,6 +267,7 @@ class BoringViewModel: NSObject, ObservableObject {
     @Published var selectedAgentID: String?
     var agentDetailExpanded: Bool { selectedAgentID != nil }
     @Published var agentListExtraHeight: CGFloat = 0
+    @Published var previewPageOverride: NotchPage? = nil
 
     var expandedPanelWidth: CGFloat {
         compactAlertWidth ?? fullPanelWidth
@@ -272,12 +293,35 @@ class BoringViewModel: NSObject, ObservableObject {
     }
 
     static let regularPanelHeight: CGFloat = 141
+    static let musicPanelHeight: CGFloat = 177
 
+    @MainActor
+    private var activeExpandedPage: NotchPage {
+        previewPageOverride ?? NotchPage.selection(coordinator: coordinator, activities: UnifiedActivities.shared)
+    }
+
+    var spotlightGuideExtraHeight: CGFloat {
+        (!isSettingsPreviewInstance && isSpotlightGuideActive && !compactAlertPresented)
+            ? SpotlightGuideGeometry.reservedExtraHeight
+            : 0
+    }
+
+    @MainActor
     var expandedNotchSize: CGSize {
-        let baseHeight: CGFloat = compactAlertPresented
-            ? compactAlertTopInset + compactAlertContentHeight
-            : (agentDetailExpanded ? 346 : Self.regularPanelHeight + agentListExtraHeight)
-        return CGSize(width: expandedPanelWidth, height: baseHeight + (!compactAlertPresented && Defaults[.largerPanel] ? 32 : 0))
+        let baseHeight: CGFloat
+        if compactAlertPresented {
+            baseHeight = compactAlertTopInset + compactAlertContentHeight
+        } else if agentDetailExpanded {
+            baseHeight = 346
+        } else if activeExpandedPage == .music {
+            baseHeight = Self.musicPanelHeight
+        } else {
+            baseHeight = Self.regularPanelHeight + agentListExtraHeight
+        }
+        let largerExtra: CGFloat = (!compactAlertPresented && Defaults[.largerPanel])
+            ? (activeExpandedPage == .music && !agentDetailExpanded ? 24 : 32)
+            : 0
+        return CGSize(width: expandedPanelWidth, height: baseHeight + largerExtra + spotlightGuideExtraHeight)
     }
 
     var expandedHeaderSize: CGSize {
@@ -291,7 +335,7 @@ class BoringViewModel: NSObject, ObservableObject {
     var expandedPageSize: CGSize {
         CGSize(width: max(1, expandedNotchSize.width - 2 * (usesSystemIslandTrigger ? expandedShoulderInset + 8 : 24)),
                height: max(1, expandedNotchSize.height - expandedHeaderSize.height
-                   - Self.expandedPageTopInset - Self.expandedBottomInset))
+                   - Self.expandedPageTopInset - Self.expandedBottomInset - spotlightGuideExtraHeight))
     }
 
     var fileDropTopInset: CGFloat {
@@ -353,6 +397,10 @@ class BoringViewModel: NSObject, ObservableObject {
               position.y >= frame.minY, position.y <= frame.maxY else { return false }
         let depth = frame.maxY - position.y
         let offset = abs(position.x - frame.midX)
+        if notchState == .closed, isSpotlightGuideActive,
+           depth <= runningAgentHeight + 36, offset <= (collapsedTriggerWidth / 2) + 28 {
+            return true
+        }
         if notchState == .closed, showsRunningAgent, runningAgentVisible,
            runningAgentWings.contains(position) { return true }
         if externalFileDragActive,
@@ -396,14 +444,17 @@ class BoringViewModel: NSObject, ObservableObject {
         notchSize = expanded ? expandedNotchSize : closedNotchSize
     }
 
-    func open(forShelfDrag: Bool = false) {
+    func open(forShelfDrag: Bool = false, forCompactAlert: Bool = false) {
         guard !systemIslandPresentationActive else { return }
+        if !forCompactAlert && compactAlertPresented {
+            setCompactAlertPresented(false)
+        }
         openedForShelfDrag = forShelfDrag
         self.notchSize = expandedNotchSize
         self.notchState = .open
         
         // A drag preview goes straight to the shelf, so avoid unrelated media work.
-        if !forShelfDrag { MusicManager.shared.forceUpdate() }
+        if !forShelfDrag && !forCompactAlert { MusicManager.shared.forceUpdate() }
     }
 
     /// Refreshes the cached notch sizes for the screen the window is now on.
@@ -421,9 +472,10 @@ class BoringViewModel: NSObject, ObservableObject {
         }
     }
 
-    func close() {
-        // Do not close while a share picker or sharing service is active
-        if SharingStateManager.shared.preventNotchClose {
+    func close(allowDuringGuide: Bool = false) {
+        // Do not close while a share picker, sharing service, or active open spotlight step is running
+        if SharingStateManager.shared.preventNotchClose
+            || (!allowDuringGuide && isSpotlightGuideActive && !NotchSpotlightGuideController.shared.isWaitingForInitialClick && !systemIslandPresentationActive) {
             return
         }
         if usesSystemIslandTrigger && notchState == .open {

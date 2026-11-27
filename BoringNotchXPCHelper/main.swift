@@ -28,9 +28,24 @@ class ServiceDelegate: NSObject, NSXPCListenerDelegate {
               SecCodeCopySigningInformation(guestStatic, SecCSFlags(rawValue: kSecCSSigningInformation), &guestInfo) == errSecSuccess,
               SecCodeCopySigningInformation(ownStatic, SecCSFlags(rawValue: kSecCSSigningInformation), &ownInfo) == errSecSuccess,
               let peer = guestInfo as? [String: Any], let selfInfo = ownInfo as? [String: Any],
-              peer[kSecCodeInfoIdentifier as String] as? String == "com.notchharbor.app",
-              let team = selfInfo[kSecCodeInfoTeamIdentifier as String] as? String,
-              peer[kSecCodeInfoTeamIdentifier as String] as? String == team else { return false }
+              peer[kSecCodeInfoIdentifier as String] as? String == "com.notchharbor.app" else { return false }
+        let selfTeam = selfInfo[kSecCodeInfoTeamIdentifier as String] as? String
+        let peerTeam = peer[kSecCodeInfoTeamIdentifier as String] as? String
+        guard selfTeam == peerTeam else { return false }
+        if selfTeam == nil {
+            let expectedAppURL = Bundle.main.bundleURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .resolvingSymlinksInPath()
+            guard let peerExec = peer[kSecCodeInfoMainExecutable as String] as? URL else { return false }
+            let peerAppURL = peerExec
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .resolvingSymlinksInPath()
+            guard peerAppURL == expectedAppURL else { return false }
+        }
         
         // Configure the connection.
         // First, set the interface that the exported object implements.

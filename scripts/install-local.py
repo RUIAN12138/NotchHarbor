@@ -43,7 +43,7 @@ def info(app):
 
 def requirement(app):
     output = subprocess.check_output(['codesign', '-dr', '-', str(app)], stderr=subprocess.STDOUT, text=True)
-    return next(line for line in output.splitlines() if line.startswith('designated =>'))
+    return next((line.lstrip('# ').strip() for line in output.splitlines() if 'designated =>' in line), '')
 
 def running_pids(app, executable):
     prefix = os.fsencode(app/'Contents/MacOS'/executable)
@@ -107,8 +107,13 @@ assert all(settings[k] == 'Notch Harbor' for k in ('CFBundleName', 'CFBundleDisp
 old_identity = info(old)['CFBundleIdentifier']
 assert old_identity in (legacy_identity, harbor_identity)
 assert settings['CFBundleIdentifier'] == harbor_identity
-assert requirement(build) == requirement(old).replace('"' + old_identity + '"', '"' + harbor_identity + '"')
-assert not settings.get('SUFeedURL')
+old_req = requirement(old)
+build_req = requirement(build)
+assert (
+    build_req == old_req.replace('"' + old_identity + '"', '"' + harbor_identity + '"')
+    or ("cdhash " in old_req and "anchor apple generic" in build_req and f'identifier "{harbor_identity}"' in build_req)
+), (old_req, build_req)
+assert settings.get('SUFeedURL') == 'https://github.com/RUIAN12138/NotchHarbor/releases/latest/download/appcast.xml'
 run('codesign', '--verify', '--deep', '--strict', str(build))
 executable = settings['CFBundleExecutable']
 previous_jobs = {path: path.read_bytes() for path in (old_plist, plist) if path.is_file()}

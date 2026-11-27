@@ -622,52 +622,138 @@ struct CompactAlertEdgeLight: View {
     }
 }
 
-/// A soft, outward falloff around the physical camera cutout.
+/// Fluorescent completion glow: wraps the entire Dynamic Island when visible,
+/// or hugs the Notch U-edge when collapsed/hidden.
 struct AgentCompletionHalo: View {
+    enum Mode: Equatable {
+        case fullIsland(CGSize)
+        case notchEdge(CGSize)
+    }
+
     let startedAt: Date
     let duration: TimeInterval
-    let cutout: CGSize
+    let mode: Mode
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 24, paused: reduceMotion)) { timeline in
-            let elapsed = max(0, timeline.date.timeIntervalSince(startedAt))
-            let progress = min(1, elapsed / duration)
-            let fade = reduceMotion ? 0.68 : notchPhase(progress, from: 0, to: 0.055)
-                * (1 - notchPhase(progress, from: 0.86, to: 1))
-            let shimmer = reduceMotion ? 0.85 : 0.86 + 0.09 * sin(elapsed * 3.1) + 0.035 * sin(elapsed * 6.3)
-            Canvas { context, size in
-                let camera = CGRect(x: (size.width - cutout.width) / 2, y: -16,
-                                    width: cutout.width, height: cutout.height + 16)
-                let silhouette = NotchShape(topCornerRadius: 0, bottomCornerRadius: 9,
-                                            topCornerIsConvex: true).path(in: camera)
-                let bounds = Path(CGRect(origin: .zero, size: size))
-                let drift = reduceMotion ? 0.5 : 0.5 - 0.43 * cos(progress * .pi * 4)
-                let pool = CGPoint(x: camera.minX + cutout.width * drift, y: cutout.height + 2)
+    init(startedAt: Date, duration: TimeInterval, cutout: CGSize) {
+        self.startedAt = startedAt
+        self.duration = duration
+        self.mode = .notchEdge(cutout)
+    }
 
-                context.drawLayer { halo in
-                    halo.opacity = Double(fade) * shimmer
-                    halo.fill(bounds, with: .color(.white.opacity(0.60)))
-                    halo.fill(bounds, with: .radialGradient(
-                        Gradient(colors: [.white.opacity(0.82), .clear]),
-                        center: pool, startRadius: 2, endRadius: cutout.width * 0.36
-                    ))
-                    halo.opacity = 1
-                    halo.blendMode = .destinationIn
-                    halo.drawLayer { mask in
-                        mask.addFilter(.blur(radius: 6))
-                        mask.stroke(silhouette, with: .color(.white),
-                                    style: StrokeStyle(lineWidth: 14, lineJoin: .round))
+    init(startedAt: Date, duration: TimeInterval, mode: Mode) {
+        self.startedAt = startedAt
+        self.duration = duration
+        self.mode = mode
+    }
+
+    private var targetSize: CGSize {
+        switch mode {
+        case .fullIsland(let size), .notchEdge(let size):
+            return CGSize(width: max(60, size.width), height: max(24, size.height))
+        }
+    }
+
+    private var isFullIsland: Bool {
+        if case .fullIsland = mode { return true }
+        return false
+    }
+
+    var body: some View {
+        let base = targetSize
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { timeline in
+            let elapsed = max(0, timeline.date.timeIntervalSince(startedAt))
+            let progress = min(1, elapsed / max(0.2, duration))
+            let fade = reduceMotion ? 0.85 : notchPhase(progress, from: 0, to: 0.06)
+                * (1 - notchPhase(progress, from: 0.84, to: 1))
+            let breath = reduceMotion ? 0.92 : 0.88 + 0.12 * sin(elapsed * 3.6)
+            let angle = Angle.degrees(reduceMotion ? 35 : elapsed * 115)
+
+            Canvas { context, size in
+                let padX: CGFloat = 22
+                if isFullIsland {
+                    let islandRect = CGRect(x: padX, y: 3, width: base.width, height: base.height)
+                    let islandPath = NotchShape.panel(expanded: false).path(in: islandRect)
+                    let center = CGPoint(x: islandRect.midX, y: islandRect.midY)
+                    let aurora = Gradient(colors: [
+                        Color(red: 0.16, green: 0.98, blue: 0.76),
+                        Color(red: 0.14, green: 0.78, blue: 1.0),
+                        Color(red: 0.48, green: 0.46, blue: 1.0),
+                        Color(red: 0.20, green: 0.96, blue: 0.88),
+                        Color(red: 0.16, green: 0.98, blue: 0.76),
+                    ])
+
+                    context.drawLayer { layer in
+                        layer.opacity = Double(fade) * breath
+                        layer.drawLayer { outer in
+                            outer.addFilter(.blur(radius: 8.5))
+                            outer.stroke(
+                                islandPath,
+                                with: .conicGradient(aurora, center: center, angle: angle),
+                                style: StrokeStyle(lineWidth: 9.5, lineCap: .round, lineJoin: .round)
+                            )
+                        }
+                        layer.drawLayer { mid in
+                            mid.addFilter(.blur(radius: 3.0))
+                            mid.stroke(
+                                islandPath,
+                                with: .conicGradient(aurora, center: center, angle: angle),
+                                style: StrokeStyle(lineWidth: 4.0, lineCap: .round, lineJoin: .round)
+                            )
+                        }
+                        layer.stroke(
+                            islandPath,
+                            with: .conicGradient(aurora, center: center, angle: angle),
+                            style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round)
+                        )
+                        layer.blendMode = .destinationOut
+                        let innerPath = NotchShape.panel(expanded: false).path(in: islandRect.insetBy(dx: 0.6, dy: 0.6))
+                        layer.fill(innerPath, with: .color(.white))
                     }
-                    halo.blendMode = .destinationOut
-                    halo.drawLayer { inset in
-                        inset.addFilter(.blur(radius: 1.6))
-                        inset.fill(silhouette, with: .color(.white))
+                } else {
+                    let camera = CGRect(x: (size.width - base.width) / 2, y: -14,
+                                        width: base.width, height: base.height + 14)
+                    let silhouette = NotchShape(topCornerRadius: 6, bottomCornerRadius: 10,
+                                                topCornerIsConvex: true).path(in: camera)
+                    let center = CGPoint(x: camera.midX, y: base.height * 0.5)
+                    let edgeAurora = Gradient(colors: [
+                        Color(red: 0.18, green: 0.98, blue: 0.78),
+                        Color(red: 0.18, green: 0.80, blue: 1.0),
+                        Color(red: 0.45, green: 0.52, blue: 1.0),
+                        Color(red: 0.22, green: 0.96, blue: 0.84),
+                        Color(red: 0.18, green: 0.98, blue: 0.78),
+                    ])
+
+                    context.drawLayer { halo in
+                        halo.opacity = Double(fade) * breath
+                        halo.drawLayer { bloom in
+                            bloom.addFilter(.blur(radius: 6.5))
+                            bloom.stroke(
+                                silhouette,
+                                with: .conicGradient(edgeAurora, center: center, angle: angle),
+                                style: StrokeStyle(lineWidth: 8.5, lineCap: .round, lineJoin: .round)
+                            )
+                        }
+                        halo.drawLayer { crisp in
+                            crisp.addFilter(.blur(radius: 1.8))
+                            crisp.stroke(
+                                silhouette,
+                                with: .conicGradient(edgeAurora, center: center, angle: angle),
+                                style: StrokeStyle(lineWidth: 3.0, lineCap: .round, lineJoin: .round)
+                            )
+                        }
+                        halo.stroke(
+                            silhouette,
+                            with: .conicGradient(edgeAurora, center: center, angle: angle),
+                            style: StrokeStyle(lineWidth: 1.4, lineCap: .round, lineJoin: .round)
+                        )
+                        halo.blendMode = .destinationOut
+                        halo.fill(silhouette, with: .color(.white))
                     }
                 }
             }
         }
-        .frame(width: cutout.width + 44, height: cutout.height + 23)
+        .frame(width: base.width + 44, height: base.height + (isFullIsland ? 24 : 20))
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }

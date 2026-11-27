@@ -5,7 +5,11 @@ repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 build_dir="${NOTCH_HARBOR_BUILD_DIR:-$repo_dir/.build}"
 package_dir="${NOTCH_HARBOR_PACKAGES_DIR:-$build_dir/swift-packages}"
 package_cache_dir="$build_dir/swiftpm-cache"
-sign_identity="${NOTCH_HARBOR_SIGNING_IDENTITY:--}"
+sign_identity="${NOTCH_HARBOR_SIGNING_IDENTITY:-}"
+if [[ -z "$sign_identity" ]]; then
+  sign_identity="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -n 1)"
+  sign_identity="${sign_identity:--}"
+fi
 folia_source="$repo_dir/THIRD_PARTY/Folia"
 folia_deps="$build_dir/folia"
 

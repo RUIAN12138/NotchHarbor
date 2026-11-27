@@ -919,6 +919,14 @@ struct About: View {
                     CheckForUpdatesView(updater: updaterController.updater)
                 }
 
+                Button("开始灵动岛点击引导") {
+                    NotificationCenter.default.post(name: .showOnboardingTutorial, object: "spotlight-only")
+                }
+
+                Button("权限设置向导") {
+                    NotificationCenter.default.post(name: .showOnboardingTutorial, object: "permissions-wizard")
+                }
+
                 Button("重新启动 Notch Harbor") { ApplicationRelauncher.restart() }
 
                 Section {
@@ -1216,6 +1224,8 @@ private struct HarborNotchPreview: View {
     @State private var page: NotchPage = .music
     @State private var hovering = false
     @State private var blocksHoverUntilExit = false
+    @State private var collapseDemoTask: Task<Void, Never>?
+    @State private var holdsHeightDuringCollapseDemo = false
 
     private struct DisplayGeometry: Equatable {
         var screenUUID: String?
@@ -1231,8 +1241,18 @@ private struct HarborNotchPreview: View {
 
     private var usesGlass: Bool { glassEnabled && !reduceTransparency }
     private var inkScheme: ColorScheme { usesGlass || !glassEnabled ? .dark : colorScheme }
-    private var shellHeight: CGFloat { expanded ? model.expandedNotchSize.height : model.runningAgentHeight }
+    private var isCompletelyHiddenCollapsed: Bool { !expanded && collapsedStyle == .hidden }
+    private var shellHeight: CGFloat {
+        expanded ? model.expandedNotchSize.height : (collapsedStyle == .hidden ? 0 : model.runningAgentHeight)
+    }
+    private var viewportShellHeight: CGFloat {
+        (expanded || holdsHeightDuringCollapseDemo) ? model.expandedNotchSize.height : max(32, shellHeight)
+    }
     private var shellWidth: CGFloat { expanded ? model.expandedPanelWidth : model.runningAgentCenterWidth + (collapsedStyle == .hidden ? 0 : 2 * restingExtension) }
+    private var panelTopPadding: CGFloat {
+        if !expanded && collapsedStyle != .island { return 0 }
+        return 10
+    }
     private var musicLightActive: Bool {
         musicLightEnabled && expanded && usesGlass && !reduceMotion && lightIntensity > 0 && music.isPlaying
     }
@@ -1244,6 +1264,8 @@ private struct HarborNotchPreview: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 Button {
+                    collapseDemoTask?.cancel()
+                    holdsHeightDuringCollapseDemo = false
                     setExpanded(!expanded)
                 } label: {
                     Label(expanded ? "Collapsed" : "Expanded",
@@ -1257,16 +1279,16 @@ private struct HarborNotchPreview: View {
                 .accessibilityIdentifier("harbor-preview-expand")
             }
             GeometryReader { proxy in
-                let scale = min(1, max(0.1, (proxy.size.width - 24) / model.expandedPanelWidth))
+                let scale = min(0.72, max(0.1, (proxy.size.width - 32) / model.expandedPanelWidth))
                 ZStack(alignment: .top) {
                     previewBackdrop
                     panel
                         .scaleEffect(scale, anchor: .top)
                         .frame(width: proxy.size.width, alignment: .top)
-                        .padding(.top, 12)
+                        .padding(.top, panelTopPadding)
                 }
             }
-            .frame(height: max(163, shellHeight + 23))
+            .frame(height: max(108, round(viewportShellHeight * 0.72) + 20))
             .clipShape(RoundedRectangle(cornerRadius: 16))
             .overlay {
                 RoundedRectangle(cornerRadius: 16).strokeBorder(.primary.opacity(0.11))
@@ -1279,15 +1301,23 @@ private struct HarborNotchPreview: View {
             model.closedNotchSize = metrics.closedSize
             model.usesSystemIslandTrigger = metrics.systemCompanion
             model.systemIslandWidth = metrics.islandWidth
+            model.previewPageOverride = page
             model.setSettingsPreviewExpanded(expanded)
         }
-        .onChange(of: page) { _, _ in
+        .onChange(of: page) { _, newPage in
             model.selectedAgentID = nil
             model.agentListExtraHeight = 0
+            model.previewPageOverride = newPage
             model.setSettingsPreviewExpanded(expanded)
         }
         .onChange(of: shelfEnabled) { _, enabled in
             if !enabled && page == .shelf { page = .music }
+        }
+        .onChange(of: collapsedStyle) { _, _ in
+            triggerCollapseAndExpandDemo()
+        }
+        .onChange(of: restingExtension) { _, _ in
+            triggerCollapseAndExpandDemo()
         }
         .task(id: hovering && !expanded && openOnHover && !blocksHoverUntilExit) {
             guard hovering, !expanded, openOnHover, !blocksHoverUntilExit else { return }
@@ -1295,7 +1325,10 @@ private struct HarborNotchPreview: View {
             if !Task.isCancelled, hovering, !expanded, !blocksHoverUntilExit { setExpanded(true) }
         }
         .onChange(of: musicLightActive, initial: true) { _, active in musicSignal.setActive(active) }
-        .onDisappear { musicSignal.setActive(false) }
+        .onDisappear {
+            collapseDemoTask?.cancel()
+            musicSignal.setActive(false)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("harbor-live-notch-preview")
     }
@@ -1323,7 +1356,7 @@ private struct HarborNotchPreview: View {
             NotchGlassBackground(
                 shape: shape, isExpanded: expanded, reduceTransparency: reduceTransparency,
                 headerHeight: hardware.height, hardwareWidth: hardware.width,
-                hoverAmount: hovering && !expanded ? 1 : 0,
+                hoverAmount: hovering && !expanded && !isCompletelyHiddenCollapsed ? 1 : 0,
                 usesSharedGlassShell: usesGlass,
                 tint: page == .music && music.isPlaying ? Color(nsColor: music.avgColor) : nil,
                 glassEnabled: glassEnabled, lightIntensity: lightIntensity,
@@ -1333,9 +1366,10 @@ private struct HarborNotchPreview: View {
                 usesDarkGlassAppearance: colorScheme == .dark, transparency: transparency,
                 previewCaptureSize: CGSize(width: model.expandedPanelWidth, height: max(1, shellHeight))
             )
-            .opacity(expanded || collapsedStyle != .hidden ? 1 : 0)
+            .opacity(isCompletelyHiddenCollapsed ? 0 : 1)
+            .scaleEffect(y: isCompletelyHiddenCollapsed ? 0.01 : 1, anchor: .top)
             .environment(\.colorScheme, inkScheme)
-            .shadow(color: .black.opacity(enableShadow && !(usesGlass && NotchOpticalSupport.isAvailable) ? 0.18 : 0),
+            .shadow(color: .black.opacity(!isCompletelyHiddenCollapsed && enableShadow && !(usesGlass && NotchOpticalSupport.isAvailable) ? 0.18 : 0),
                     radius: 8, y: 3)
 
             if expanded {
@@ -1364,17 +1398,32 @@ private struct HarborNotchPreview: View {
                                                                 identity: NotchContentReveal(progress: 1)))
             }
 
-            Button { setExpanded(!expanded) } label: {
-                UnevenRoundedRectangle(bottomLeadingRadius: 10, bottomTrailingRadius: 10)
-                    .fill(.black)
-                    .frame(width: hardware.width, height: hardware.height)
-                    .contentShape(Rectangle())
+            Button {
+                collapseDemoTask?.cancel()
+                holdsHeightDuringCollapseDemo = false
+                setExpanded(!expanded)
+            } label: {
+                Group {
+                    if isCompletelyHiddenCollapsed {
+                        Color.clear
+                    } else if !expanded && collapsedStyle == .island {
+                        NotchShape.panel(expanded: false)
+                            .fill(.black)
+                    } else {
+                        UnevenRoundedRectangle(bottomLeadingRadius: 10, bottomTrailingRadius: 10)
+                            .fill(.black)
+                    }
+                }
+                .frame(width: !expanded && collapsedStyle == .island ? shellWidth : hardware.width, height: hardware.height)
+                .scaleEffect(y: isCompletelyHiddenCollapsed ? 0.01 : 1, anchor: .top)
+                .opacity(isCompletelyHiddenCollapsed ? 0 : 1)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(expanded ? "Collapsed" : "Expanded")
             .accessibilityIdentifier("harbor-preview-notch")
         }
-        .frame(width: shellWidth, height: max(1, shellHeight), alignment: .top)
+        .frame(width: max(hardware.width, shellWidth), height: max(isCompletelyHiddenCollapsed ? hardware.height : 1, shellHeight), alignment: .top)
         .notchPageSwipe(isEnabled: { expanded && gesturesEnabled && !model.isMusicScrubbing }, acceptsPoint: { point, bounds in
             shape.path(in: bounds).contains(point)
         }, action: { step in
@@ -1393,6 +1442,26 @@ private struct HarborNotchPreview: View {
         withAnimation(reduceMotion ? nil : NotchPanelMotion.presentation()) {
             expanded = opening
             model.setSettingsPreviewExpanded(opening)
+        }
+    }
+
+    private func triggerCollapseAndExpandDemo() {
+        collapseDemoTask?.cancel()
+        let shouldReopen = expanded || holdsHeightDuringCollapseDemo
+        if shouldReopen {
+            holdsHeightDuringCollapseDemo = true
+        }
+        if expanded {
+            setExpanded(false)
+        }
+        guard shouldReopen else { return }
+        collapseDemoTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1050))
+            guard !Task.isCancelled else { return }
+            setExpanded(true)
+            try? await Task.sleep(for: .milliseconds(420))
+            guard !Task.isCancelled else { return }
+            holdsHeightDuringCollapseDemo = false
         }
     }
 
@@ -2026,9 +2095,18 @@ private struct AgentSuggestionSettings: View {
                         .fixedSize()
                         .accessibilityHidden(true)
                 }
-                Text("完成弹窗收起后显示流光。调到 0 可关闭。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack {
+                    Text("灵动岛形态下环绕全岛荧光，收起或刘海形态下沿刘海边缘发光。调到 0 可关闭。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("预览荧光效果") {
+                        if completionHaloDuration == 0 { completionHaloDuration = 6 }
+                        NotificationCenter.default.post(name: .previewAgentCompletionHalo, object: nil)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
             }
             Section("快捷回复建议") {
                 Picker("快捷回复来源", selection: $quickReplySource) {

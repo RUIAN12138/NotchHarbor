@@ -23,6 +23,14 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>SUFeedURL</key>
+	<string>https://github.com/RUIAN12138/NotchHarbor/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>P+aAtKLucnmcvqX7W456Jd1q+yarPtNWtQBUt1U5YGE=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>21600</integer>
 	<key>SUEnableDownloaderService</key>
 	<true/>
 	<key>SUEnableInstallerLauncherService</key>

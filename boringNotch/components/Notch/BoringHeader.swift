@@ -160,6 +160,7 @@ struct BoringHeader: View {
                 previewPage.wrappedValue = destination
             } else {
                 destination.activate(coordinator: coordinator, activities: activities)
+                NotchSpotlightGuideController.shared.handleNavTap(destination)
             }
         } label: {
             ZStack {

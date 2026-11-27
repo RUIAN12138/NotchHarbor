@@ -22,6 +22,8 @@ class MusicManager: ObservableObject {
     private var controllerCancellables = Set<AnyCancellable>()
     private var debounceIdleTask: Task<Void, Never>?
     private var lyricsTask: Task<Void, Never>?
+    private var timelineResyncTask: Task<Void, Never>?
+    private var isMusicViewportVisible = false
     private var lyricsRequestID = UUID()
     private var lyricsTrackKey: String?
     private var lyricsAttemptAt = Date.distantPast
@@ -68,9 +70,11 @@ class MusicManager: ObservableObject {
     @Published private(set) var syncedLyrics: [(time: Double, text: String)] = [] {
         didSet { lyricsTimingRevision &+= 1 }
     }
+    @Published private(set) var richSyncedLyrics: [MusicLyricText.TimedLine] = []
     private var sourceTimedLyrics: [(time: Double, text: String)] = [] {
         didSet { updateLyricPresentation() }
     }
+    private var sourceRichLyrics: [MusicLyricText.TimedLine] = []
     @Published var canFavoriteTrack: Bool = false
     @Published var isFavoriteTrack: Bool = false
 
@@ -127,6 +131,7 @@ class MusicManager: ObservableObject {
     public func destroy() {
         debounceIdleTask?.cancel()
         lyricsTask?.cancel()
+        timelineResyncTask?.cancel()
         cancellables.removeAll()
         controllerCancellables.removeAll()
         flipWorkItem?.cancel()
@@ -206,9 +211,7 @@ class MusicManager: ObservableObject {
                 self.isPlaying = state.isPlaying
                 self.updateIdleState(state: state.isPlaying)
             }
-
-            if state.isPlaying && state.hasMedia {
-            }
+            updateTimelineResyncSchedule()
         }
 
         // Check for changes in track metadata using last artwork change values
@@ -365,8 +368,29 @@ class MusicManager: ObservableObject {
         lyricsTrackKey = nil
         currentLyrics = ""
         lyricAdjustmentMilliseconds = 0
+        sourceRichLyrics = []
         sourceTimedLyrics = []
         isFetchingLyrics = false
+    }
+
+    @MainActor
+    private func applyParsedLyrics(lrc: String, yrc: String? = nil, plainFallback: String? = nil) -> Bool {
+        let rich = MusicLyricText.parseRich(lrc: lrc, yrc: yrc)
+        let timed = rich.isEmpty ? parseLRC(lrc) : rich.map { (time: $0.time, text: $0.text) }
+        sourceRichLyrics = rich
+        sourceTimedLyrics = timed
+        if let plainFallback, (!timed.isEmpty || currentLyrics.isEmpty) {
+            currentLyrics = MusicLyricText.simplified(plainFallback)
+        }
+        return !timed.isEmpty
+    }
+
+    private static func containsCJK(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            (0x3040...0x30FF).contains(scalar.value)
+                || (0x3400...0x9FFF).contains(scalar.value)
+                || (0xAC00...0xD7AF).contains(scalar.value)
+        }
     }
 
     @MainActor
@@ -387,6 +411,7 @@ class MusicManager: ObservableObject {
         lyricsAttemptAt = Date()
         isFetchingLyrics = true
         currentLyrics = ""
+        sourceRichLyrics = []
         sourceTimedLyrics = []
         lyricsTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -417,10 +442,8 @@ class MusicManager: ObservableObject {
                     if let result = try await AppleScriptHelper.execute(script),
                        let lyrics = result.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !lyrics.isEmpty {
                         guard self.lyricsRequestID == requestID, !Task.isCancelled else { return }
-                        let timed = self.parseLRC(lyrics)
                         self.currentLyrics = MusicLyricText.simplified(lyrics)
-                        self.sourceTimedLyrics = timed
-                        if !timed.isEmpty {
+                        if self.applyParsedLyrics(lrc: lyrics, plainFallback: lyrics) {
                             self.isFetchingLyrics = false
                             return
                         }
@@ -428,11 +451,13 @@ class MusicManager: ObservableObject {
                 } catch { /* Continue to the existing public lyrics source. */ }
             }
             guard self.lyricsRequestID == requestID, !Task.isCancelled else { return }
-            if bundleIdentifier?.lowercased().contains("netease") == true,
-               let lrc = await self.fetchNetEaseLyrics(title: title, artist: artist, album: album, duration: duration) {
+            let bundleLower = bundleIdentifier?.lowercased() ?? ""
+            let preferNetEase = bundleLower.contains("netease") || bundleLower.contains("qqmusic")
+                || Self.containsCJK(title) || Self.containsCJK(artist)
+            if preferNetEase,
+               let netease = await self.fetchNetEaseLyrics(title: title, artist: artist, album: album, duration: duration) {
                 guard self.lyricsRequestID == requestID, !Task.isCancelled else { return }
-                self.sourceTimedLyrics = self.parseLRC(lrc)
-                if !self.syncedLyrics.isEmpty {
+                if self.applyParsedLyrics(lrc: netease.lrc, yrc: netease.yrc) {
                     self.isFetchingLyrics = false
                     self.lyricsLogger.info("Loaded \(self.syncedLyrics.count, privacy: .public) timed lines from NetEase")
                     return
@@ -440,6 +465,15 @@ class MusicManager: ObservableObject {
             }
             guard self.lyricsRequestID == requestID, !Task.isCancelled else { return }
             await self.fetchLyricsFromWeb(title: title, artist: artist, duration: duration, requestID: requestID)
+            if !preferNetEase, self.lyricsRequestID == requestID, !Task.isCancelled, self.syncedLyrics.isEmpty,
+               let netease = await self.fetchNetEaseLyrics(title: title, artist: artist, album: album, duration: duration) {
+                guard self.lyricsRequestID == requestID, !Task.isCancelled else { return }
+                if self.applyParsedLyrics(lrc: netease.lrc, yrc: netease.yrc) {
+                    self.isFetchingLyrics = false
+                    self.lyricsLogger.info("Loaded \(self.syncedLyrics.count, privacy: .public) fallback timed lines from NetEase")
+                    return
+                }
+            }
             guard !retry, self.lyricsRequestID == requestID, self.syncedLyrics.isEmpty else { return }
             try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled, self.lyricsRequestID == requestID, self.syncedLyrics.isEmpty, self.isPlaying else {
@@ -450,7 +484,7 @@ class MusicManager: ObservableObject {
         }
     }
 
-    private func fetchNetEaseLyrics(title: String, artist: String, album: String, duration: Double) async -> String? {
+    private func fetchNetEaseLyrics(title: String, artist: String, album: String, duration: Double) async -> (lrc: String, yrc: String?)? {
         guard !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         func get(_ path: String, _ query: [URLQueryItem]) async throws -> [String: Any] {
             var address = URLComponents()
@@ -484,10 +518,16 @@ class MusicManager: ObservableObject {
             for id in ids.prefix(3) where attempted.insert(id).inserted {
                 guard !Task.isCancelled else { return nil }
                 guard let lyric = try? await get("/api/song/lyric", [
-                    .init(name: "id", value: String(id)), .init(name: "lv", value: "1")
-                ]), let lrc = (lyric["lrc"] as? [String: Any])?["lyric"] as? String,
-                      MusicLyricText.parse(lrc).contains(where: { !$0.text.isEmpty }) else { continue }
-                return lrc
+                    .init(name: "id", value: String(id)),
+                    .init(name: "lv", value: "1"),
+                    .init(name: "yv", value: "1")
+                ]) else { continue }
+                let lrc = (lyric["lrc"] as? [String: Any])?["lyric"] as? String ?? ""
+                let yrc = (lyric["yrc"] as? [String: Any])?["lyric"] as? String
+                let hasLrc = MusicLyricText.parse(lrc).contains(where: { !$0.text.isEmpty })
+                let hasYrc = yrc.map { MusicLyricText.parseYRC($0).contains(where: { !$0.text.isEmpty }) } ?? false
+                guard hasLrc || hasYrc else { continue }
+                return (lrc: lrc, yrc: hasYrc ? yrc : nil)
             }
         }
         return nil
@@ -513,11 +553,13 @@ class MusicManager: ObservableObject {
                   let record = LyricsRecordSelection.best(records, title: title, artist: artist, duration: duration) else { return }
             let plain = (record["plainLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let synced = (record["syncedLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let timed = parseLRC(synced)
+            let rich = MusicLyricText.parseRich(lrc: synced)
+            let timed = rich.isEmpty ? parseLRC(synced) : rich.map { (time: $0.time, text: $0.text) }
             if !timed.isEmpty { lyricsLogger.info("Loaded \(timed.count, privacy: .public) timed lines from LRCLIB") }
             if !timed.isEmpty || currentLyrics.isEmpty {
                 currentLyrics = MusicLyricText.simplified(plain.isEmpty ? synced : plain)
             }
+            sourceRichLyrics = rich
             sourceTimedLyrics = timed
         } catch {
             guard lyricsRequestID == requestID, !Task.isCancelled else { return }
@@ -539,7 +581,45 @@ class MusicManager: ObservableObject {
     }
 
     private func updateLyricPresentation() {
+        richSyncedLyrics = MusicLyricCalibration.adjustedRich(sourceRichLyrics, by: lyricAdjustmentMilliseconds)
         syncedLyrics = MusicLyricCalibration.adjusted(sourceTimedLyrics, by: lyricAdjustmentMilliseconds)
+    }
+
+    @MainActor
+    func setMusicViewportVisible(_ visible: Bool) {
+        guard isMusicViewportVisible != visible else { return }
+        isMusicViewportVisible = visible
+        if visible {
+            Task { @MainActor [weak self] in
+                await self?.refreshTimelinePosition()
+            }
+        }
+        updateTimelineResyncSchedule()
+    }
+
+    @MainActor
+    func refreshTimelinePosition() async {
+        if let systemController, activeController === systemController {
+            await systemController.refreshTimelineOnly()
+        } else if let controller = activeController, controller.isActive() {
+            await controller.refreshTimelineOnly()
+        }
+    }
+
+    @MainActor
+    private func updateTimelineResyncSchedule() {
+        timelineResyncTask?.cancel()
+        timelineResyncTask = nil
+        let needsBackgroundPoll = activeController is AppleMusicController || activeController is SpotifyController
+        guard isPlaying, isMusicViewportVisible || needsBackgroundPoll else { return }
+        let interval: Duration = isMusicViewportVisible ? .milliseconds(2000) : .seconds(5)
+        timelineResyncTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard let self, !Task.isCancelled, self.isPlaying else { break }
+                await self.refreshTimelinePosition()
+            }
+        }
     }
 
     func seek(toLyric timestamp: TimeInterval) {
@@ -680,8 +760,13 @@ class MusicManager: ObservableObject {
     }
 
     func seek(to position: TimeInterval) {
-        Task {
-            await activeController?.seek(to: position)
+        let clamped = songDuration.isFinite && songDuration > 0 ? min(max(0, position), songDuration) : max(0, position)
+        Task { @MainActor [weak self] in
+            if let self {
+                self.elapsedTime = clamped
+                self.timestampDate = Date()
+            }
+            await self?.activeController?.seek(to: clamped)
         }
     }
     func skip(seconds: TimeInterval) {
@@ -764,8 +849,41 @@ class MusicManager: ObservableObject {
 
 /// Convert Han variants once on receipt; foreign words are not translated.
 enum MusicLyricText {
+    struct TimedWord: Equatable {
+        let text: String
+        let startTime: Double
+        let endTime: Double
+    }
+
+    struct TimedLine: Equatable {
+        let time: Double
+        let endTime: Double?
+        let text: String
+        let words: [TimedWord]
+    }
+
+    private static let inlineWordTagRegex = try? NSRegularExpression(pattern: #"<(\d{1,3}):([0-5]\d)(?:\.(\d{1,3}))?>"#)
+
     static func simplified(_ text: String) -> String {
         text.applyingTransform(StringTransform("Traditional-Simplified"), reverse: false) ?? text
+    }
+
+    private static func stripInlineWordTags(_ text: String) -> String {
+        guard let regex = inlineWordTagRegex else { return text }
+        let ns = text as NSString
+        return regex.stringByReplacingMatches(in: text, range: NSRange(location: 0, length: ns.length), withTemplate: "")
+    }
+
+    private static func parseTimestamp(minutes: String, seconds: String, fraction: String?) -> Double {
+        let minVal = Double(minutes) ?? 0
+        let secVal = Double(seconds) ?? 0
+        let fracVal: Double
+        if let fraction, !fraction.isEmpty {
+            fracVal = (Double(fraction) ?? 0) / pow(10, Double(fraction.count))
+        } else {
+            fracVal = 0
+        }
+        return minVal * 60 + secVal + fracVal
     }
 
     static func parse(_ source: String) -> [(time: Double, text: String)] {
@@ -779,18 +897,119 @@ enum MusicLyricText {
             let ns = line as NSString
             let matches = stamp.matches(in: line, range: NSRange(location: 0, length: ns.length))
             guard let last = matches.last else { continue }
-            let text = simplified(ns.substring(from: NSMaxRange(last.range)).trimmingCharacters(in: .whitespaces))
+            let rawBody = ns.substring(from: NSMaxRange(last.range))
+            let cleaned = stripInlineWordTags(rawBody).trimmingCharacters(in: .whitespaces)
+            let text = simplified(cleaned)
             for match in matches {
-                let minutes = Double(ns.substring(with: match.range(at: 1))) ?? 0
-                let seconds = Double(ns.substring(with: match.range(at: 2))) ?? 0
+                let minutes = ns.substring(with: match.range(at: 1))
+                let seconds = ns.substring(with: match.range(at: 2))
                 let range = match.range(at: 3)
-                let fraction = range.location == NSNotFound ? 0 : (Double(ns.substring(with: range)) ?? 0) / pow(10, Double(range.length))
-                let time = minutes * 60 + seconds + fraction + shift
+                let fraction = range.location == NSNotFound ? nil : ns.substring(with: range)
+                let time = parseTimestamp(minutes: minutes, seconds: seconds, fraction: fraction) + shift
                 if time.isFinite { result.append((max(0, time), text, result.count)) }
             }
         }
         return result.sorted { $0.time == $1.time ? $0.order < $1.order : $0.time < $1.time }
             .map { (time: $0.time, text: $0.text) }
+    }
+
+    static func parseYRC(_ source: String) -> [TimedLine] {
+        guard let lineHead = try? NSRegularExpression(pattern: #"^\[(\d+),(\d+)\](.*)$"#),
+              let wordToken = try? NSRegularExpression(pattern: #"\((\d+),(\d+),\d+\)([^\(\r\n]*)"#) else { return [] }
+        var lines: [(line: TimedLine, order: Int)] = []
+        for rawLine in source.components(separatedBy: .newlines) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let ns = trimmed as NSString
+            guard let head = lineHead.firstMatch(in: trimmed, range: NSRange(location: 0, length: ns.length)) else { continue }
+            let startMs = Double(ns.substring(with: head.range(at: 1))) ?? 0
+            let durMs = Double(ns.substring(with: head.range(at: 2))) ?? 0
+            let body = ns.substring(with: head.range(at: 3))
+            let bodyNS = body as NSString
+            let matches = wordToken.matches(in: body, range: NSRange(location: 0, length: bodyNS.length))
+            var words: [TimedWord] = []
+            var fullText = ""
+            for match in matches {
+                let wStart = (Double(bodyNS.substring(with: match.range(at: 1))) ?? startMs) / 1000
+                let wDur = max(0.02, (Double(bodyNS.substring(with: match.range(at: 2))) ?? 50) / 1000)
+                let wText = simplified(bodyNS.substring(with: match.range(at: 3)))
+                guard !wText.isEmpty else { continue }
+                fullText += wText
+                words.append(TimedWord(text: wText, startTime: max(0, wStart), endTime: max(0, wStart + wDur)))
+            }
+            let cleanText = fullText.trimmingCharacters(in: .whitespaces)
+            let lineStart = max(0, startMs / 1000)
+            let lineEnd = durMs > 0 ? max(lineStart + 0.05, (startMs + durMs) / 1000) : words.last?.endTime
+            lines.append((TimedLine(time: lineStart, endTime: lineEnd, text: cleanText, words: words), lines.count))
+        }
+        return lines.sorted { $0.line.time == $1.line.time ? $0.order < $1.order : $0.line.time < $1.line.time }.map(\.line)
+    }
+
+    static func parseRich(lrc: String, yrc: String? = nil) -> [TimedLine] {
+        if let yrc, !yrc.isEmpty {
+            let parsedYRC = parseYRC(yrc)
+            if parsedYRC.contains(where: { !$0.text.isEmpty }) {
+                return parsedYRC
+            }
+        }
+        guard let stamp = try? NSRegularExpression(pattern: #"\[(\d{1,3}):([0-5]\d)(?:\.(\d{1,3}))?\]"#),
+              let offset = try? NSRegularExpression(pattern: #"(?i)\[offset:\s*([+-]?\d+)\s*\]"#),
+              let inlineTag = inlineWordTagRegex else { return [] }
+        let raw = lrc as NSString
+        let shift = offset.matches(in: lrc, range: NSRange(location: 0, length: raw.length)).last
+            .flatMap { Double(raw.substring(with: $0.range(at: 1))) }.map { $0 / 1000 } ?? 0
+        var entries: [(time: Double, text: String, rawWords: [(time: Double, text: String)], order: Int)] = []
+        for line in lrc.components(separatedBy: .newlines) {
+            let ns = line as NSString
+            let matches = stamp.matches(in: line, range: NSRange(location: 0, length: ns.length))
+            guard let last = matches.last else { continue }
+            let body = ns.substring(from: NSMaxRange(last.range))
+            let bodyNS = body as NSString
+            let wordMatches = inlineTag.matches(in: body, range: NSRange(location: 0, length: bodyNS.length))
+            var rawWords: [(time: Double, text: String)] = []
+            if !wordMatches.isEmpty {
+                for (idx, wMatch) in wordMatches.enumerated() {
+                    let wMin = bodyNS.substring(with: wMatch.range(at: 1))
+                    let wSec = bodyNS.substring(with: wMatch.range(at: 2))
+                    let wFracRange = wMatch.range(at: 3)
+                    let wFrac = wFracRange.location == NSNotFound ? nil : bodyNS.substring(with: wFracRange)
+                    let wTime = max(0, parseTimestamp(minutes: wMin, seconds: wSec, fraction: wFrac) + shift)
+                    let textStart = NSMaxRange(wMatch.range)
+                    let textEnd = idx + 1 < wordMatches.count ? wordMatches[idx + 1].range.location : bodyNS.length
+                    if textEnd > textStart {
+                        let segment = simplified(bodyNS.substring(with: NSRange(location: textStart, length: textEnd - textStart)))
+                        if !segment.isEmpty { rawWords.append((wTime, segment)) }
+                    }
+                }
+            }
+            let text = simplified(stripInlineWordTags(body).trimmingCharacters(in: .whitespaces))
+            for match in matches {
+                let minutes = ns.substring(with: match.range(at: 1))
+                let seconds = ns.substring(with: match.range(at: 2))
+                let range = match.range(at: 3)
+                let fraction = range.location == NSNotFound ? nil : ns.substring(with: range)
+                let time = parseTimestamp(minutes: minutes, seconds: seconds, fraction: fraction) + shift
+                if time.isFinite {
+                    entries.append((max(0, time), text, matches.count == 1 ? rawWords : [], entries.count))
+                }
+            }
+        }
+        let sorted = entries.sorted { $0.time == $1.time ? $0.order < $1.order : $0.time < $1.time }
+        return sorted.enumerated().map { index, item in
+            let nextLineTime = index + 1 < sorted.count ? sorted[index + 1].time : nil
+            let words: [TimedWord] = item.rawWords.enumerated().map { wIdx, w in
+                let wEnd: Double
+                if wIdx + 1 < item.rawWords.count {
+                    wEnd = max(w.time + 0.04, item.rawWords[wIdx + 1].time)
+                } else if let nextLineTime {
+                    wEnd = max(w.time + 0.08, min(nextLineTime, w.time + 1.2))
+                } else {
+                    wEnd = w.time + 0.5
+                }
+                return TimedWord(text: w.text, startTime: w.time, endTime: wEnd)
+            }
+            return TimedLine(time: item.time, endTime: words.last?.endTime, text: item.text, words: words)
+        }
     }
 }
 
@@ -914,6 +1133,20 @@ enum MusicLyricCalibration {
         guard milliseconds != 0 else { return lines }
         let shift = Double(clamp(milliseconds)) / 1000
         return lines.map { (max(0, $0.time + shift), $0.text) }
+    }
+
+    static func adjustedRich(_ lines: [MusicLyricText.TimedLine], by milliseconds: Int) -> [MusicLyricText.TimedLine] {
+        guard milliseconds != 0 else { return lines }
+        let shift = Double(clamp(milliseconds)) / 1000
+        return lines.map { line in
+            let start = max(0, line.time + shift)
+            let end = line.endTime.map { max(start + 0.04, $0 + shift) }
+            let words = line.words.map { w in
+                let ws = max(0, w.startTime + shift)
+                return MusicLyricText.TimedWord(text: w.text, startTime: ws, endTime: max(ws + 0.02, w.endTime + shift))
+            }
+            return MusicLyricText.TimedLine(time: start, endTime: end, text: line.text, words: words)
+        }
     }
 
     static func load(trackKey: String, defaults: UserDefaults = .standard) -> Int {

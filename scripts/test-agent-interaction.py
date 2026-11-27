@@ -219,6 +219,23 @@ extension UnifiedActivities {
                                                                active: "openai", apiEnabled: true, today: nil) {
         precondition(selected.id == "openai")
     } else { preconditionFailure("Automatic mode must follow the active provider") }
+    let geminiDual = AgentProviderUsage(
+        id: "gemini",
+        updatedAt: clock,
+        windows: [
+            AgentUsageWindow(usedPercent: 20, windowMinutes: 300, resetsAt: clock + 3600, label: "Gemini 5-hour"),
+            AgentUsageWindow(usedPercent: 35, windowMinutes: 10_080, resetsAt: clock + 86400, label: "Gemini weekly"),
+            AgentUsageWindow(usedPercent: 55, windowMinutes: 300, resetsAt: clock + 3600, label: "Claude/GPT 5-hour"),
+            AgentUsageWindow(usedPercent: 70, windowMinutes: 10_080, resetsAt: clock + 86400, label: "Claude/GPT weekly"),
+        ],
+        billing: nil,
+        localTokens30Days: nil
+    )
+    let arcLevels = geminiDual.geminiDualArcLevels(at: clock)
+    precondition(arcLevels.outerMajorGemini == 80 && arcLevels.outerMinorClaudeGPT == 45)
+    precondition(arcLevels.innerMajorGemini == 65 && arcLevels.innerMinorClaudeGPT == 30)
+    precondition(geminiDual.showsQuotaRings && AgentQuotaRings.image(for: geminiDual, at: clock).isTemplate)
+    precondition(AgentProviderUsage.selected(from: [provider, geminiDual], preferred: "", active: "antigravity")?.id == "gemini")
     let id = UUID(), second = UUID()
     let now = Date().timeIntervalSince1970
     var tick = 0.0

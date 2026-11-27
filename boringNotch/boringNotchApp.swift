@@ -192,7 +192,7 @@ private final class HarborStatusPopover: NSObject, NSPopoverDelegate {
         let activity = UnifiedActivities.shared
         let selection = AgentUsageSelection.resolve(
             activity.agentUsage, preferred: preferences.string(forKey: AgentUsageSelection.key) ?? "",
-            active: activity.runningAgent?.source, apiEnabled: preferences.bool(forKey: AgentSuggestionAPI.enabledKey),
+            active: activity.activeQuotaAgentSource, apiEnabled: preferences.bool(forKey: AgentSuggestionAPI.enabledKey),
             today: AgentAPIUsageLedger.shared.today
         )
         AgentUsageStatusLabel.apply(to: button, selection: selection)
@@ -265,6 +265,11 @@ private final class HarborStatusPopover: NSObject, NSPopoverDelegate {
         localClickMonitor = nil
         globalClickMonitor = nil
     }
+}
+
+private final class FullScreenOnboardingWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -741,11 +746,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupDragDetectors()
 
-        if coordinator.firstLaunch {
+        NotchSpotlightGuideController.shared.onRequestOpenNotch = { [weak self] in
+            guard let self else { return }
+            self.closeNotchTask?.cancel()
+            self.closeNotchTask = nil
+            self.coordinator.firstLaunch = false
+            self.coordinator.isOnboardingActive = false
+            if let (screen, model) = self.primaryNotchContext {
+                if Defaults[.showOnAllDisplays], let uuid = screen.displayUUID {
+                    self.windows[uuid]?.orderFrontRegardless()
+                } else {
+                    self.window?.orderFrontRegardless()
+                }
+                withAnimation(NotchPanelMotion.spring(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)) {
+                    if model.notchState == .closed {
+                        model.open()
+                    } else {
+                        model.notchSize = model.expandedNotchSize
+                    }
+                }
+            }
+        }
+
+        NotchSpotlightGuideController.shared.onRequestCollapseNotch = { [weak self] in
+            guard let self else { return }
+            self.closeNotchTask?.cancel()
+            self.closeNotchTask = nil
+            self.coordinator.firstLaunch = false
+            self.coordinator.isOnboardingActive = false
+            if let (screen, model) = self.primaryNotchContext {
+                if Defaults[.showOnAllDisplays], let uuid = screen.displayUUID {
+                    self.windows[uuid]?.orderFrontRegardless()
+                } else {
+                    self.window?.orderFrontRegardless()
+                }
+                withAnimation(NotchPanelMotion.presentation()) {
+                    model.close(allowDuringGuide: true)
+                }
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name.showOnboardingTutorial, object: nil, queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor in
+                if notification.object as? String == "permissions-wizard" {
+                    self?.showOnboardingWindow(step: .welcome)
+                } else {
+                    SettingsWindowController.shared.close()
+                    NSApp.deactivate()
+                    NotchSpotlightGuideController.shared.start(force: true)
+                }
+            }
+        }
+
+        if CommandLine.arguments.contains("--spotlight-guide") || coordinator.firstLaunch {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(450))
+                NotchSpotlightGuideController.shared.start(force: true)
+            }
+            if coordinator.firstLaunch { playWelcomeSound() }
+        } else if CommandLine.arguments.contains("--onboarding") {
             DispatchQueue.main.async {
                 self.showOnboardingWindow()
             }
-            playWelcomeSound()
         } else if MusicManager.shared.isNowPlayingDeprecated
             && Defaults[.mediaController] == .nowPlaying
         {
@@ -1002,46 +1066,105 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(self)
     }
 
-    private func showOnboardingWindow(step: OnboardingStep = .welcome) {
-        if onboardingWindowController == nil {
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 400, height: 600),
-                styleMask: [.titled, .fullSizeContentView],
-                backing: .buffered,
-                defer: false
-            )
-            window.center()
-            window.title = "Notch Harbor"
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.contentView = NSHostingView(
-                rootView: OnboardingView(
-                    step: step,
-                    onFinish: { [weak self] in
-                        window.orderOut(nil)
-                        window.close()
-                        NSApp.deactivate()
-                        self?.coordinator.firstLaunch = false
-                    },
-                    onOpenSettings: {
-                        window.close()
-                        SettingsWindowController.shared.showWindow()
-                    }
-                ))
-            window.isRestorable = false
-            window.identifier = NSUserInterfaceItemIdentifier("OnboardingWindow")
+    @MainActor
+    private var primaryNotchContext: (NSScreen, BoringViewModel)? {
+        if let (screen, _, model) = notchOnBuiltInScreen() {
+            return (screen, model)
+        }
+        let screen = window?.screen ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return nil }
+        if Defaults[.showOnAllDisplays], let uuid = screen.displayUUID, let model = viewModels[uuid] {
+            return (screen, model)
+        }
+        return (screen, vm)
+    }
 
-            onboardingWindowController = NSWindowController(window: window)
+    @MainActor
+    private func syncRealNotchDuringOnboarding(to page: NotchPage) {
+        guard let (_, model) = primaryNotchContext else { return }
+        closeNotchTask?.cancel()
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        withAnimation(NotchPanelMotion.spring(reduceMotion: reduceMotion)) {
+            let target: NotchPage = (page == .shelf && !Defaults[.boringShelf]) ? .music : page
+            target.activate(coordinator: coordinator, activities: UnifiedActivities.shared)
+            if model.notchState == .closed {
+                model.open()
+            } else {
+                model.notchSize = model.expandedNotchSize
+            }
+        }
+    }
+
+    @MainActor
+    private func showOnboardingWindow(step: OnboardingStep = .welcome) {
+        coordinator.isOnboardingActive = true
+        if let existing = onboardingWindowController?.window {
+            existing.alphaValue = 1
+            NSApp.activate(ignoringOtherApps: true)
+            existing.makeKeyAndOrderFront(nil)
+            existing.orderFrontRegardless()
+            return
         }
 
-//        NSApp.setActivationPolicy(.regular)
+        let onboardingWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 560),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        onboardingWindow.center()
+        onboardingWindow.title = "Notch Harbor"
+        onboardingWindow.titlebarAppearsTransparent = true
+        onboardingWindow.titleVisibility = .hidden
+        onboardingWindow.isMovableByWindowBackground = true
+        onboardingWindow.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        onboardingWindow.standardWindowButton(.zoomButton)?.isHidden = true
+        onboardingWindow.contentView = NSHostingView(
+            rootView: OnboardingView(
+                step: step,
+                onFinish: { [weak self, weak onboardingWindow] in
+                    onboardingWindow?.orderOut(nil)
+                    onboardingWindow?.close()
+                    self?.onboardingWindowController = nil
+                    self?.coordinator.firstLaunch = false
+                    self?.coordinator.isOnboardingActive = false
+                    NSApp.deactivate()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+                        NotchSpotlightGuideController.shared.start(force: true)
+                    }
+                },
+                onSkipGuide: { [weak self, weak onboardingWindow] in
+                    NotchSpotlightGuideController.shared.hasCompleted = true
+                    onboardingWindow?.orderOut(nil)
+                    onboardingWindow?.close()
+                    self?.onboardingWindowController = nil
+                    self?.coordinator.firstLaunch = false
+                    self?.coordinator.isOnboardingActive = false
+                    NSApp.deactivate()
+                },
+                onOpenSettings: { [weak self, weak onboardingWindow] in
+                    NotchSpotlightGuideController.shared.hasCompleted = true
+                    onboardingWindow?.orderOut(nil)
+                    onboardingWindow?.close()
+                    self?.onboardingWindowController = nil
+                    self?.coordinator.firstLaunch = false
+                    self?.coordinator.isOnboardingActive = false
+                    SettingsWindowController.shared.showWindow()
+                }
+            )
+        )
+        onboardingWindow.isRestorable = false
+        onboardingWindow.identifier = NSUserInterfaceItemIdentifier("OnboardingWindow")
+
+        onboardingWindowController = NSWindowController(window: onboardingWindow)
         NSApp.activate(ignoringOtherApps: true)
-        onboardingWindowController?.window?.makeKeyAndOrderFront(nil)
-        onboardingWindowController?.window?.orderFrontRegardless()
+        onboardingWindow.makeKeyAndOrderFront(nil)
+        onboardingWindow.orderFrontRegardless()
     }
 }
 
 extension Notification.Name {
+    static let showOnboardingTutorial = Notification.Name("ShowOnboardingTutorial")
     static let selectedScreenChanged = Notification.Name("SelectedScreenChanged")
     static let notchHeightChanged = Notification.Name("NotchHeightChanged")
     static let showOnAllDisplaysChanged = Notification.Name("showOnAllDisplaysChanged")
